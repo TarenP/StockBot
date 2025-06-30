@@ -1,117 +1,183 @@
 import os
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-
-import tensorflow as tf
-from tensorflow.keras import layers, models, optimizers, callbacks
-import pandas as pd
+import pyarrow.parquet as pq
 import numpy as np
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
 
-# 1) Load your master DataFrame
-master_df = pd.read_parquet('Master.parquet')
-if 'date' in master_df.columns and 'ticker' in master_df.columns:
-    master_df = master_df.set_index(['date', 'ticker'])
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
-# 2) Define return and feature columns
-return_col = 'ret_5d'
-feature_cols = [c for c in master_df.columns if c not in (return_col, 'label')]
+# ---------------------------------------
+# Configuration
+# ---------------------------------------
+parquet_path = 'Master_cleaned.parquet'
+return_col   = 'ret_5d'
+batch_size   = 2048
+n_epochs     = 10
+patience     = 3
+device       = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 3) Label top 5% tickers per day
-def label_top_percentile(df, return_col, percentile=0.95):
-    df = df.copy()
-    labels = pd.Series(0, index=df.index)
-    for date, group in df.groupby(level='date'):
-        cutoff = group[return_col].quantile(percentile)
-        mask = group[return_col] >= cutoff
-        labels.loc[mask.index[mask]] = 1
-    df['label'] = labels
-    return df
+# ---------------------------------------
+# Prepare ParquetFile
+# ---------------------------------------
+print("[DEBUG] Opening Parquet file for streaming...")
+pf = pq.ParquetFile(parquet_path)
+all_cols = pf.schema_arrow.names
+exclude  = {return_col, 'date', 'ticker'}
+feature_cols = [c for c in all_cols if c not in exclude]
+print(f"[DEBUG] Detected feature columns: {len(feature_cols)}")
 
-labeled_df = label_top_percentile(master_df, return_col)
+# ---------------------------------------
+# Compute date-wise cutoff map
+# ---------------------------------------
+print("[DEBUG] Computing date-wise cutoff map...")
+cutoff_lists = {}
+all_dates = set()
+for i, batch in enumerate(pf.iter_batches(batch_size=1_000_000)):
+    dfb = batch.to_pandas()[['date', return_col]]
+    for date, grp in dfb.groupby('date'):
+        all_dates.add(date)
+        cutoff_lists.setdefault(date, []).extend(grp[return_col].values)
+    if (i + 1) % 10 == 0:
+        print(f"[DEBUG] Processed {i+1} partitions for cutoff map...")
 
-# 4) Split into train/validation
-val_frac = 0.2
-n = len(labeled_df)
-indices = np.arange(n)
-np.random.shuffle(indices)
-val_size = int(n * val_frac)
-val_idx = indices[:val_size]
-train_idx = indices[val_size:]
+cutoff_map = {date: np.quantile(vals, 0.95) for date, vals in cutoff_lists.items()}
+print(f"[DEBUG] Computed cutoff for {len(cutoff_map)} dates.")
 
-train_df = labeled_df.iloc[train_idx]
-val_df   = labeled_df.iloc[val_idx]
+# Chronological train/val split
+all_dates = sorted(all_dates)
+split_idx = int(len(all_dates) * 0.8)
+train_dates = set(all_dates[:split_idx])
+val_dates   = set(all_dates[split_idx:])
+print(f"[DEBUG] Train dates: {len(train_dates)}, Validation dates: {len(val_dates)}")
 
-# 5) Optional: standardize features using training scaler
-scaler = StandardScaler()
-train_df_features = scaler.fit_transform(train_df[feature_cols])
-val_df_features   = scaler.transform(val_df[feature_cols])
-train_df.loc[:, feature_cols] = train_df_features
-val_df.loc[:, feature_cols]   = val_df_features
+# Fit a global StandardScaler on a small sample
+print("[DEBUG] Fitting StandardScaler on first row group...")
+sample = pf.read_row_group(0).to_pandas()[feature_cols]
+scaler = StandardScaler().fit(sample.values)
+print("[DEBUG] Scaler mean/scale calculated.")
 
-# 6) Define batch generator
-def batch_generator(df, feature_cols, label_col, batch_size=1024):
-    num_rows = len(df)
-    while True:
-        df_shuffled = df.sample(frac=1)
-        for start in range(0, num_rows, batch_size):
-            batch = df_shuffled.iloc[start:start + batch_size]
-            X_batch = batch[feature_cols].values.astype(np.float32)
-            y_batch = batch[label_col].values.astype(np.float32)
-            yield X_batch, y_batch
+# ---------------------------------------
+# Define an Iterable Dataset generator
+# ---------------------------------------
+def parquet_generator(dates_subset, split_name="train"):
+    local_pf = pq.ParquetFile(parquet_path)
+    print(f"[DEBUG] Starting generator for {split_name}, dates_subset size = {len(dates_subset)}")
+    for i, batch in enumerate(local_pf.iter_batches(batch_size=batch_size)):
+        df = batch.to_pandas()
+        df = df[df['date'].isin(dates_subset)]
+        if df.empty:
+            continue
+        # Label on the fly
+        df['label'] = (df[return_col] >= df['date'].map(cutoff_map)).astype(np.int8)
+        # Extract and clean features/labels
+        X_raw = df[feature_cols].values.astype(np.float32)
+        y_raw = df['label'].values.astype(np.float32)
+        mask = np.isfinite(X_raw).all(axis=1)
+        if not mask.any():
+            continue
+        X = scaler.transform(X_raw[mask])
+        y = y_raw[mask]
+        # Yield mini-batches
+        for j in range(0, len(X), batch_size):
+            xb = torch.from_numpy(X[j:j+batch_size]).to(device)
+            yb = torch.from_numpy(y[j:j+batch_size]).to(device)
+            if j == 0:
+                print(f"[DEBUG] {split_name} partition {i}: yielding {len(xb)} samples")
+            yield xb, yb
 
-batch_size = 1024
-train_steps = len(train_df) // batch_size
-val_steps   = len(val_df) // batch_size
-
-# 7) Create tf.data.Datasets
-train_dataset = tf.data.Dataset.from_generator(
-    lambda: batch_generator(train_df, feature_cols, 'label', batch_size),
-    output_signature=(
-        tf.TensorSpec(shape=(None, len(feature_cols)), dtype=tf.float32),
-        tf.TensorSpec(shape=(None,), dtype=tf.float32)
-    )
-)
-val_dataset = tf.data.Dataset.from_generator(
-    lambda: batch_generator(val_df, feature_cols, 'label', batch_size),
-    output_signature=(
-        tf.TensorSpec(shape=(None, len(feature_cols)), dtype=tf.float32),
-        tf.TensorSpec(shape=(None,), dtype=tf.float32)
-    )
-)
-
-# 8) Build and compile model
-input_dim = len(feature_cols)
-model = models.Sequential([
-    layers.Input(shape=(input_dim,)),
-    layers.Dense(128, activation='relu'),
-    layers.Dropout(0.3),
-    layers.Dense(64, activation='relu'),
-    layers.Dropout(0.3),
-    layers.Dense(1, activation='sigmoid')
-])
-model.compile(
-    optimizer=optimizers.Adam(learning_rate=1e-3),
-    loss='binary_crossentropy',
-    metrics=[tf.keras.metrics.AUC(name='auc')]
-)
-
-# 9) Train using streaming datasets
-model.fit(
-    train_dataset,
-    epochs=10,
-    steps_per_epoch=train_steps,
-    validation_data=val_dataset,
-    validation_steps=val_steps,
-    callbacks=[
-        callbacks.EarlyStopping(
-            monitor='val_auc',
-            patience=3,
-            restore_best_weights=True
+# ---------------------------------------
+# Define the MLP model
+# ---------------------------------------
+class SelectorMLP(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1)
         )
-    ],
-    verbose=1
-)
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
 
-# 10) Save the trained model
-model.save('selector_mlp.keras')
-print("Model saved to selector_mlp.keras")
+model = SelectorMLP(len(feature_cols)).to(device)
+criterion = nn.BCEWithLogitsLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+# Estimate steps per epoch
+total_rows = sum(pf.metadata.row_group(i).num_rows for i in range(pf.num_row_groups))
+train_steps = int(total_rows * 0.8) // batch_size
+val_steps   = int(total_rows * 0.2) // batch_size
+print(f"[DEBUG] Steps per epoch: train={train_steps}, val={val_steps}")
+
+# ---------------------------------------
+# Training with early stopping on validation AUC
+# ---------------------------------------
+best_val_auc = 0.0
+epochs_no_improve = 0
+
+for epoch in range(1, n_epochs + 1):
+    print(f"\n[DEBUG] Starting epoch {epoch}/{n_epochs}")
+    # Training
+    model.train()
+    train_losses = []
+    gen = parquet_generator(train_dates, split_name="train")
+    for batch_idx, (X_batch, y_batch) in enumerate(gen):
+        optimizer.zero_grad()
+        logits = model(X_batch)
+        loss = criterion(logits, y_batch)
+        loss.backward()
+        optimizer.step()
+        train_losses.append(loss.item())
+        if (batch_idx + 1) % 50 == 0:
+            print(f"[DEBUG] Epoch {epoch} Train batch {batch_idx+1}/{train_steps}, loss={loss.item():.4f}")
+        if batch_idx+1 >= train_steps:
+            break
+    avg_train_loss = np.mean(train_losses)
+
+    # Validation
+    model.eval()
+    val_losses, y_trues, y_scores = [], [], []
+    gen_val = parquet_generator(val_dates, split_name="val")
+    for batch_idx, (X_batch, y_batch) in enumerate(gen_val):
+        logits = model(X_batch)
+        loss = criterion(logits, y_batch)
+        val_losses.append(loss.item())
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+        y_scores.append(probs)
+        y_trues.append(y_batch.detach().cpu().numpy())
+        if (batch_idx + 1) % 20 == 0:
+            print(f"[DEBUG] Epoch {epoch} Val batch {batch_idx+1}/{val_steps}, loss={loss.item():.4f}")
+        if batch_idx+1 >= val_steps:
+            break
+    avg_val_loss = np.mean(val_losses)
+    y_trues = np.concatenate(y_trues)
+    y_scores = np.concatenate(y_scores)
+    val_auc = roc_auc_score(y_trues, y_scores)
+
+    print(f"[DEBUG] Epoch {epoch} summary: Train loss {avg_train_loss:.4f}, Val loss {avg_val_loss:.4f}, Val AUC {val_auc:.4f}")
+
+    # Early stopping
+    if val_auc > best_val_auc:
+        best_val_auc = val_auc
+        epochs_no_improve = 0
+        torch.save(model.state_dict(), 'best_selector.pt')
+        print(f"[DEBUG] New best model saved with AUC {val_auc:.4f}")
+    else:
+        epochs_no_improve += 1
+        if epochs_no_improve >= patience:
+            print("[DEBUG] Early stopping triggered.")
+            break
+
+# ---------------------------------------
+# Save final model
+# ---------------------------------------
+model.load_state_dict(torch.load('best_selector.pt'))
+torch.save(model.state_dict(), 'selector_mlp.pth')
+print("Done—model saved to selector_mlp.pth")
