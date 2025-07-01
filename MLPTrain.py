@@ -33,7 +33,7 @@ feature_cols = [c for c in all_cols if c not in exclude]
 # Precompute date-wise cutoff map
 # ---------------------------------------
 cutoff_lists, all_dates = {}, set()
-for batch in pf.iter_batches(batch_size=1_000_000):
+for batch in pf.iter_batches(batch_size=1_500_000):
     dfb = batch.to_pandas()[['date', return_col]]
     for date, grp in dfb.groupby('date'):
         all_dates.add(date)
@@ -165,9 +165,11 @@ for epoch in range(1, n_epochs + 1):
 # Save final model and state dict
 # ---------------------------------------
 # Save only the state dict
-torch.jit.script(model.state_dict(), 'selector_mlp_state_dict.pt')
+torch.save(model.state_dict(), 'selector_mlp_state_dict.pt')
 # Save entire model object for easy loading
-torch.jit.script(model, 'selector_mlp_model.pt')
+# torch.jit.script(model, 'selector_mlp_model.pt')
+scripted = torch.jit.script(model)
+scripted.save('selector_mlp_scripted.pt')
 
 print("Training complete. Saved:")
 print(" - State dict -> selector_mlp_state_dict.pt")
