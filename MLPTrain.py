@@ -14,10 +14,10 @@ from tqdm import tqdm
 # Configuration
 # ---------------------------------------
 parquet_path = 'Master_cleaned.parquet'
-return_col   = 'ret_5d'
+return_col   = 'ret_5d_future'  # Column to predict
 batch_size   = 2048
 n_epochs     = 10
-patience     = 3
+patience = 3  # number of epochs with no improvement before stopping
 device       = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
@@ -84,6 +84,21 @@ val_ds   = ParquetDataset(val_dates)
 train_loader = DataLoader(train_ds, batch_size=None, num_workers=0)
 val_loader   = DataLoader(val_ds,   batch_size=None, num_workers=0)
 
+# Count positives/negatives for weighting
+print("Counting positive/negative samples for pos_weight...")
+pos_count = 0
+neg_count = 0
+for batch in pf.iter_batches(batch_size=1_500_000):
+    dfb = batch.to_pandas()[['date', return_col]]
+    dfb['label'] = (dfb[return_col] >= dfb['date'].map(cutoff_map)).astype(np.int8)
+    pos_count += (dfb['label'] == 1).sum()
+    neg_count += (dfb['label'] == 0).sum()
+
+pos_weight_value = neg_count / max(pos_count, 1)  # avoid division by zero
+print(f"pos_weight = {pos_weight_value:.2f}")
+pos_weight = torch.tensor(pos_weight_value, dtype=torch.float32).to(device)
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
 # ---------------------------------------
 # Define the MLP model
 # ---------------------------------------
@@ -99,7 +114,6 @@ class SelectorMLP(nn.Module):
         return self.net(x).squeeze(-1)
 
 model = SelectorMLP(len(feature_cols)).to(device)
-criterion = nn.BCEWithLogitsLoss()
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
 # Estimate steps per epoch
@@ -148,29 +162,30 @@ for epoch in range(1, n_epochs + 1):
     y_scores = np.concatenate(y_scores)
     val_auc = roc_auc_score(y_trues, y_scores)
 
-    print(f"Epoch {epoch}/{n_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val AUC: {val_auc:.4f}")
-
-    # Early stopping
     if val_auc > best_val_auc:
         best_val_auc = val_auc
         epochs_no_improve = 0
-        torch.save(model.state_dict(), 'best_selector_state_dict.pt')
+        torch.save(model.state_dict(), 'selector_mlp_state_dict.pt')
+        torch.jit.script(model).save('selector_mlp_scripted.pt')
     else:
         epochs_no_improve += 1
         if epochs_no_improve >= patience:
             print("Early stopping triggered.")
             break
 
+    print(f"Epoch {epoch}/{n_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val AUC: {val_auc:.4f}")
+
+
 # ---------------------------------------
 # Save final model and state dict
 # ---------------------------------------
-# Save only the state dict
-torch.save(model.state_dict(), 'selector_mlp_state_dict.pt')
-# Save entire model object for easy loading
-# torch.jit.script(model, 'selector_mlp_model.pt')
-scripted = torch.jit.script(model)
-scripted.save('selector_mlp_scripted.pt')
+# # Save only the state dict
+# torch.save(model.state_dict(), 'selector_mlp_state_dict.pt')
+# # Save entire model object for easy loading
+# # torch.jit.script(model, 'selector_mlp_model.pt')
+# scripted = torch.jit.script(model)
+# scripted.save('selector_mlp_scripted.pt')
 
 print("Training complete. Saved:")
-print(" - State dict -> selector_mlp_state_dict.pt")
-print(" - Full model -> selector_mlp_model.pt")
+print(" - Best state dict -> best_selector_state_dict.pt")
+print(" - Best TorchScript model -> best_selector_scripted.pt")
