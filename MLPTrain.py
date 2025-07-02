@@ -15,7 +15,7 @@ from tqdm import tqdm
 # ---------------------------------------
 parquet_path = 'Master_cleaned.parquet'
 return_col   = 'ret_5d_future'  # Column to predict
-batch_size   = 2048
+batch_size   = 4096
 n_epochs     = 10
 patience = 3  # number of epochs with no improvement before stopping
 device       = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
