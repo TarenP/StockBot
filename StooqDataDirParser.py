@@ -121,6 +121,6 @@ def consolidate(root: Path, output: Path, n_workers: int = 8) -> None:
 # CLI entrypoint
 ###############################################################################
 if __name__ == '__main__':
-    ROOT_DIR = Path('data')
-    OUTPUT = Path('stooq_panel.parquet')
+    ROOT_DIR = Path('StockData')
+    OUTPUT = Path('MasterDS/stooq_panel.parquet')
     consolidate(ROOT_DIR, OUTPUT)
