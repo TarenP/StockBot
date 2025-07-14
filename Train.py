@@ -28,12 +28,12 @@ torch.multiprocessing.set_start_method("spawn", force=True)
 
 PARQUET_PATH = Path("MasterDS/Master_cleaned.parquet")
 RETURN_COL   = "ret_5d_future"
-BATCH_SIZE   = 64
+BATCH_SIZE   = 512
 EPOCHS       = 15
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 WINDOW       = 10
 POS_RATIO    = 0.30              # oversample positives inside each batch
-NUM_WORKERS  = max(1, min(4, os.cpu_count() - 2))
+NUM_WORKERS  = max(1, min(6, os.cpu_count() - 2))
 
 # -----------------------------------------------------------
 # Utility: load metadata once - UNCHANGED
@@ -73,7 +73,7 @@ SCALER = StandardScaler().fit(pd.concat(samples).values)
 
 # 95-th pct cut-off per date
 cutoff = defaultdict(list)
-for batch in pf.iter_batches(batch_size=1_000_000):
+for batch in pf.iter_batches(batch_size=500_000):
     df = batch.to_pandas()[["date", RETURN_COL]]
     for d, g in df.groupby("date"):
         cutoff[d].extend(g[RETURN_COL].values)
@@ -270,6 +270,8 @@ def train():
     scaler = GradScaler()
     crit = FocalLoss().to(DEVICE)
 
+    epoch_losses = []
+
     for epoch in range(1, EPOCHS+1):
         model.train()
         running_loss = 0.0
@@ -310,7 +312,9 @@ def train():
                     'loss': f"{loss.item():.4f}",
                     'avg_loss': f"{avg_loss:.4f}"
                 })
-                
+                if step_count >= TRAIN_STEPS:
+                    break   # stop exactly at the planned step count
+
         except Exception as e:
             print(f"\nTraining error at epoch {epoch}, step {step_count}: {str(e)}")
             import traceback
@@ -320,6 +324,7 @@ def train():
         
         # Save epoch checkpoint
         epoch_loss = running_loss / max(step_count, 1)
+        epoch_losses.append(epoch_loss)
         print(f"→ Epoch {epoch} mean loss: {epoch_loss:.4f}")
         torch.save(model.state_dict(), f"models/TopSelector_epoch{epoch}.pt")
     
@@ -339,7 +344,7 @@ def evaluate(model):
     
     with torch.no_grad():
         for xb, yb, _ in test_loader:
-            xb = xb.flatten(1).to(DEVICE)
+            xb = xb.to(DEVICE)
             y_true.extend(yb.numpy())
             
             # Process in chunks to avoid OOM
@@ -370,6 +375,14 @@ def main():
     os.makedirs("models", exist_ok=True)
     print(f"Using {DEVICE} | workers={NUM_WORKERS}")
     model = train()
+    plt.figure(figsize=(6,4))
+    plt.plot(range(1, EPOCHS+1), epoch_losses, marker='o')
+    plt.title("Training: Mean Loss per Epoch")
+    plt.xlabel("Epoch")
+    plt.ylabel("Mean Loss")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("training_loss.png")
     evaluate(model)
 
 if __name__ == "__main__":
