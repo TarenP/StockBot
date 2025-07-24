@@ -25,7 +25,7 @@ from Train import (
 )
 
 # Configuration - can override training params if needed
-MODEL_PATH = "models/TopSelector_epoch4.pt"
+MODEL_PATH = "models/TopSelector_epoch10.pt"
 NUM_WORKERS = max(1, min(6, os.cpu_count() - 2))
 
 def evaluate():
