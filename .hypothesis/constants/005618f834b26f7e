@@ -1,0 +1,4 @@
+# file: C:\Users\taren\Documents\Github Repositories\StockBot\pipeline\sentiment.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.05, 0.1, 0.15, 0.45, 0.5, 200, 512, '  Scoring headlines', '%Y-%m-%d', '%b-%d-%y', ':', 'Fetching news', 'FinBERT loaded.', 'NEWSAPI_KEY', 'ProsusAI/finbert', 'Today', 'User-Agent', 'apiKey', 'articles', 'batch', 'date', 'en', 'from', 'green', 'html.parser', 'ignore', 'item', 'label', 'language', 'last', 'neg_score', 'negative', 'neutral', 'neutral_score', 'news-table', 'pageSize', 'pos_score', 'positive', 'pubDate', 'publishedAt', 'q', 'score', 'sentiment', 'sortBy', 'stock', 'td', 'text-classification', 'ticker', 'title', 'to', 'tr', 'xml', 'yellow']

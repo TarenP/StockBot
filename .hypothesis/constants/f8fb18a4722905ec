@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\version.py
+# hypothesis_version: 6.151.9
+
+['12.8', '2.7.1+cu128', '__version__', 'cuda', 'debug', 'git_version', 'hip']

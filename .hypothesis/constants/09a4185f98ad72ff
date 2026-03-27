@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\profiler\__init__.py
+# hypothesis_version: 6.151.9
+
+['DeviceType', 'KINETO_USE_DAEMON', 'Optimizer', 'ProfilerAction', 'ProfilerActivity', 'kineto_available', 'profile', 'record_function', 'schedule', 'supported_activities']

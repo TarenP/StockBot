@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\yfinance\domain\domain.py
+# hypothesis_version: 6.151.9
+
+['US', 'companiesCount', 'companies_count', 'description', 'employeeCount', 'employee_count', 'en-US', 'formatted', 'industriesCount', 'industries_count', 'lang', 'market weight', 'marketCap', 'marketWeight', 'market_cap', 'market_weight', 'messageBoardId', 'message_board_id', 'name', 'overview', 'rating', 'raw', 'region', 'researchReports', 'symbol', 'topCompanies', 'true', 'withReturns']

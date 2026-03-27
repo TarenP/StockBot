@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\yfinance\screener\query.py
+# hypothesis_version: 6.151.9
+
+[',\n', 'AND', 'BTWN', 'EQ', 'GT', 'GTE', 'IS-IN', 'Invalid operand type', 'LT', 'LTE', 'OR', 'QueryBase', 'T', 'exchange', 'operands', 'operator', 'valid_values_table']

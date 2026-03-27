@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\_higher_order_ops\while_loop.py
+# hypothesis_version: 6.151.9
+
+[', ', 'body_fn', 'body_output', 'call_function', 'carried_inputs', 'cond_fn', 'device', 'eager', 'mode', 'while_loop']

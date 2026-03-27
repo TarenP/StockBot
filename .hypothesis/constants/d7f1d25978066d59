@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\curl_cffi\aio.py
+# hypothesis_version: 6.151.9
+
+[1000, 'AsyncCurl', 'NOT DONE', 'ProactorEventLoop', 'int *', 'perform', 'win32']

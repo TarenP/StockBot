@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\fx\passes\splitter_base.py
+# hypothesis_version: 6.151.9
+
+[100, '--allow-non-tensor', '--allow_non_tensor', '--max-acc-splits', '--max_acc_splits', '--skip-fusion', '--skip_fusion', 'AliceBlue', 'Checking inputs...\n', 'Checking outputs...\n', 'FxNetAccNodesFinder', 'SplitResult', 'Subgraph', '_', '_run_on_cpu_', 'acc', 'call_module', 'chartreuse1', 'crimson', 'default', 'dtype', 'fillcolor', 'get_attr', 'node_support', 'node_support.dot', 'output', 'placeholder', 'preview', 'store_true', 'supported', 'tag', 'tensor_meta', 'unsupported']

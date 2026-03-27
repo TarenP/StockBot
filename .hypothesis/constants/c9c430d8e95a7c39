@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\pandas\core\base.py
+# hypothesis_version: 6.151.9
+
+[1000, 'Index', 'IndexOpsMixin', '__frozen', '__setstate__', '_cache', 'duplicated', 'first', 'ignore', 'inplace', 'klass', 'largest', 'left', 'max', 'memory_usage', 'min', 'right', 'searchsorted', 'smallest', 'tolist', 'unique']

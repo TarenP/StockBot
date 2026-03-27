@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\_higher_order_ops\utils.py
+# hypothesis_version: 6.151.9
+
+['eager', 'fake', 'placeholder', 'pos', 'real', 'requires_grad', 'sym_int_args', 'val']

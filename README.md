@@ -96,6 +96,13 @@ top_n          = 500      # sufficient universe for a $10k daily broker
 max_daily_loss = 0.025    # tighter during paper trading — 2.5% daily halt
 max_drawdown   = 0.12     # tighter during paper trading — 12% circuit breaker
 no_options     = true     # disabled until stock-side edge is proven in paper trading
+
+# RL integration (opt-in — defaults to heuristic mode)
+rl_enabled            = false              # set true to activate RL ranking
+rl_checkpoint_path    = models/best_fold9.pt
+rl_phase              = 1                  # 1=ranking, 2=ranking+exits, 3=weights (future)
+rl_exit_threshold     = 0.30              # Phase 2: sell if rl_score drops below this
+rl_conviction_drop    = 0.20              # Phase 2: sell 50% if score drops by this much
 ```
 
 ---
@@ -217,10 +224,40 @@ the harder it becomes to add more. The `max_sector` config sets a hard cap.
 7. Applies sector budget, penny cap, cash floor, and volatility scaling
 8. Applies execution cost estimate (spread model) before buying
 
+### RL integration (opt-in)
+
+Set `rl_enabled = true` in `broker.config` (or pass `--rl_enabled`) to
+activate the RL model for live decisions. The broker operates in hard
+model-required mode — if the checkpoint is missing or fails to load, the
+cycle aborts rather than silently falling back to heuristics.
+
+**Phase 1 — RL as ranking controller (default when enabled):**
+The screener still narrows the universe to a shortlist. The RL model then
+ranks candidates by conviction score instead of the heuristic composite
+score. All existing risk controls (sector cap, penny cap, ATR stop, cash
+floor) still apply after RL ranking. Options are suppressed while RL is
+active.
+
+**Phase 2 — RL conviction-drop exits (`rl_phase = 2`):**
+In addition to Phase 1 ranking, the RL model checks held positions each
+cycle. If the current RL score drops below `rl_exit_threshold` (default
+0.30), the position is sold. If it drops by more than `rl_conviction_drop`
+(default 0.20) relative to the score at entry, 50% of the position is sold.
+RL exits run before heuristic exits each cycle.
+
+```bash
+# Enable RL for one run
+python Broker.py --rl_enabled --rl_checkpoint_path models/best_fold9.pt
+
+# Enable Phase 2 exits
+python Broker.py --rl_enabled --rl_phase 2
+```
+
+Run the ablation study before enabling RL in production to verify it
+actually improves on the heuristic baseline.
+
 ### Options trading
 After stock decisions, evaluates top-scored stocks for options:
-
-| Signal condition | Strategy | Why |
 |-----------------|----------|-----|
 | Score > 0.75 + strong positive sentiment | Long Call | Leveraged bullish bet |
 | Score > 0.65 + mild positive sentiment | Bull Call Spread | Cheaper bullish, defined risk |
@@ -322,6 +359,25 @@ python Agent.py --mode replay --sensitivity        # also run sensitivity sweep
 The sensitivity sweep runs the replay across 13 parameter combinations to
 test whether results are robust or collapse under parameter changes.
 
+### RL ablation study
+```bash
+python Agent.py --mode ablation --rl_checkpoint models/best_fold9.pt
+```
+Runs all four strategy variants over the same historical period and produces
+a side-by-side comparison:
+
+| Variant | Screener | Ranking |
+|---|---|---|
+| `heuristics_only` | Rule-based | Composite score (baseline) |
+| `screener_heuristics` | TickerScorer ML | Composite score |
+| `screener_rl` | TickerScorer ML | RL score |
+| `rl_weights` | TickerScorer ML | Direct RL weights |
+
+Saves `plots/ablation_report.csv` and `plots/ablation.png`. Prints a gate
+result (`PASSED`/`FAILED`) — the RL variant must beat the heuristic baseline
+by at least 0.10 Sharpe without worsening max drawdown by more than 5pp
+before the integration is considered production-ready.
+
 ### Update data manually
 ```bash
 python Agent.py --mode update
@@ -403,6 +459,7 @@ pipeline/
   backtest.py                 RL agent backtest vs SPY
   benchmark.py                SPY benchmark metrics (beta, alpha, IR, capture)
   screener.py                 Per-ticker buy signal scorer (all 11,500+ tickers)
+  rl_inference.py             RL inference wrapper (get_rl_targets, WeightAdapter stub)
   sentiment.py                News scraper + FinBERT scorer
   updater.py                  yfinance price fetcher
   scheduler.py                Daily/weekly automation
@@ -414,7 +471,7 @@ broker/
   analyst.py                  On-demand stock research (live price + news)
   options.py                  Options strategies, Greeks, cash-secured accounting
   risk.py                     Portfolio risk engine + startup validation
-  replay.py                   Broker replay backtest + sensitivity sweep
+  replay.py                   Broker replay backtest + sensitivity sweep + ablation
   sectors.py                  Dynamic sector scoring and allocation
   validator.py                Data quality cross-verification (30%+ move check)
   universe.py                 New stock discovery (Finviz + Yahoo trending)

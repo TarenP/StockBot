@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\pandas\core\groupby\grouper.py
+# hypothesis_version: 6.151.9
+
+[', ', '__len__', 'axis', 'dropna', 'dtype', 'first', 'freq', 'int', 'key', 'level', 'mM', 'mergesort', 'name', 'ndim', 'sort']

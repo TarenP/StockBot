@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\export\dynamic_shapes.py
+# hypothesis_version: 6.151.9
+
+[' = ', 'Constraint', 'Dim', 'ShapeEnv', 'Source', 'Suggested fixes:', 'Symbol', '__main__', '__name__', 'dim', 'dims', 'fn', 'inputs', 'max', 'min', 'mismatch', 'root', 't_id', 'value']

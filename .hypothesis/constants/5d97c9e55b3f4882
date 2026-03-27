@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\_ops.py
+# hypothesis_version: 6.151.9
+
+['.', '::', 'BaseFunctionalizeAPI', 'HigherOrderOperator', 'OpOverload', 'Python', '_P', '_T', '__', '__file__', '__origin__', '__self__', '_ops.py', 'default', 'getdlopenflags', 'higher_order', 'setdlopenflags', 'torch.ops', 'torch.ops.', '{}.{}', '{}.{}.{}']

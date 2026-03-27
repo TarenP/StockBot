@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\random.py
+# hypothesis_version: 6.151.9
+
+['_is_in_bad_fork', 'cuda', 'devices', 'fork_rng', 'manual_seed_all', 'meta']

@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\nn\parallel\data_parallel.py
+# hypothesis_version: 6.151.9
+
+[0.75, 'DataParallel', 'DataParallel.forward', 'T', 'cuda', 'data_parallel', 'mps']

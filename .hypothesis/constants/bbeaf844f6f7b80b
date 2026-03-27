@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\trio\_subprocess.py
+# hypothesis_version: 6.151.9
+
+[434, 'bufsize', 'encoding', 'errors', 'linux', 'nt', 'open_process', 'posix', 'run_process', 'shell', 'stderr', 'stdin', 'stdout', 'text', 'universal_newlines', 'win32']

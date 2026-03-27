@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\export\_remove_effect_tokens_pass.py
+# hypothesis_version: 6.151.9
+
+['call_function', 'output', 'placeholder', 'val']

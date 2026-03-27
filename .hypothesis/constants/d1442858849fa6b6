@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\cloudpickle\__init__.py
+# hypothesis_version: 6.151.9
+
+['3.1.1', 'CloudPickler', 'Pickler', '__version__', 'dump', 'dumps', 'load', 'loads']

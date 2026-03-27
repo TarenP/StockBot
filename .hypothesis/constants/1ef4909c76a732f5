@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\distributions\constraint_registry.py
+# hypothesis_version: 6.151.9
+
+['ConstraintRegistry', 'biject_to', 'transform_to']

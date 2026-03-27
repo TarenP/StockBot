@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\yfinance\ticker.py
+# hypothesis_version: 6.151.9
+
+['%Y-%m-%d', 'Options', 'ask', 'bid', 'calls', 'change', 'contractSize', 'contractSymbol', 'currency', 'expirationDates', 'impliedVolatility', 'inTheMoney', 'lastPrice', 'lastTradeDate', 'openInterest', 'optionChain', 'options', 'percentChange', 'puts', 'quarterly', 'quote', 'result', 's', 'strike', 'trailing', 'underlying', 'volume', 'yearly']

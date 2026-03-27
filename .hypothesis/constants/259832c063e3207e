@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\multiprocessing\__init__.py
+# hypothesis_version: 6.151.9
+
+['darwin', 'file_descriptor', 'file_system', 'get_sharing_strategy', 'set_sharing_strategy', 'win32']

@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\backends\mps\__init__.py
+# hypothesis_version: 6.151.9
+
+['IMPL', 'MPS', 'aten', 'is_available', 'is_built', 'is_macos13_or_newer', 'is_macos_or_newer', 'native_group_norm']

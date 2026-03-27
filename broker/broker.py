@@ -164,6 +164,9 @@ def run_cycle(
             adj_value = risk.apply_execution_cost(d.shares * d.price, d.price, is_penny)
             adj_shares = adj_value / d.price if d.price > 0 else 0
             ok = portfolio.buy(d.ticker, adj_shares, d.price, d.reason)
+            # Store rl_score_at_entry in position metadata when RL is enabled
+            if ok and hasattr(d, "_rl_score_at_entry") and d.ticker in portfolio.positions:
+                portfolio.positions[d.ticker]["rl_score_at_entry"] = d._rl_score_at_entry
 
         elif d.action == "SELL":
             ok = portfolio.sell_all(d.ticker, d.price, d.reason)
@@ -267,10 +270,15 @@ def parse_args(config: dict = None):
     p.add_argument("--top_n",          type=int,   default=cfg.get("top_n",          500))
     p.add_argument("--max_daily_loss", type=float, default=cfg.get("max_daily_loss", 0.025))
     p.add_argument("--max_drawdown",   type=float, default=cfg.get("max_drawdown",   0.12))
-    p.add_argument("--no_options",     action="store_true", default=cfg.get("no_options", True))
-    p.add_argument("--no_market_hours",action="store_true", default=False)
-    p.add_argument("--status",         action="store_true")
-    p.add_argument("--trades",         action="store_true")
+    p.add_argument("--no_options",        action="store_true", default=cfg.get("no_options", True))
+    p.add_argument("--no_market_hours",   action="store_true", default=False)
+    p.add_argument("--status",            action="store_true")
+    p.add_argument("--trades",            action="store_true")
+    p.add_argument("--rl_enabled",        action="store_true", default=cfg.get("rl_enabled", False))
+    p.add_argument("--rl_checkpoint_path",type=str,   default=cfg.get("rl_checkpoint_path", "models/best_fold9.pt"))
+    p.add_argument("--rl_phase",          type=int,   default=cfg.get("rl_phase",          1))
+    p.add_argument("--rl_exit_threshold", type=float, default=cfg.get("rl_exit_threshold", 0.30))
+    p.add_argument("--rl_conviction_drop",type=float, default=cfg.get("rl_conviction_drop", 0.20))
     return p.parse_args()
 
 
@@ -308,6 +316,11 @@ def main(config: dict = None):
         max_sector_pct      = args.max_sector,
         avoid_earnings_days = args.avoid_earnings,
         device              = DEVICE,
+        rl_enabled          = args.rl_enabled,
+        rl_checkpoint_path  = args.rl_checkpoint_path,
+        rl_phase            = args.rl_phase,
+        rl_exit_threshold   = args.rl_exit_threshold,
+        rl_conviction_drop  = args.rl_conviction_drop,
     )
     brain._base_min_score = args.min_score
 

@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\pyarrow\compute.py
+# hypothesis_version: 6.151.9
+
+['\n{}\n', '*', 'Array-like', 'Parameters', '_OptionsClassDoc', 'and', 'and_', 'argument', 'arguments', 'ascending', 'cast', 'coalesce', 'descending', 'dummy', 'hash_aggregate', 'index', 'memory_pool', 'options', 'or', 'or_', 'params', 'random', 'scalar_aggregate', 'select_k_unstable', 'system', 'take', 'vector']

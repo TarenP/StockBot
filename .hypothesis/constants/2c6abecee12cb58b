@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\fx\experimental\proxy_tensor.py
+# hypothesis_version: 6.151.9
+
+[',', '.', 'PythonKeyTracer', 'R', 'T', 'U', '_ExtractValType', '_NestedProxys', '_NestedTensors', '_P', '__code__', '_modules', '_orig_mod', '_param_constant', 'arg_kwarg_vals', 'artifact', 'call_function', 'decomposition', 'dispatch_trace', 'encoding', 'export/_trace.py', 'fake', 'fn', 'forward', 'get_attr', 'get_proxy_mode', 'handle_sym_dispatch', 'make_fx', 'make_fx_fail_partial', 'meta', 'name', 'nn_module_stack', 'not_implemented', 'original_aten', 'output', 'placeholder', 'py_sym_types', 'real', 'self', 'stack_trace', 'string', 'symbolic', 'tensor_meta', 'torch.Size', 'torch/__init__.py', 'torch_fn', 'unbacked_bindings', 'val']

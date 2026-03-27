@@ -1,0 +1,4 @@
+# file: C:\Users\taren\Documents\Github Repositories\StockBot\broker\options.py
+# hypothesis_version: 6.151.9
+
+[-0.1, 0.0, 1e-09, 0.001, 0.01, 0.05, 0.1, 0.15, 0.3, 0.35, 0.5, 0.6, 0.65, 0.75, 0.8, 0.9, 0.92, 0.95, 1.0, 1.05, 1.1, 1.2, 5.0, 100, 365, '%Y-%m-%d', 'Bearish', 'Moderate bullish', 'Strong bullish', 'ask', 'bid', 'call', 'calls', 'delta', 'expiry', 'gamma', 'impliedVolatility', 'inf', 'iv', 'long', 'openInterest', 'price', 'put', 'puts', 'short', 'strike', 'theta', 'vega', 'volume', 'w', 'yfinance']

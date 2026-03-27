@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\utils\data\_utils\pin_memory.py
+# hypothesis_version: 6.151.9
+
+['_fields', 'cuda', 'pin_memory', 'pt_data_pin', 'xpu']

@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\fx\passes\runtime_assert.py
+# hypothesis_version: 6.151.9
+
+['%s', 'call_method', 'example_value', 'graph_code', 'nn_module_stack', 'placeholder', 'size', 'stack_trace', 'stride', 'sympy.Expr', 'unbacked_bindings', 'val']

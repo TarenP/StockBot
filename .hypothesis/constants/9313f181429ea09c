@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\curl_cffi\requests\models.py
+# hypothesis_version: 6.151.9
+
+[0.0, 200, 'Content-Type', 'OK', '_encoding', '_text', 'charset=([\\w-]+)', 'replace', 'utf-8', 'utf-8-sig']

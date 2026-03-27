@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torchgen\utils.py
+# hypothesis_version: 6.151.9
+
+['"', '(', '(^|\\W){}($|\\W)', ')', ', ', '.', '::', '@', 'Everything', 'S', 'T', '[', ']', '__main__', 'gen.py', 'generated_comment', 'latin1', 'little', 'set({}\n    {})', 'shard_id', 'templates', 'torchgen', 'w', '{', '}']

@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\pandas\core\indexers\objects.py
+# hypothesis_version: 6.151.9
+
+['both', 'int64', 'left', 'neither', 'right', 'window_size']

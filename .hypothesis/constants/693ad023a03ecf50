@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\xpu\memory.py
+# hypothesis_version: 6.151.9
+
+['.', 'empty_cache', 'max_memory_allocated', 'max_memory_reserved', 'mem_get_info', 'memory_allocated', 'memory_reserved', 'memory_stats']

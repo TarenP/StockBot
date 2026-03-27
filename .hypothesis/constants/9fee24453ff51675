@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\ao\nn\quantized\modules\conv.py
+# hypothesis_version: 6.151.9
+
+[1.0, ' but got:', ' nnq.', ', bias=False', ', groups={groups}', ', padding={padding}', 'Conv1d', 'Conv2d', 'Conv3d', 'ConvTranspose1d', 'ConvTranspose2d', 'ConvTranspose3d', 'QuantizedConv1d', 'QuantizedConv2d', 'QuantizedConv3d', 'bias', 'device', 'dtype', 'qconfig', 'reflect', 'scale', 'weight', 'weight_fake_quant', 'zero_point', 'zeros']

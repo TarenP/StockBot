@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\_functorch\_aot_autograd\utils.py
+# hypothesis_version: 6.151.9
+
+['%s', '_boxed_call', '_export_root', '_orig_mod', 'aot_graphs_effects', 'backward', 'call_function', 'cpu', 'cuda', 'forward', 'fwd_nn_module_stack', 'fwd_source_fn_stack', 'nn_module_stack', 'output', 'placeholder', 'seq_nr', 'source_fn_stack', 'tags', 'tensor_meta', 'val']

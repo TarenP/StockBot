@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\mtia\memory.py
+# hypothesis_version: 6.151.9
+
+['dram', 'max_memory_allocated', 'memory_stats', 'peak_bytes']

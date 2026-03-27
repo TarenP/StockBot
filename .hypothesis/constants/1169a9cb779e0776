@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\_higher_order_ops\executorch_call_delegate.py
+# hypothesis_version: 6.151.9
+
+['LoweredBackendModule', 'call_function']

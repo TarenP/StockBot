@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\nn\utils\rnn.py
+# hypothesis_version: 6.151.9
+
+[0.0, 'PackedSequence', '_R', '_T', 'cpu', 'cuda', 'device', 'dtype', 'invert_permutation', 'pack_padded_sequence', 'pack_sequence', 'pad_packed_sequence', 'pad_sequence', 'right', 'unpack_sequence', 'unpad_sequence']

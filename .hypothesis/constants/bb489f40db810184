@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\amp\autocast_mode.py
+# hypothesis_version: 6.151.9
+
+[' currently.', ', ', 'autocast', 'autocast_decorator', 'cpu', 'cuda', 'custom_bwd', 'custom_fwd', 'hpu', 'ipu', 'mps', 'mtia', 'xla', 'xpu']

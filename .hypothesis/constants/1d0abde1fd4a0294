@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\yfinance\scrapers\analysis.py
+# hypothesis_version: 6.151.9
+
+['%Y-%m-%d', ',', 'all', 'corsDomain', 'current', 'currentPrice', 'earningsEstimate', 'earningsHistory', 'earningsTrend', 'epsRevisions', 'epsTrend', 'estimates', 'false', 'finance.yahoo.com', 'financialData', 'fmt', 'formatted', 'growth', 'history', 'indexTrend', 'industryTrend', 'modules', 'period', 'price', 'quarter', 'quoteSummary', 'raw', 'result', 'revenueEstimate', 'sectorTrend', 'stockTrend', 'symbol', 'target', 'trend']

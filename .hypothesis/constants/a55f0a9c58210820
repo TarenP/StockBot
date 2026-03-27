@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\nn\init.py
+# hypothesis_version: 6.151.9
+
+[-2.0, 0.0, 0.01, 1.0, 2.0, 3.0, 5.0, 'conv1d', 'conv2d', 'conv3d', 'conv_transpose1d', 'conv_transpose2d', 'conv_transpose3d', 'fan_in', 'fan_out', 'leaky_relu', 'linear', 'relu', 'selu', 'sigmoid', 'tanh']

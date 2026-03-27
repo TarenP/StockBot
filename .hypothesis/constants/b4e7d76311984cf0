@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\ao\quantization\pt2e\graph_utils.py
+# hypothesis_version: 6.151.9
+
+['add', 'add_', 'call_function', 'get_attr', 'get_equivalent_types', 'mul', 'mul_', 'output', 'placeholder']

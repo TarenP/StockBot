@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\_functorch\eager_transforms.py
+# hypothesis_version: 6.151.9
+
+['error', 'inputs', 'jacfwd', 'jacrev', 'mutations', 'mutations_and_views', 'outputs', 'primals', 'tangents', 'torch.func', 'vjp(f, *primals)']

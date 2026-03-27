@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\pandas\core\internals\__init__.py
+# hypothesis_version: 6.151.9
+
+['ArrayManager', 'Block', 'BlockManager', 'DataManager', 'DatetimeTZBlock', 'ExtensionBlock', 'NumericBlock', 'ObjectBlock', 'SingleArrayManager', 'SingleBlockManager', 'SingleDataManager', 'concatenate_managers', 'make_block']

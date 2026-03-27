@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\fx\passes\utils\source_matcher_utils.py
+# hypothesis_version: 6.151.9
+
+['.', 'SourcePartition', 'WARNING', 'get_attr', 'source_fn_stack', 'torch_fn']

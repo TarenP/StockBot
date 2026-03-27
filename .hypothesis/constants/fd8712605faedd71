@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\export\exported_program.py
+# hypothesis_version: 6.151.9
+
+['CallSpec', 'CustomDecompTable', 'ExportedProgram', 'ModuleCallEntry', 'ModuleCallSignature', 'aten', 'call_function', 'from_node', 'in_spec', 'original_callable', 'out_spec', 'output', 'placeholder', 'val']

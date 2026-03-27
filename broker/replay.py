@@ -194,6 +194,8 @@ class ReplayPortfolio:
 def run_replay(
     df_features: pd.DataFrame,
     price_lookup: pd.DataFrame,
+    strategy: str = "heuristics_only",
+    checkpoint_path: str | None = None,
     initial_cash: float = 10_000.0,
     rebalance_freq: int = 5,          # run broker logic every N trading days
     max_positions: int = 20,
@@ -203,14 +205,28 @@ def run_replay(
     penny_pct: float = 0.20,
     max_sector_pct: float = 0.40,
     execution_spread: float = 0.001,  # 10 bps flat for replay simplicity
-    label: str = "Broker Replay",
+    label: str | None = None,
 ) -> tuple[np.ndarray, list]:
     """
     Run the broker decision logic over historical data.
 
-    Returns:
-        (daily_returns, trade_log)
+    Parameters
+    ----------
+    strategy : str
+        One of "heuristics_only", "screener_heuristics", "screener_rl", "rl_weights".
+    checkpoint_path : str | None
+        Path to a PortfolioTransformer .pt checkpoint. Required for
+        "screener_rl" and "rl_weights" strategies.
+    label : str | None
+        Display label for the progress bar. Defaults to the strategy name.
+
+    Returns
+    -------
+    (daily_returns, trade_log)
     """
+    if label is None:
+        label = strategy
+
     import broker.brain as brain_module
     from broker.brain import BrokerBrain, Decision
     from broker.sectors import score_sectors, compute_target_allocations, get_portfolio_sector_weights
@@ -301,13 +317,76 @@ def run_replay(
         except KeyError:
             continue
 
-        snap["_score"] = (
-            snap.get("ret_5d",    0) * 0.3 +
-            snap.get("vol_ratio", 0) * 0.2 +
-            snap.get("sent_net",  0) * 0.3 +
-            snap.get("macd_hist", 0) * 0.2
-        )
-        candidates = snap.nlargest(50, "_score").index.tolist()
+        # ── Strategy: build candidate shortlist ───────────────────────────────
+        if strategy == "heuristics_only":
+            # Rule-based _score for shortlisting
+            snap["_score"] = (
+                snap.get("ret_5d",    0) * 0.3 +
+                snap.get("vol_ratio", 0) * 0.2 +
+                snap.get("sent_net",  0) * 0.3 +
+                snap.get("macd_hist", 0) * 0.2
+            )
+            candidates = snap.nlargest(50, "_score").index.tolist()
+            rl_scores  = None
+            rl_weights = None
+        else:
+            # screener_heuristics / screener_rl / rl_weights — use TickerScorer
+            screener_candidates = None
+            try:
+                from pipeline.screener import run_screener
+                import torch
+                screener_df = run_screener(
+                    df_slice,
+                    device=torch.device("cpu"),
+                    top_n=50,
+                )
+                if not screener_df.empty and "ticker" in screener_df.columns:
+                    screener_candidates = screener_df["ticker"].tolist()
+            except Exception as exc:
+                logger.warning(
+                    "Screener unavailable on %s (%s) — falling back to rule-based shortlist",
+                    date, exc,
+                )
+
+            if screener_candidates is None:
+                # Fallback to rule-based
+                snap["_score"] = (
+                    snap.get("ret_5d",    0) * 0.3 +
+                    snap.get("vol_ratio", 0) * 0.2 +
+                    snap.get("sent_net",  0) * 0.3 +
+                    snap.get("macd_hist", 0) * 0.2
+                )
+                screener_candidates = snap.nlargest(50, "_score").index.tolist()
+
+            candidates = screener_candidates
+            rl_scores  = None
+            rl_weights = None
+
+            # ── RL scoring for screener_rl / rl_weights ───────────────────────
+            if strategy in ("screener_rl", "rl_weights") and checkpoint_path is not None:
+                try:
+                    from pipeline.rl_inference import get_rl_targets
+                    rl_mode = "rank" if strategy == "screener_rl" else "weights"
+                    rl_result = get_rl_targets(
+                        df_slice, candidates, checkpoint_path, mode=rl_mode
+                    )
+                    if strategy == "screener_rl":
+                        rl_scores = rl_result   # pd.Series[ticker → rl_score]
+                    else:
+                        rl_weights = rl_result  # pd.Series[ticker|CASH → rl_weight]
+                except Exception as exc:
+                    logger.warning(
+                        "RL inference failed on %s (%s) — falling back to heuristic ranking",
+                        date, exc,
+                    )
+
+            # Sort candidates by rl_score when screener_rl
+            if strategy == "screener_rl" and rl_scores is not None:
+                candidates = sorted(
+                    candidates,
+                    key=lambda t: float(rl_scores.get(t, 0.0)),
+                    reverse=True,
+                )
 
         # ── Sector scoring ────────────────────────────────────────────────────
         sector_scores_map = score_sectors(df_slice, sector_map)
@@ -330,6 +409,8 @@ def run_replay(
                 break
             if ticker in portfolio.positions:
                 continue
+            if ticker == "CASH":
+                continue
 
             # Get price
             try:
@@ -339,7 +420,7 @@ def run_replay(
             except (KeyError, Exception):
                 continue
 
-            # Get composite score from features
+            # ── Compute composite_score (used for heuristics_only and screener_heuristics) ──
             try:
                 feats = df_slice.loc[date, ticker]
                 sent_net = float(feats.get("sent_net", 0.0))
@@ -349,7 +430,7 @@ def run_replay(
                 vol      = float(feats.get("vol_ratio",1.0))
                 surprise = float(feats.get("sent_surprise", 0.0))
 
-                score = (
+                composite_score = (
                     np.clip(0.5 + mom5 * 5, 0, 1) * 0.15 +
                     np.clip(0.5 + mom5 * 2, 0, 1) * 0.10 +
                     np.clip(1.0 - abs(rsi - 52.5) / 52.5, 0, 1) * 0.10 +
@@ -360,11 +441,9 @@ def run_replay(
                     0.05   # bb_pct neutral
                 )
             except (KeyError, Exception):
-                continue
+                composite_score = 0.0
 
-            if score < min_score:
-                continue
-
+            # ── Determine effective score and alloc_value per strategy ─────────
             is_penny = price < 5.0
             sector   = sector_map.get(ticker, "Unknown")
 
@@ -382,22 +461,49 @@ def run_replay(
             if sector_budget <= equity * 0.01:
                 continue
 
-            conviction  = (score - min_score) / (1.0 - min_score)
-            alloc_pct   = np.clip(0.10 * conviction, 0.01, 0.10)
-            alloc_value = min(equity * alloc_pct, sector_budget,
-                              portfolio.cash * 0.95)
-            if is_penny:
-                alloc_value = min(alloc_value, equity * penny_pct - penny_value)
+            if strategy == "rl_weights" and rl_weights is not None:
+                # Size directly from rl_weight × equity
+                weight = float(rl_weights.get(ticker, 0.0))
+                if weight <= 0.0:
+                    continue
+                alloc_value = weight * equity
+                alloc_value = min(alloc_value, sector_budget, portfolio.cash * 0.95)
+                if is_penny:
+                    alloc_value = min(alloc_value, equity * penny_pct - penny_value)
+                score = weight  # for logging
+            elif strategy == "screener_rl" and rl_scores is not None:
+                # Rank by rl_score, apply min_score threshold to rl_score
+                score = float(rl_scores.get(ticker, 0.0))
+                if score < min_score:
+                    continue
+                conviction  = (score - min_score) / (1.0 - min_score)
+                alloc_pct   = np.clip(0.10 * conviction, 0.01, 0.10)
+                alloc_value = min(equity * alloc_pct, sector_budget,
+                                  portfolio.cash * 0.95)
+                if is_penny:
+                    alloc_value = min(alloc_value, equity * penny_pct - penny_value)
+            else:
+                # heuristics_only or screener_heuristics — rank by composite_score
+                score = composite_score
+                if score < min_score:
+                    continue
+                conviction  = (score - min_score) / (1.0 - min_score)
+                alloc_pct   = np.clip(0.10 * conviction, 0.01, 0.10)
+                alloc_value = min(equity * alloc_pct, sector_budget,
+                                  portfolio.cash * 0.95)
+                if is_penny:
+                    alloc_value = min(alloc_value, equity * penny_pct - penny_value)
 
-            # Apply execution cost
+            # Apply execution cost (same across all strategies)
             alloc_value *= (1.0 - execution_spread)
             shares = alloc_value / price
             if shares < 0.001 or alloc_value < 1.0:
                 continue
 
-            portfolio.buy(ticker, shares, price, f"score={score:.2f}")
+            portfolio.buy(ticker, shares, price, f"score={score:.4f}")
             trade_log.append({"date": str(date), "action": "BUY", "ticker": ticker,
-                               "price": price, "score": score, "sector": sector})
+                               "price": price, "score": score, "sector": sector,
+                               "strategy": strategy})
             sector_spent[sector] = sector_spent.get(sector, 0.0) + alloc_value
             if is_penny:
                 penny_value += alloc_value
@@ -576,6 +682,42 @@ def run_full_replay(
     return broker_rets, trade_log
 
 
+def _check_ablation_gate(report_df: pd.DataFrame) -> str:
+    """
+    Returns "PASSED" or "FAILED".
+    Gate conditions:
+      - screener_rl Sharpe >= heuristics_only Sharpe + 0.10
+      - screener_rl max_drawdown <= heuristics_only max_drawdown + 0.05
+    """
+    rl_row   = report_df[report_df["strategy"] == "screener_rl"].iloc[0]
+    base_row = report_df[report_df["strategy"] == "heuristics_only"].iloc[0]
+
+    rl_sharpe   = float(rl_row["sharpe"])
+    base_sharpe = float(base_row["sharpe"])
+    rl_dd       = float(rl_row["max_drawdown"])
+    base_dd     = float(base_row["max_drawdown"])
+
+    sharpe_ok   = rl_sharpe >= base_sharpe + 0.10
+    drawdown_ok = rl_dd <= base_dd + 0.05
+
+    if not sharpe_ok:
+        print(
+            f"⚠️  ABLATION GATE FAILED: screener_rl Sharpe ({rl_sharpe:.4f}) "
+            f"did not exceed heuristics_only Sharpe ({base_sharpe:.4f}) + 0.10 "
+            f"(required >= {base_sharpe + 0.10:.4f})"
+        )
+    if not drawdown_ok:
+        print(
+            f"⚠️  ABLATION GATE FAILED: screener_rl max_drawdown ({rl_dd:.4f}) "
+            f"exceeded heuristics_only max_drawdown ({base_dd:.4f}) + 0.05 "
+            f"(required <= {base_dd + 0.05:.4f})"
+        )
+
+    result = "PASSED" if (sharpe_ok and drawdown_ok) else "FAILED"
+    logger.info("Ablation gate: %s", result)
+    return result
+
+
 def _equal_weight_returns(
     df_features: pd.DataFrame,
     price_lookup: pd.DataFrame,
@@ -597,3 +739,149 @@ def _equal_weight_returns(
                 pass
         rets.append(float(np.mean(day_rets)) if day_rets else 0.0)
     return np.array(rets)
+
+
+# ── Ablation report ───────────────────────────────────────────────────────────
+
+def run_ablation(
+    df_features: pd.DataFrame,
+    price_lookup: pd.DataFrame,
+    checkpoint_path: str | None = None,
+    initial_cash: float = 10_000.0,
+    replay_years: int = 3,
+    save_report: str = "plots/ablation_report.csv",
+    save_plot: str = "plots/ablation.png",
+) -> pd.DataFrame:
+    """
+    Run all four strategy variants over the same historical period and
+    produce a side-by-side AblationReport DataFrame.
+
+    Parameters
+    ----------
+    df_features : pd.DataFrame
+        MultiIndex [date, ticker] feature DataFrame.
+    price_lookup : pd.DataFrame
+        Raw close prices indexed by [date, ticker].
+    checkpoint_path : str | None
+        Path to a PortfolioTransformer .pt checkpoint.
+        Required for "screener_rl" and "rl_weights" variants.
+    initial_cash : float
+        Starting cash for every variant.
+    replay_years : int
+        How many trailing years of df_features to use.
+    save_report : str
+        CSV output path for the AblationReport.
+    save_plot : str
+        PNG output path for the Sharpe bar chart.
+
+    Returns
+    -------
+    pd.DataFrame
+        AblationReport with columns:
+        strategy, total_return, ann_return, sharpe, max_drawdown,
+        win_rate, spy_alpha, n_trades
+    """
+    import os
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from pipeline.benchmark import compute_metrics, fetch_spy_returns
+
+    # ── Restrict to replay window (same pattern as run_full_replay) ───────────
+    dates  = sorted(df_features.index.get_level_values("date").unique())
+    cutoff = pd.Timestamp(dates[-1]) - pd.DateOffset(years=replay_years)
+    df_replay = df_features[df_features.index.get_level_values("date") >= cutoff]
+
+    replay_dates = sorted(df_replay.index.get_level_values("date").unique())
+    logger.info(
+        "Ablation period: %s → %s (%d years, %d trading days)",
+        replay_dates[0].date(), replay_dates[-1].date(),
+        replay_years, len(replay_dates),
+    )
+
+    # ── Fetch SPY returns for the same window ─────────────────────────────────
+    spy_series = fetch_spy_returns(
+        start=replay_dates[0].strftime("%Y-%m-%d"),
+        end=(replay_dates[-1] + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
+    )
+    if not spy_series.empty:
+        spy_ann_return = float(
+            (1 + spy_series.values).prod() ** (252 / max(len(spy_series), 1)) - 1
+        )
+    else:
+        spy_ann_return = 0.0
+    logger.info("SPY annualised return over ablation window: %.4f", spy_ann_return)
+
+    # ── Four strategy variants ────────────────────────────────────────────────
+    variants = [
+        ("heuristics_only",    None),
+        ("screener_heuristics", None),
+        ("screener_rl",        checkpoint_path),
+        ("rl_weights",         checkpoint_path),
+    ]
+
+    rows = []
+    for strategy, ckpt in variants:
+        logger.info("Running ablation variant: %s", strategy)
+        rets, trade_log = run_replay(
+            df_replay,
+            price_lookup,
+            strategy=strategy,
+            checkpoint_path=ckpt,
+            initial_cash=initial_cash,
+            label=strategy,
+        )
+
+        m = compute_metrics(rets, label=strategy)
+        n_trades = sum(1 for t in trade_log if t["action"] == "BUY")
+
+        rows.append({
+            "strategy":     strategy,
+            "total_return": m["total_return"],
+            "ann_return":   m["ann_return"],
+            "sharpe":       m["sharpe"],
+            "max_drawdown": m["max_drawdown"],
+            "win_rate":     m["win_rate"],
+            "spy_alpha":    m["ann_return"] - spy_ann_return,
+            "n_trades":     n_trades,
+        })
+
+    report_df = pd.DataFrame(rows, columns=[
+        "strategy", "total_return", "ann_return", "sharpe",
+        "max_drawdown", "win_rate", "spy_alpha", "n_trades",
+    ])
+
+    # ── Ablation gate ─────────────────────────────────────────────────────────
+    gate_result = _check_ablation_gate(report_df)
+    logger.info("Ablation gate result: %s", gate_result)
+
+    # ── Save CSV report ───────────────────────────────────────────────────────
+    os.makedirs(os.path.dirname(save_report) if os.path.dirname(save_report) else ".", exist_ok=True)
+    report_df.to_csv(save_report, index=False)
+    logger.info("Ablation report saved → %s", save_report)
+
+    # ── Save Sharpe bar chart ─────────────────────────────────────────────────
+    os.makedirs(os.path.dirname(save_plot) if os.path.dirname(save_plot) else ".", exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    strategies = report_df["strategy"].tolist()
+    sharpes    = report_df["sharpe"].tolist()
+    colors     = ["#4CAF50" if s >= 0 else "#F44336" for s in sharpes]
+    bars = ax.bar(strategies, sharpes, color=colors, edgecolor="white", linewidth=0.8)
+    ax.axhline(0, color="black", lw=0.8, ls="--", alpha=0.5)
+    ax.set_title("Ablation Study — Sharpe Ratio by Strategy", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Sharpe Ratio")
+    ax.set_xlabel("Strategy")
+    for bar, val in zip(bars, sharpes):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.01,
+            f"{val:.3f}",
+            ha="center", va="bottom", fontsize=9,
+        )
+    plt.xticks(rotation=15, ha="right")
+    plt.tight_layout()
+    plt.savefig(save_plot, dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info("Ablation chart saved → %s", save_plot)
+
+    return report_df

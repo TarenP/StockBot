@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\yfinance\scrapers\fundamentals.py
+# hypothesis_version: 6.151.9
+
+[2016, '&type=', ',', 'D', 'Financials', '^', 'annual', 'asOfDate', 'balance-sheet', 'cash-flow', 'financials', 'income', 'meta', 'quarterly', 'raw', 'reportedValue', 'result', 's', 'shares', 'timeseries', 'timestamp', 'trailing', 'yearly']

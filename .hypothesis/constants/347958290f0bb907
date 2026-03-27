@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\_higher_order_ops\associative_scan.py
+# hypothesis_version: 6.151.9
+
+['associative_scan', 'call_function', 'cuda', 'eager', 'generic', 'output', 'pointwise', 'scan_combine_graph', 'tensor_meta']

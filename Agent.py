@@ -47,7 +47,7 @@ def parse_args():
     )
     p.add_argument("--mode", choices=["train", "finetune", "update", "backtest",
                                        "predict", "schedule", "train_screener",
-                                       "screen", "replay"],
+                                       "screen", "replay", "ablation"],
                    default="predict", help="What to do (default: predict)")
     p.add_argument("--top_n",        type=int,   default=1000,      help="Universe size for portfolio agent")
     p.add_argument("--top_k",        type=int,   default=10,       help="Stocks to hold / show")
@@ -68,6 +68,7 @@ def parse_args():
     p.add_argument("--screener_top_n", type=int, default=50,       help="How many picks to show from screener")
     p.add_argument("--replay_years",  type=int, default=3,         help="Years of history to replay (--mode replay)")
     p.add_argument("--sensitivity",   action="store_true",         help="Run sensitivity sweep during replay")
+    p.add_argument("--rl_checkpoint", type=str, default=None,      help="Path to RL checkpoint for ablation/RL modes")
     return p.parse_args()
 
 
@@ -444,6 +445,18 @@ def run_replay_mode(args):
     )
 
 
+def run_ablation_mode(args):
+    from broker.replay import run_ablation, _build_price_lookup
+    df_features, _ = _load_data_and_universe(args.top_n)
+    price_lookup = _build_price_lookup()
+    report = run_ablation(
+        df_features    = df_features,
+        price_lookup   = price_lookup,
+        checkpoint_path= args.rl_checkpoint,
+    )
+    print(report.to_string(index=False))
+
+
 # ── Mode: schedule ────────────────────────────────────────────────────────────
 
 def run_schedule(args):
@@ -474,5 +487,6 @@ if __name__ == "__main__":
         "train_screener": run_train_screener,
         "screen":         run_screen,
         "replay":         run_replay_mode,
+        "ablation":       run_ablation_mode,
     }
     dispatch[args.mode](args)

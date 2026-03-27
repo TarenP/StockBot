@@ -1,0 +1,4 @@
+# file: C:\Users\taren\Documents\Github Repositories\StockBot\broker\analyst.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.05, 0.1, 0.15, 0.2, 0.45, 0.5, 1.0, 3.0, 50.0, 52.5, '%Y-%m-%d', 'Close', 'High', 'Low', 'Open', 'Volume', 'bb_pct', 'close', 'composite_score', 'date', 'headlines', 'macd_hist', 'neg_score', 'negative', 'neutral', 'neutral_score', 'pos_score', 'positive', 'price', 'ret_20d', 'ret_5d', 'rsi', 'sent_net', 'sent_surprise', 'sentiment', 'ticker', 'title', 'vol_ratio', 'volume', 'w', 'yfinance']

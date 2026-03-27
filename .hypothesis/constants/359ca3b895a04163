@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\nn\parameter.py
+# hypothesis_version: 6.151.9
+
+['_is_buffer', '_is_param', 'device', 'dtype', 'method-wrapper']

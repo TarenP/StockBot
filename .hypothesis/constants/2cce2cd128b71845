@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\ao\quantization\pt2e\_numeric_debugger.py
+# hypothesis_version: 6.151.9
+
+['custom', 'nn_module_stack', 'numeric_debug_handle']

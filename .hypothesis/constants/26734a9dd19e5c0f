@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\bs4\builder\_htmlparser.py
+# hypothesis_version: 6.151.9
+
+[256, '&%s', 'CDATA[', 'DOCTYPE ', 'MIT', 'X', 'convert_charrefs', 'html.parser', 'ignore', 'replace', 'windows-1252', 'x', '�']

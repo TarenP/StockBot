@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\_export\wrappers.py
+# hypothesis_version: 6.151.9
+
+['_export_tracepoint', 'call_function', 'in_spec', 'module_call_inputs', 'module_call_outputs', 'out_spec']

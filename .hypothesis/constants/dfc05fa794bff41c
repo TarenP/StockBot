@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\charset_normalizer\models.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.01, 0.02, 1.0, 100, 'CharsetMatch', 'CoherenceMatches', 'English', 'Latin Based', 'Unknown', 'alphabets', 'ascii', 'chaos', 'coherence', 'encoding', 'encoding_aliases', 'has_sig_or_bom', 'is_preferred', 'language', 'path', 'replace', 'strict', 'unicode_path', 'utf_8']

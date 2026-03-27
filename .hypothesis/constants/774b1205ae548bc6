@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\pandas\arrays\__init__.py
+# hypothesis_version: 6.151.9
+
+['ArrowExtensionArray', 'ArrowStringArray', 'BooleanArray', 'Categorical', 'DatetimeArray', 'FloatingArray', 'IntegerArray', 'IntervalArray', 'NumpyExtensionArray', 'PandasArray', 'PeriodArray', 'SparseArray', 'StringArray', 'TimedeltaArray']

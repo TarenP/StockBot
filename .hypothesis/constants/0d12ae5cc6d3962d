@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\_library\custom_ops.py
+# hypothesis_version: 6.151.9
+
+['::', 'ADInplaceOrView', 'AutocastCPU', 'AutocastCUDA', 'Autograd', 'BackendSelect', 'CustomOpDef', 'FRAGMENT', 'FuncTorchBatched', 'cpu', 'cuda', 'disable', 'enable', 'torch.library']

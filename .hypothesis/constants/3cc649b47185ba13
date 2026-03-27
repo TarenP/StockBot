@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\cpu\__init__.py
+# hypothesis_version: 6.151.9
+
+['Event', 'Stream', 'StreamContext', 'cpu', 'current_device', 'current_stream', 'device_count', 'is_available', 'set_device', 'stream', 'synchronize']

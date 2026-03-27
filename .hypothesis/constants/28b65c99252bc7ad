@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\mtia\__init__.py
+# hypothesis_version: 6.151.9
+
+['all', 'current_device', 'current_stream', 'default_stream', 'device', 'device_count', 'empty_cache', 'get_rng_state', 'init', 'is_available', 'is_initialized', 'is_initializing', 'max_memory_allocated', 'memory_stats', 'mtia', 'python', 'set_device', 'set_rng_state', 'set_stream', 'snapshot', 'stream', 'synchronize', 'torch.mtia.Stream']

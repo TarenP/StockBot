@@ -13,8 +13,10 @@ Decision process each cycle:
 """
 
 import logging
+import os
 import numpy as np
 import pandas as pd
+import torch
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -25,6 +27,7 @@ from broker.sectors   import (
     get_portfolio_sector_weights,
 )
 from broker.validator import validate_portfolio_prices
+from pipeline.rl_inference import get_rl_targets
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,11 @@ class BrokerBrain:
         max_sector_pct:       float = 0.40,   # hard cap per sector
         avoid_earnings_days:  int   = 3,       # skip stocks within N days of earnings
         device=None,
+        rl_enabled:           bool  = False,
+        rl_checkpoint_path:   str | None = "models/best_fold9.pt",
+        rl_phase:             int   = 1,
+        rl_exit_threshold:    float = 0.30,
+        rl_conviction_drop:   float = 0.20,
     ):
         self.portfolio            = portfolio
         self.max_positions        = max_positions
@@ -71,6 +79,11 @@ class BrokerBrain:
         self.max_sector_pct       = max_sector_pct
         self.avoid_earnings_days  = avoid_earnings_days
         self.device               = device
+        self.rl_enabled           = rl_enabled
+        self.rl_checkpoint_path   = rl_checkpoint_path
+        self.rl_phase             = rl_phase
+        self.rl_exit_threshold    = rl_exit_threshold
+        self.rl_conviction_drop   = rl_conviction_drop
 
         # Cache sector map across cycles (refreshed weekly)
         self._sector_map:   dict[str, str]   = {}
@@ -86,6 +99,21 @@ class BrokerBrain:
     ) -> list[Decision]:
         decisions = []
 
+        # ── RL pre-flight check ───────────────────────────────────────────────
+        if self.rl_enabled:
+            try:
+                self._assert_model_available()
+            except RuntimeError as exc:
+                logger.error(f"RL model unavailable — aborting cycle: {exc}")
+                return []
+
+            # Warn if options are not already suppressed
+            if not getattr(self, "no_options", True):
+                logger.warning(
+                    "RL mode is active: options decisions are suppressed "
+                    "regardless of the no_options setting."
+                )
+
         # ── 1. Refresh sector map (weekly) ────────────────────────────────────
         self._maybe_refresh_sector_map(df_features)
 
@@ -98,8 +126,21 @@ class BrokerBrain:
             )
             self.portfolio.update_prices(clean_prices)
 
-        # ── 3. Exit decisions ─────────────────────────────────────────────────
+        # ── 3. RL exit checks (Phase 2) — runs before heuristic exits ───────────
+        rl_exited_tickers: set[str] = set()
+        if self.rl_enabled and self.rl_phase >= 2:
+            rl_exit_decisions = self._rl_exit_checks(
+                df_features, list(self.portfolio.positions.keys())
+            )
+            decisions.extend(rl_exit_decisions)
+            rl_exited_tickers = {d.ticker for d in rl_exit_decisions}
+
+        # ── 4. Heuristic exit decisions ───────────────────────────────────────
         for ticker in list(self.portfolio.positions.keys()):
+            # Skip tickers that already have an RL-driven exit decision
+            if ticker in rl_exited_tickers:
+                continue
+
             pos   = self.portfolio.positions[ticker]
             price = pos["last_price"]
             cost  = pos["avg_cost"]
@@ -150,7 +191,7 @@ class BrokerBrain:
                     reason=f"Signal deteriorated (score={report['composite_score']:.2f})",
                 ))
 
-        # ── 4. Sector scoring — broker decides allocations ────────────────────
+        # ── 5. Sector scoring — broker decides allocations ────────────────────
         sector_scores = score_sectors(df_features, self._sector_map)
         current_sector_weights = get_portfolio_sector_weights(
             self.portfolio.positions, self._sector_map
@@ -161,18 +202,37 @@ class BrokerBrain:
             max_single_sector=self.max_sector_pct,
         )
 
-        # ── 5. Screen for candidates ──────────────────────────────────────────
+        # ── 6. Screen for candidates ──────────────────────────────────────────
         candidates = self._screen_candidates(df_features, top_n=screener_top_n)
 
-        # ── 6. Buy decisions ──────────────────────────────────────────────────
+        # ── Phase 1: RL scoring of shortlist ──────────────────────────────────
+        rl_scores: pd.Series | None = None
+        if self.rl_enabled and candidates:
+            try:
+                rl_scores = get_rl_targets(
+                    df_features,
+                    candidates,
+                    self.rl_checkpoint_path,
+                    mode="rank",
+                )
+                logger.info(
+                    "RL scored %d tickers in shortlist.", len(candidates)
+                )
+            except Exception as exc:
+                logger.error(
+                    "RL inference failed — aborting cycle: %s", exc, exc_info=True
+                )
+                return decisions
+
+        # ── 7. Buy decisions ──────────────────────────────────────────────────
         sells_pending = sum(1 for d in decisions if d.action in ("SELL",))
         n_slots = self.max_positions - (
             len(self.portfolio.positions) - sells_pending
         )
         n_slots = max(0, n_slots)
 
+        researched: list[dict] = []
         if n_slots > 0 and candidates:
-            researched = []
             for ticker in candidates[:min(n_slots * 3, 40)]:
                 if ticker in self.portfolio.positions:
                     continue
@@ -183,11 +243,61 @@ class BrokerBrain:
                     continue
 
                 report = research(ticker)
-                if report and report["composite_score"] >= self.min_score:
-                    report["sector"] = self._sector_map.get(ticker.upper(), "Unknown")
-                    researched.append(report)
+                if report is None:
+                    continue
 
-            researched.sort(key=lambda r: r["composite_score"], reverse=True)
+                composite = report["composite_score"]
+                rl_score_val = float(rl_scores.get(ticker, 0.0)) if rl_scores is not None else None
+
+                # Diagnostic logging — always log both scores when RL is active
+                if self.rl_enabled and rl_score_val is not None:
+                    delta = rl_score_val - composite
+                    logger.debug(
+                        "  %s  rl_score=%.4f  composite=%.4f  delta=%+.4f",
+                        ticker, rl_score_val, composite, delta,
+                    )
+
+                # Apply min_score threshold
+                if self.rl_enabled:
+                    if rl_score_val is None or rl_score_val < self.min_score:
+                        continue
+                else:
+                    if composite < self.min_score:
+                        continue
+
+                report["sector"] = self._sector_map.get(ticker.upper(), "Unknown")
+                if rl_score_val is not None:
+                    report["rl_score"] = rl_score_val
+                researched.append(report)
+
+            # Sort by rl_score (RL mode) or composite_score (heuristic mode)
+            if self.rl_enabled:
+                researched.sort(key=lambda r: r.get("rl_score", 0.0), reverse=True)
+            else:
+                researched.sort(key=lambda r: r["composite_score"], reverse=True)
+
+            # ── Per-cycle RL summary log ──────────────────────────────────────
+            if self.rl_enabled and rl_scores is not None:
+                n_scored = len(candidates)
+
+                # Compute heuristic rank order vs RL rank order
+                heuristic_order = sorted(
+                    researched, key=lambda r: r["composite_score"], reverse=True
+                )
+                heuristic_rank = {r["ticker"]: i for i, r in enumerate(heuristic_order)}
+                rl_rank = {r["ticker"]: i for i, r in enumerate(researched)}
+                n_rank_diff = sum(
+                    1 for t in rl_rank if heuristic_rank.get(t, -1) != rl_rank[t]
+                )
+
+                top5 = [
+                    f"{r['ticker']}({r.get('rl_score', 0.0):.3f})"
+                    for r in researched[:5]
+                ]
+                logger.info(
+                    "RL cycle summary: scored=%d  rank_diffs=%d  top5=%s",
+                    n_scored, n_rank_diff, " ".join(top5),
+                )
 
             equity      = self.portfolio.equity
             penny_value = sum(
@@ -199,11 +309,15 @@ class BrokerBrain:
             sector_spent: dict[str, float] = {}
 
             for report in researched[:n_slots]:
-                ticker   = report["ticker"]
-                price    = report["price"]
-                score    = report["composite_score"]
-                sector   = report.get("sector", "Unknown")
-                is_penny = price < self.penny_threshold
+                ticker        = report["ticker"]
+                price         = report["price"]
+                composite     = report["composite_score"]
+                rl_score_val  = report.get("rl_score")
+                sector        = report.get("sector", "Unknown")
+                is_penny      = price < self.penny_threshold
+
+                # Conviction score: use rl_score when RL enabled, else composite
+                score = rl_score_val if (self.rl_enabled and rl_score_val is not None) else composite
 
                 # ── Penny cap ─────────────────────────────────────────────────
                 if is_penny:
@@ -269,13 +383,23 @@ class BrokerBrain:
                     days_to = (next_earnings - datetime.today().date()).days
                     earnings_note = f" | Earnings in {days_to}d"
 
-                reason = (
-                    f"Score={score:.2f} | Sector={sector} "
-                    f"(target={target_alloc:.0%}) | "
-                    f"Sentiment={sent_label}{earnings_note} | "
-                    f"{'PENNY ' if is_penny else ''}"
-                    f"{report.get('headlines', [''])[0][:50]}"
-                )
+                if self.rl_enabled and rl_score_val is not None:
+                    reason = (
+                        f"rl_score={rl_score_val:.4f} | composite_score={composite:.4f} | "
+                        f"rl_mode=true | Sector={sector} "
+                        f"(target={target_alloc:.0%}) | "
+                        f"Sentiment={sent_label}{earnings_note} | "
+                        f"{'PENNY ' if is_penny else ''}"
+                        f"{report.get('headlines', [''])[0][:50]}"
+                    )
+                else:
+                    reason = (
+                        f"Score={composite:.2f} | Sector={sector} "
+                        f"(target={target_alloc:.0%}) | "
+                        f"Sentiment={sent_label}{earnings_note} | "
+                        f"{'PENNY ' if is_penny else ''}"
+                        f"{report.get('headlines', [''])[0][:50]}"
+                    )
 
                 decisions.append(Decision(
                     action="BUY", ticker=ticker,
@@ -283,16 +407,22 @@ class BrokerBrain:
                     score=score, reason=reason,
                 ))
 
+                # Store rl_score_at_entry in position metadata after buy
+                if self.rl_enabled and rl_score_val is not None:
+                    # Tag the decision so broker.py can store it post-execution
+                    decisions[-1]._rl_score_at_entry = rl_score_val
+
                 sector_spent[sector] = sector_spent.get(sector, 0.0) + alloc_value
                 if is_penny:
                     penny_value += alloc_value
 
-        # ── 7. Options decisions ──────────────────────────────────────────────
-        options_decisions = self._evaluate_options(
-            researched if n_slots > 0 and candidates else [],
-            df_features,
-        )
-        decisions.extend(options_decisions)
+        # ── 8. Options decisions (suppressed when RL enabled) ─────────────────
+        if not self.rl_enabled:
+            options_decisions = self._evaluate_options(
+                researched if n_slots > 0 and candidates else [],
+                df_features,
+            )
+            decisions.extend(options_decisions)
 
         return decisions
 
@@ -355,7 +485,147 @@ class BrokerBrain:
             self._sector_map = get_sectors_bulk(tickers)
             self._sector_cache_date = now
 
+    # ── RL model validation ───────────────────────────────────────────────────
+
+    def _assert_model_available(self, shortlist: list | None = None) -> None:
+        """
+        Validate that the RL checkpoint exists and (optionally) that its
+        architecture matches the current shortlist size.
+
+        Raises RuntimeError (logged as CRITICAL) if:
+          - The checkpoint file does not exist.
+          - shortlist is provided and model_cfg["n_assets"] != len(shortlist).
+        """
+        if not self.rl_checkpoint_path or not os.path.exists(self.rl_checkpoint_path):
+            msg = (
+                f"RL checkpoint not found: '{self.rl_checkpoint_path}'. "
+                "Aborting cycle — set rl_enabled=false or provide a valid checkpoint."
+            )
+            logger.critical(msg)
+            raise RuntimeError(msg)
+
+        if shortlist is not None:
+            try:
+                ckpt = torch.load(self.rl_checkpoint_path, map_location="cpu", weights_only=False)
+                model_cfg = ckpt.get("model_cfg", {})
+                n_assets_ckpt = model_cfg.get("n_assets")
+                if n_assets_ckpt is not None and n_assets_ckpt != len(shortlist):
+                    msg = (
+                        f"RL checkpoint architecture mismatch: checkpoint has "
+                        f"n_assets={n_assets_ckpt} but shortlist has {len(shortlist)} tickers. "
+                        "Aborting cycle."
+                    )
+                    logger.critical(msg)
+                    raise RuntimeError(msg)
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                msg = f"Failed to load RL checkpoint '{self.rl_checkpoint_path}': {exc}"
+                logger.critical(msg)
+                raise RuntimeError(msg) from exc
+
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _rl_exit_checks(
+        self,
+        df_features: pd.DataFrame,
+        held_tickers: list[str],
+    ) -> list[Decision]:
+        """
+        Phase 2: For each held ticker, fetch current RL score and compare to
+        the score recorded at entry.  Returns SELL or SELL_PARTIAL decisions.
+
+        - SELL if current_rl_score < rl_exit_threshold
+        - SELL_PARTIAL (50%) if (entry_rl_score - current_rl_score) > rl_conviction_drop
+        - On inference failure: retain position and log a warning (no spurious exit)
+        """
+        exit_decisions: list[Decision] = []
+
+        for ticker in held_tickers:
+            pos = self.portfolio.positions.get(ticker)
+            if pos is None:
+                continue
+
+            price = pos.get("last_price", 0.0)
+            shares = pos.get("shares", 0.0)
+            entry_rl_score = pos.get("rl_score_at_entry")  # may be None
+
+            # Fetch current RL score for this ticker
+            try:
+                rl_series = get_rl_targets(
+                    df_features,
+                    [ticker],
+                    self.rl_checkpoint_path,
+                    mode="rank",
+                )
+                current_rl_score = float(rl_series.get(ticker, 0.0))
+            except Exception as exc:
+                logger.warning(
+                    "RL exit check failed for %s — retaining position: %s",
+                    ticker, exc,
+                )
+                continue
+
+            # Check absolute exit threshold
+            if current_rl_score < self.rl_exit_threshold:
+                drop = (entry_rl_score - current_rl_score) if entry_rl_score is not None else None
+                drop_str = f"{drop:.4f}" if drop is not None else "N/A (no entry score)"
+                logger.info(
+                    "RL exit (SELL) %s: entry_rl_score=%s  current_rl_score=%.4f  "
+                    "drop=%s  threshold=rl_exit_threshold(%.2f)",
+                    ticker,
+                    f"{entry_rl_score:.4f}" if entry_rl_score is not None else "N/A",
+                    current_rl_score,
+                    drop_str,
+                    self.rl_exit_threshold,
+                )
+                exit_decisions.append(Decision(
+                    action="SELL",
+                    ticker=ticker,
+                    shares=shares,
+                    price=price,
+                    score=current_rl_score,
+                    reason=(
+                        f"RL exit: current_rl_score={current_rl_score:.4f} < "
+                        f"rl_exit_threshold={self.rl_exit_threshold:.2f} | "
+                        f"entry_rl_score={entry_rl_score} | "
+                        f"drop={drop_str} | rl_mode=true"
+                    ),
+                ))
+                continue
+
+            # Check conviction drop threshold (only when entry score is known)
+            if entry_rl_score is not None:
+                drop = entry_rl_score - current_rl_score
+                if drop > self.rl_conviction_drop:
+                    half_shares = shares * 0.5
+                    logger.info(
+                        "RL exit (SELL_PARTIAL) %s: entry_rl_score=%.4f  "
+                        "current_rl_score=%.4f  drop=%.4f  "
+                        "threshold=rl_conviction_drop(%.2f)",
+                        ticker,
+                        entry_rl_score,
+                        current_rl_score,
+                        drop,
+                        self.rl_conviction_drop,
+                    )
+                    exit_decisions.append(Decision(
+                        action="SELL_PARTIAL",
+                        ticker=ticker,
+                        shares=half_shares,
+                        price=price,
+                        score=current_rl_score,
+                        reason=(
+                            f"RL conviction drop: entry_rl_score={entry_rl_score:.4f} | "
+                            f"current_rl_score={current_rl_score:.4f} | "
+                            f"drop={drop:.4f} > rl_conviction_drop={self.rl_conviction_drop:.2f} | "
+                            f"rl_mode=true"
+                        ),
+                    ))
+
+        return exit_decisions
+
+
 
     def _screen_candidates(
         self, df_features: pd.DataFrame, top_n: int = 100

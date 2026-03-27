@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\torch\accelerator\__init__.py
+# hypothesis_version: 6.151.9
+
+['current_accelerator', 'current_device_idx', 'current_device_index', 'current_stream', 'device_count', 'is_available', 'set_device_idx', 'set_device_index', 'set_stream', 'synchronize']

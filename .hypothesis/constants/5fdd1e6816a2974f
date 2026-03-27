@@ -1,0 +1,4 @@
+# file: C:\Users\taren\Documents\Github Repositories\StockBot\pipeline\rl_inference.py
+# hypothesis_version: 6.151.9
+
+[-5.0, 0.0, 1e-09, 1e-05, 0.01, 0.05, 1.0, 5.0, 'CASH', 'cpu', 'date', 'mean', 'model_cfg', 'model_state', 'rank', 'rl_score', 'rl_weight', 'std', 'ticker', 'weights']
