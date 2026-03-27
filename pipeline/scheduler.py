@@ -20,6 +20,7 @@ from pathlib import Path
 
 import torch
 import numpy as np
+import pandas as pd
 
 from pipeline.updater import update_parquet
 
@@ -131,6 +132,14 @@ def weekly_finetune(
 
         logger.info(f"Fine-tune complete. Val Sharpe={val_sharpe:.3f} | Saved: {ckpt_path}")
 
+        # After every finetune, run the auto-tuner to update parameters and RL mode
+        logger.info("=== Auto-tune pass (post-finetune) ===")
+        try:
+            from pipeline.autotuner import run_autotuner
+            run_autotuner(save_dir=save_dir)
+        except Exception as e:
+            logger.error(f"Auto-tune pass failed: {e}", exc_info=True)
+
     except Exception as e:
         logger.error(f"Weekly fine-tune failed: {e}", exc_info=True)
 
@@ -151,6 +160,7 @@ def run_scheduler(universe: list[str] | None = None):
     logger.info("Scheduler started.")
     logger.info("  Daily data update:  17:00 Mon–Fri")
     logger.info("  Weekly fine-tune:   Sunday 20:00")
+    logger.info("  Auto-tune pass:     after each finetune (params + RL gate)")
     logger.info("Press Ctrl+C to stop.\n")
 
     schedule.every().day.at("17:00").do(daily_update, universe=universe)

@@ -31,10 +31,22 @@ class Portfolio:
         if STATE_PATH.exists():
             try:
                 data = json.loads(STATE_PATH.read_text())
-                self.cash         = data.get("cash", self.initial_cash)
+                self.cash         = float(data.get("cash", self.initial_cash))
                 self.positions    = data.get("positions", {})
                 self.trade_log    = data.get("trade_log", [])
-                self.initial_cash = data.get("initial_cash", self.initial_cash)
+                self.initial_cash = float(data.get("initial_cash", self.initial_cash))
+
+                # Validate state consistency
+                if self.cash < 0:
+                    logger.warning("Portfolio cash is negative — resetting to 0")
+                    self.cash = 0.0
+                # Remove any positions with invalid data
+                bad = [t for t, p in self.positions.items()
+                       if not isinstance(p, dict) or p.get("shares", 0) <= 0]
+                for t in bad:
+                    logger.warning("Removing invalid position: %s", t)
+                    del self.positions[t]
+
                 logger.info(f"Portfolio loaded. Cash: ${self.cash:,.2f} | "
                             f"Positions: {len(self.positions)}")
             except Exception as e:

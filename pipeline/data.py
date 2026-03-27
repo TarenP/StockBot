@@ -57,6 +57,14 @@ def load_master(
     Pass `universe` to skip the auto-selection step (faster on repeated calls).
     """
     tqdm.write("Loading price data...")
+    if not Path(price_path).exists():
+        raise FileNotFoundError(
+            f"\n\nPrice data not found at '{price_path}'.\n"
+            "You need to train the model first:\n\n"
+            "    python Agent.py --mode train --folds 10\n\n"
+            "This downloads historical data and trains the RL model (~2-6 hours).\n"
+            "After that, just run: python Broker.py"
+        )
     df_prices = pd.read_parquet(price_path)
 
     with tqdm(total=5, desc="Preparing data", unit="step", colour="cyan",

@@ -90,6 +90,8 @@ class BrokerBrain:
         # Cache sector map across cycles (refreshed weekly)
         self._sector_map:   dict[str, str]   = {}
         self._sector_cache_date: datetime | None = None
+        # Ensure _base_min_score is always set (broker.py also sets this after init)
+        self._base_min_score: float = min_score
 
     # ── Main decision cycle ───────────────────────────────────────────────────
 

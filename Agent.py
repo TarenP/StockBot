@@ -160,6 +160,58 @@ def run_train(args):
         best = max(best_ckpts, key=lambda x: x[1])
         logger.info(f"\nBest checkpoint: {best[0]}  (val Sharpe={best[1]:.3f})")
 
+        # ── Post-training: train screener then warm-start shadow population ─────
+        logger.info("\nTraining screener on full universe...")
+        logger.info("The screener narrows 11,500+ tickers to a shortlist for the RL agent.")
+        try:
+            from pipeline.data import load_master as _load_all
+            df_all = _load_all(top_n=99_999)
+            from pipeline.screener import train_screener
+            train_screener(df_all, device=DEVICE, epochs=10)
+            logger.info("Screener training complete.")
+        except Exception as exc:
+            logger.warning(f"Screener training failed (continuing): {exc}")
+        # ── Post-training: warm-start shadow population on historical data ────
+        logger.info("\nRunning shadow warm-up on historical data...")
+        logger.info("This finds the best broker parameters from history so you")
+        logger.info("start with a pre-tuned config on day one. Takes ~10-20 min.")
+        try:
+            from broker.replay import _build_price_lookup
+            from broker.shadows import run_historical_warmup
+
+            # Load broker.config for baseline genome
+            from pathlib import Path as _Path
+            def _load_cfg(path="broker.config"):
+                cfg = {}
+                for line in _Path(path).read_text().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    v = v.split("#")[0].strip()
+                    cfg[k.strip()] = (
+                        True if v.lower() == "true" else
+                        False if v.lower() == "false" else
+                        (int(v) if v.lstrip("-").isdigit() else
+                         (float(v) if v.replace(".", "", 1).lstrip("-").isdigit() else v))
+                    )
+                return cfg
+
+            live_config  = _load_cfg()
+            price_lookup = _build_price_lookup()
+
+            run_historical_warmup(
+                df_features     = df,
+                price_lookup    = price_lookup,
+                checkpoint_path = best[0],
+                live_config     = live_config,
+                generations     = 5,
+                replay_years    = 3,
+            )
+            logger.info("Shadow warm-up complete. broker.config updated with best historical parameters.")
+        except Exception as exc:
+            logger.warning(f"Shadow warm-up failed (broker.config unchanged): {exc}")
+
 
 # ── Mode: finetune ────────────────────────────────────────────────────────────
 
