@@ -102,11 +102,15 @@ def get_sector(ticker: str) -> str:
 
 
 def get_sectors_bulk(tickers: list[str]) -> dict[str, str]:
-    """Batch sector lookup — uses cache aggressively to minimise API calls."""
-    result = {}
+    """
+    Batch sector lookup — checks static map and disk cache first,
+    only calls yfinance for genuinely unknown tickers.
+    Shows a progress bar so you can see it working.
+    """
+    result      = {}
     need_lookup = []
+    cache       = _load_sector_cache()
 
-    cache = _load_sector_cache()
     for t in tickers:
         t = t.upper()
         if t in _STATIC_SECTOR_MAP:
@@ -118,15 +122,37 @@ def get_sectors_bulk(tickers: list[str]) -> dict[str, str]:
 
     if need_lookup:
         import yfinance as yf
-        for ticker in need_lookup:
+        from tqdm import tqdm
+
+        logger.info(f"  Looking up sectors for {len(need_lookup)} new tickers "
+                    f"(cached: {len(result)})...")
+
+        # Save every 50 lookups so a crash doesn't lose progress
+        SAVE_EVERY = 50
+        pbar = tqdm(need_lookup, desc="Sector lookup", unit="ticker",
+                    colour="cyan", dynamic_ncols=True)
+        for i, ticker in enumerate(pbar):
+            pbar.set_postfix(ticker=ticker)
             try:
-                info   = yf.Ticker(ticker).info
-                sector = info.get("sector", "Unknown") or "Unknown"
+                info   = yf.Ticker(ticker).fast_info
+                # fast_info doesn't have sector — fall back to info for unknowns
+                sector = "Unknown"
+                try:
+                    full   = yf.Ticker(ticker).info
+                    sector = full.get("sector", "Unknown") or "Unknown"
+                except Exception:
+                    pass
                 result[ticker] = sector
                 cache[ticker]  = sector
-                time.sleep(0.05)
             except Exception:
                 result[ticker] = "Unknown"
+                cache[ticker]  = "Unknown"
+
+            time.sleep(0.03)   # gentler than 0.05
+
+            if (i + 1) % SAVE_EVERY == 0:
+                _save_sector_cache(cache)   # checkpoint progress
+
         _save_sector_cache(cache)
 
     return result
@@ -279,7 +305,7 @@ def compute_target_allocations(
     logger.info("Sector allocation targets:")
     for s, w in sorted(target.items(), key=lambda x: x[1], reverse=True):
         current = current_sector_weights.get(s, 0.0)
-        arrow   = "↑" if w > current + 0.02 else ("↓" if w < current - 0.02 else "→")
+        arrow   = "^" if w > current + 0.02 else ("v" if w < current - 0.02 else "=")
         logger.info(f"  {s:<28} {w:.1%}  {arrow}  (current: {current:.1%})")
 
     return target

@@ -1,35 +1,55 @@
 """
-Autonomous broker — the main loop.
+Autonomous broker — one-shot mode.
 
-Runs continuously at a user-specified frequency, making buy/sell decisions
-across penny stocks and regular stocks using technical + sentiment signals.
+Run this script whenever you want the broker to update.
+It does one full cycle and exits:
+  1. Validates data freshness and portfolio state
+  2. Fetches latest prices + news
+  3. Checks exits on all held positions
+  4. Screens for new opportunities
+  5. Executes buy/sell/options decisions
+  6. Logs results and SPY benchmark
+  7. Exits
 
 Usage:
-    python Broker.py --cash 10000 --interval daily
-    python Broker.py --cash 50000 --interval hourly --max_positions 30
-    python Broker.py --status          # show portfolio without trading
-    python Broker.py --trades          # show recent trade history
+    python Broker.py                        # run a cycle with defaults
+    python Broker.py --cash 10000           # set starting cash (first run only)
+    python Broker.py --status               # show portfolio + SPY benchmark, no trading
+    python Broker.py --trades               # show recent trade history, no trading
+    python Broker.py --no_options           # stocks only
+
+Schedule it however you like:
+    Windows Task Scheduler  → run daily at 4:30pm ET
+    Cron (Mac/Linux)        → 30 16 * * 1-5 python /path/to/Broker.py
+    Manually                → just run it when you want
 """
 
 import argparse
 import logging
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-import schedule
 import torch
+
+# Create required directories before anything else
+Path("logs").mkdir(exist_ok=True)
+Path("plots").mkdir(exist_ok=True)
+Path("broker/state").mkdir(parents=True, exist_ok=True)
 
 from broker.portfolio import Portfolio
 from broker.brain     import BrokerBrain
-from broker.journal   import log_cycle, print_report, print_recent_trades
-from broker.universe  import refresh_universe
+from broker.risk      import PortfolioRiskEngine, validate_startup
+from broker.journal   import (
+    log_cycle, print_report, print_recent_trades,
+    daily_integrity_check, _fetch_current_spy_price,
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("logs/broker.log"),
+        logging.FileHandler("logs/broker.log", encoding="utf-8"),
         logging.StreamHandler(),
     ],
 )
@@ -38,47 +58,119 @@ logger = logging.getLogger(__name__)
 Path("logs").mkdir(exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ET     = ZoneInfo("America/New_York")
 
-INTERVALS = {
-    "hourly":  60,
-    "2hour":   120,
-    "4hour":   240,
-    "daily":   1440,
-    "weekly":  10080,
-}
+MARKET_OPEN  = (9, 30)
+MARKET_CLOSE = (16, 0)
 
 
-# ── Single trading cycle ──────────────────────────────────────────────────────
+# ── Market hours check ────────────────────────────────────────────────────────
 
-def run_cycle(portfolio: Portfolio, brain: BrokerBrain, top_n: int = 500):
-    logger.info(f"{'─'*55}")
-    logger.info(f"Trading cycle started | Equity: ${portfolio.equity:,.2f}")
+def _is_market_hours() -> bool:
+    now = datetime.now(ET)
+    if now.weekday() >= 5:
+        return False
+    t = (now.hour, now.minute)
+    return MARKET_OPEN <= t < MARKET_CLOSE
 
-    # ── Load feature data ─────────────────────────────────────────────────────
+
+# ── One-shot cycle ────────────────────────────────────────────────────────────
+
+def run_cycle(
+    portfolio: Portfolio,
+    brain: BrokerBrain,
+    risk: PortfolioRiskEngine,
+    top_n: int = 500,
+    enforce_market_hours: bool = True,
+):
+    now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
+    logger.info(f"{'='*55}")
+    logger.info(f"Broker cycle | {now_et} | Equity: ${portfolio.equity:,.2f}")
+    logger.info(f"{'='*55}")
+
+    # ── Auto-update prices + sentiment ────────────────────────────────────────
+    logger.info("Fetching latest market data and news...")
+    try:
+        from pipeline.updater import update_parquet, _load_trained_universe
+        # Use checkpoint universe if available, otherwise use top_n from load_master
+        universe = _load_trained_universe("models")
+        n_prices = update_parquet(universe=universe, save_dir="models")
+        if n_prices:
+            logger.info(f"  Prices: {n_prices} new rows added")
+        else:
+            logger.info("  Prices: already up to date")
+    except Exception as e:
+        logger.warning(f"  Price update failed (continuing with cached data): {e}")
+
+    try:
+        from pipeline.updater import _load_trained_universe
+        from pipeline.sentiment import update_sentiment
+        universe = _load_trained_universe("models")
+        if not universe:
+            # No checkpoint yet — sentiment update will happen after first train
+            logger.info("  Sentiment: skipping (no checkpoint yet — run --mode train first)")
+        else:
+            n_sent = update_sentiment(universe, lookback_days=3)
+            if n_sent:
+                logger.info(f"  Sentiment: {n_sent} new headlines scored")
+            else:
+                logger.info("  Sentiment: already up to date")
+    except Exception as e:
+        logger.warning(f"  Sentiment update failed (continuing with cached data): {e}")
+
+    # ── Market hours ──────────────────────────────────────────────────────────
+    in_market = _is_market_hours()
+    if enforce_market_hours and not in_market:
+        now = datetime.now(ET)
+        logger.warning(
+            f"Outside market hours ({now.strftime('%H:%M ET, %A')}). "
+            f"Price updates and exits will run, but no new entries."
+        )
+        brain.min_score = 999.0
+    else:
+        brain.min_score = brain._base_min_score
+
+    # ── Risk engine ───────────────────────────────────────────────────────────
+    risk.start_session(portfolio.equity)
+    health_status, health_reason = risk.check_portfolio_health(portfolio)
+
+    if health_status == "halt":
+        logger.warning(f"RISK HALT: {health_reason}")
+        brain.min_score = 999.0
+    elif health_status == "warning":
+        logger.warning(f"RISK WARNING: {health_reason}")
+
+    # ── Fetch latest data ─────────────────────────────────────────────────────
+    logger.info("Loading market data...")
     try:
         from pipeline.data import load_master
         df = load_master(top_n=top_n, min_price=0.01, min_avg_volume=5_000)
     except Exception as e:
         logger.error(f"Failed to load data: {e}")
+        brain.min_score = brain._base_min_score
         return
 
-    # ── Run decision engine ───────────────────────────────────────────────────
-    decisions = brain.run_cycle(df, screener_top_n=100)
+    # ── Run decisions ─────────────────────────────────────────────────────────
+    decisions = brain.run_cycle(df, screener_top_n=100, risk_engine=risk)
 
     if not decisions:
         logger.info("No trades this cycle.")
-    else:
-        logger.info(f"{len(decisions)} decisions:")
 
-    # ── Execute decisions ─────────────────────────────────────────────────────
+    # ── Execute ───────────────────────────────────────────────────────────────
     executed = []
     for d in decisions:
         if d.action == "BUY":
-            ok = portfolio.buy(d.ticker, d.shares, d.price, d.reason)
+            is_penny  = d.price < 5.0
+            adj_value = risk.apply_execution_cost(d.shares * d.price, d.price, is_penny)
+            adj_shares = adj_value / d.price if d.price > 0 else 0
+            ok = portfolio.buy(d.ticker, adj_shares, d.price, d.reason)
+
         elif d.action == "SELL":
             ok = portfolio.sell_all(d.ticker, d.price, d.reason)
+
         elif d.action == "SELL_PARTIAL":
             ok = portfolio.sell(d.ticker, d.shares, d.price, d.reason)
+
         elif d.action == "OPEN_OPTION":
             contract = getattr(d, "_option_contract", None)
             if contract:
@@ -87,12 +179,10 @@ def run_cycle(portfolio: Portfolio, brain: BrokerBrain, top_n: int = 500):
                     portfolio.cash += cash_delta
             else:
                 ok = False
+
         elif d.action == "CLOSE_OPTION":
-            # Find matching option key
-            matching = [
-                k for k, c in portfolio.options.positions.items()
-                if c.ticker == d.ticker
-            ]
+            matching = [k for k, c in portfolio.options.positions.items()
+                        if c.ticker == d.ticker]
             ok = False
             for key in matching:
                 success, cash_back = portfolio.options.close(key, d.price)
@@ -105,66 +195,82 @@ def run_cycle(portfolio: Portfolio, brain: BrokerBrain, top_n: int = 500):
         if ok:
             executed.append(d)
 
+    # ── SPY tracking + save ───────────────────────────────────────────────────
+    spy_price = _fetch_current_spy_price()
     portfolio.save()
-    log_cycle(executed, portfolio.equity, portfolio.cash)
+    log_cycle(executed, portfolio.equity, portfolio.cash, spy_price=spy_price)
 
-    logger.info(f"Cycle complete | Equity: ${portfolio.equity:,.2f} | "
-                f"Cash: ${portfolio.cash:,.2f} | "
-                f"Positions: {len(portfolio.positions)}")
+    # ── Summary ───────────────────────────────────────────────────────────────
+    report = daily_integrity_check(portfolio)
+    if "beating_spy" in report:
+        status = "✓ beating SPY" if report["beating_spy"] else "✗ trailing SPY"
+        logger.info(
+            f"Done | Equity: ${portfolio.equity:,.2f} | "
+            f"Return: {portfolio.total_return:+.2%} | {status} "
+            f"(alpha: {report.get('alpha_vs_spy', 0):+.2%})"
+        )
+    else:
+        logger.info(
+            f"Done | Equity: ${portfolio.equity:,.2f} | "
+            f"Positions: {len(portfolio.positions)} stocks, "
+            f"{len(portfolio.options.positions)} options"
+        )
+
     print(portfolio.summary())
-
-
-# ── Universe refresh (weekly) ─────────────────────────────────────────────────
-
-def run_universe_refresh():
-    logger.info("Refreshing universe — discovering new stocks...")
-    new = refresh_universe(max_new=200)
-    if new:
-        logger.info(f"Added {len(new)} new tickers: {new[:10]}...")
+    brain.min_score = brain._base_min_score
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Autonomous Broker Agent")
-    p.add_argument("--cash",          type=float, default=10_000,
-                   help="Starting cash (only used on first run)")
-    p.add_argument("--interval",      choices=list(INTERVALS.keys()), default="daily",
-                   help="How often to trade (default: daily)")
-    p.add_argument("--max_positions", type=int,   default=20,
-                   help="Max simultaneous positions")
-    p.add_argument("--stop_loss",     type=float, default=0.12,
-                   help="Minimum stop-loss floor (default: 12%%, ATR-adjusted above this)")
-    p.add_argument("--take_profit",   type=float, default=0.45,
-                   help="Full take-profit threshold (default: 45%%, partial at 20%%)")
-    p.add_argument("--min_score",     type=float, default=0.60,
-                   help="Minimum buy signal score 0-1 (default: 0.60)")
-    p.add_argument("--penny_pct",     type=float, default=0.20,
-                   help="Max %% of portfolio in penny stocks (default: 20%%)")
-    p.add_argument("--max_sector",    type=float, default=0.40,
-                   help="Hard cap per sector (default: 40%%, broker self-adjusts below this)")
-    p.add_argument("--avoid_earnings",type=int,   default=3,
-                   help="Skip stocks within N days of earnings (default: 3, 0=disabled)")
-    p.add_argument("--top_n",         type=int,   default=500,
-                   help="Universe size for screening")
-    p.add_argument("--no_options",    action="store_true",
-                   help="Disable options trading (stocks only)")
-    p.add_argument("--status",        action="store_true",
-                   help="Show portfolio status and exit")
-    p.add_argument("--trades",        action="store_true",
-                   help="Show recent trades and exit")
-    p.add_argument("--once",          action="store_true",
-                   help="Run one cycle and exit (no loop)")
+def parse_args(config: dict = None):
+    p = argparse.ArgumentParser(
+        description="Autonomous broker — run once, exits when done.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    cfg = config or {}
+    p.add_argument("--cash",           type=float, default=cfg.get("cash",           10_000))
+    p.add_argument("--max_positions",  type=int,   default=cfg.get("max_positions",  20))
+    p.add_argument("--stop_loss",      type=float, default=cfg.get("stop_loss",      0.07))
+    p.add_argument("--take_profit",    type=float, default=cfg.get("take_profit",    0.45))
+    p.add_argument("--min_score",      type=float, default=cfg.get("min_score",      0.50))
+    p.add_argument("--penny_pct",      type=float, default=cfg.get("penny_pct",      0.20))
+    p.add_argument("--max_sector",     type=float, default=cfg.get("max_sector",     0.40))
+    p.add_argument("--avoid_earnings", type=int,   default=cfg.get("avoid_earnings", 3))
+    p.add_argument("--top_n",          type=int,   default=cfg.get("top_n",          1000))
+    p.add_argument("--max_daily_loss", type=float, default=cfg.get("max_daily_loss", 0.03))
+    p.add_argument("--max_drawdown",   type=float, default=cfg.get("max_drawdown",   0.15))
+    p.add_argument("--no_options",     action="store_true", default=cfg.get("no_options", False))
+    p.add_argument("--no_market_hours",action="store_true", default=False)
+    p.add_argument("--status",         action="store_true")
+    p.add_argument("--trades",         action="store_true")
     return p.parse_args()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     args = parse_args()
 
     portfolio = Portfolio(initial_cash=args.cash)
-    brain     = BrokerBrain(
+
+    # Status / trades — no trading, just reporting
+    if args.status:
+        print_report(portfolio)
+        return
+
+    if args.trades:
+        print_recent_trades(n=30)
+        return
+
+    # Startup validation before any trading
+    errors = validate_startup(portfolio)
+    if errors:
+        logger.error("Startup validation failed — fix these before trading:")
+        for e in errors:
+            logger.error(f"  • {e}")
+        return
+
+    brain = BrokerBrain(
         portfolio           = portfolio,
         max_positions       = args.max_positions,
         stop_loss_pct_floor = args.stop_loss,
@@ -175,52 +281,20 @@ def main():
         avoid_earnings_days = args.avoid_earnings,
         device              = DEVICE,
     )
+    brain._base_min_score = args.min_score
 
-    # ── Status / trades only ──────────────────────────────────────────────────
-    if args.status:
-        print_report(portfolio)
-        return
-
-    if args.trades:
-        print_recent_trades(n=30)
-        return
-
-    # ── Single run ────────────────────────────────────────────────────────────
-    if args.once:
-        run_cycle(portfolio, brain, top_n=args.top_n)
-        return
-
-    # ── Continuous loop ───────────────────────────────────────────────────────
-    interval_mins = INTERVALS[args.interval]
-    logger.info(f"Broker started | Interval: {args.interval} ({interval_mins}min) | "
-                f"Device: {DEVICE}")
-    logger.info(f"Settings: max_positions={args.max_positions} | "
-                f"stop_loss_floor={args.stop_loss:.0%} (ATR-adjusted) | "
-                f"take_profit={args.take_profit:.0%} (partial at 20%%) | "
-                f"min_score={args.min_score} | penny_pct={args.penny_pct:.0%} | "
-                f"max_sector={args.max_sector:.0%} | avoid_earnings={args.avoid_earnings}d")
-
-    # Run immediately on start
-    run_cycle(portfolio, brain, top_n=args.top_n)
-
-    # Schedule recurring cycles
-    schedule.every(interval_mins).minutes.do(
-        run_cycle, portfolio=portfolio, brain=brain, top_n=args.top_n
+    risk = PortfolioRiskEngine(
+        max_daily_loss = args.max_daily_loss,
+        max_drawdown   = args.max_drawdown,
     )
 
-    # Discover new stocks every Sunday
-    schedule.every().sunday.at("08:00").do(run_universe_refresh)
-
-    logger.info(f"Next cycle in {interval_mins} minutes. Press Ctrl+C to stop.")
-
-    try:
-        while True:
-            schedule.run_pending()
-            time.sleep(30)
-    except KeyboardInterrupt:
-        portfolio.save()
-        logger.info("Broker stopped. Portfolio saved.")
-        print_report(portfolio)
+    run_cycle(
+        portfolio,
+        brain,
+        risk,
+        top_n             = args.top_n,
+        enforce_market_hours = not args.no_market_hours,
+    )
 
 
 if __name__ == "__main__":

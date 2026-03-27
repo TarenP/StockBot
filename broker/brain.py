@@ -82,6 +82,7 @@ class BrokerBrain:
         self,
         df_features: pd.DataFrame,
         screener_top_n: int = 100,
+        risk_engine=None,   # PortfolioRiskEngine instance
     ) -> list[Decision]:
         decisions = []
 
@@ -233,6 +234,10 @@ class BrokerBrain:
                 alloc_pct   = np.clip(alloc_pct, 0.01, self.max_position_pct)
                 alloc_value = equity * alloc_pct
 
+                # Volatility scaling
+                if risk_engine is not None:
+                    alloc_value = risk_engine.vol_scale_allocation(alloc_value)
+
                 # Constrain by sector budget
                 alloc_value = min(alloc_value, sector_budget)
 
@@ -242,6 +247,13 @@ class BrokerBrain:
 
                 # Never spend more than 95% of remaining cash
                 alloc_value = min(alloc_value, self.portfolio.cash * 0.95)
+
+                # Pre-trade risk check
+                if risk_engine is not None:
+                    allowed, reason = risk_engine.check_pre_trade(alloc_value, self.portfolio)
+                    if not allowed:
+                        logger.debug(f"Pre-trade check blocked {ticker}: {reason}")
+                        continue
 
                 shares = alloc_value / price if price > 0 else 0
                 if shares < 0.001 or alloc_value < 1.0:
@@ -399,7 +411,9 @@ class BrokerBrain:
         current_prices = self._get_current_prices(
             list({c.ticker for c in self.portfolio.options.positions.values()})
         )
-        expired_keys = self.portfolio.options.check_expirations(current_prices)
+        expired_keys = self.portfolio.options.check_expirations(
+            current_prices, self.portfolio
+        )
         if expired_keys:
             logger.info(f"  {len(expired_keys)} option(s) expired/assigned")
 

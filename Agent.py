@@ -46,9 +46,10 @@ def parse_args():
         epilog=__doc__,
     )
     p.add_argument("--mode", choices=["train", "finetune", "update", "backtest",
-                                       "predict", "schedule", "train_screener", "screen"],
+                                       "predict", "schedule", "train_screener",
+                                       "screen", "replay"],
                    default="predict", help="What to do (default: predict)")
-    p.add_argument("--top_n",        type=int,   default=500,      help="Universe size for portfolio agent")
+    p.add_argument("--top_n",        type=int,   default=1000,      help="Universe size for portfolio agent")
     p.add_argument("--top_k",        type=int,   default=10,       help="Stocks to hold / show")
     p.add_argument("--folds",        type=int,   default=3,        help="Walk-forward folds")
     p.add_argument("--total_steps",  type=int,   default=100_000,  help="PPO steps per fold")
@@ -65,6 +66,8 @@ def parse_args():
     p.add_argument("--max_price",    type=float, default=None,     help="Max price filter for screener")
     p.add_argument("--min_volume",   type=float, default=10_000,   help="Min avg daily volume for screener")
     p.add_argument("--screener_top_n", type=int, default=50,       help="How many picks to show from screener")
+    p.add_argument("--replay_years",  type=int, default=3,         help="Years of history to replay (--mode replay)")
+    p.add_argument("--sensitivity",   action="store_true",         help="Run sensitivity sweep during replay")
     return p.parse_args()
 
 
@@ -429,6 +432,18 @@ def run_screen(args):
     print_screener_results(results, label=label)
 
 
+def run_replay_mode(args):
+    from broker.replay import run_full_replay
+    df, asset_list = _load_data_and_universe(args.top_n)
+    run_full_replay(
+        df_features          = df,
+        initial_cash         = 10_000.0,
+        replay_years         = args.replay_years,
+        run_sensitivity_sweep= args.sensitivity,
+        save_plot            = "plots/replay.png",
+    )
+
+
 # ── Mode: schedule ────────────────────────────────────────────────────────────
 
 def run_schedule(args):
@@ -458,5 +473,6 @@ if __name__ == "__main__":
         "schedule":       run_schedule,
         "train_screener": run_train_screener,
         "screen":         run_screen,
+        "replay":         run_replay_mode,
     }
     dispatch[args.mode](args)
