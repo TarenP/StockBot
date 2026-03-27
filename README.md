@@ -84,19 +84,18 @@ Edit `broker.config` once. These become your defaults every run — no flags nee
 
 ```
 cash           = 10000    # starting cash (first run only — ignored after that)
-max_positions  = 20       # max stocks held at once
-stop_loss      = 0.07     # minimum stop-loss (ATR-adjusted upward per stock)
-take_profit    = 0.45     # full exit threshold — sells remaining shares at this gain
-partial_profit = 0.20     # sell 50% here, let rest run to take_profit
-                          # set partial_profit > take_profit to disable partial exits
-min_score      = 0.50     # minimum signal score to buy (0-1)
-penny_pct      = 0.10     # max % of portfolio in $2-$5 stocks
-max_sector     = 0.40     # hard cap per sector
-avoid_earnings = 3        # skip stocks within N days of earnings
-top_n          = 1000     # how many stocks to screen
-max_daily_loss = 0.03     # halt new entries if down 3% today
-max_drawdown   = 0.15     # circuit breaker: no new entries if down 15% from peak
-no_options     = false    # set to true to disable options trading
+max_positions  = 10       # focused portfolio — 10 names on $10k is enough
+stop_loss      = 0.08     # ATR-adjusted upward per stock; 8% floor avoids noise clips
+take_profit    = 0.35     # full exit — realistic for a daily-checked system
+partial_profit = 0.15     # take half off at +15%, let rest run to take_profit
+min_score      = 0.58     # high enough to filter mediocre setups
+penny_pct      = 0.03     # minimal speculative exposure until system is proven
+max_sector     = 0.25     # prevents correlated sector drawdowns
+avoid_earnings = 5        # earnings risk starts well before the report date
+top_n          = 500      # sufficient universe for a $10k daily broker
+max_daily_loss = 0.025    # tighter during paper trading — 2.5% daily halt
+max_drawdown   = 0.12     # tighter during paper trading — 12% circuit breaker
+no_options     = true     # disabled until stock-side edge is proven in paper trading
 ```
 
 ---

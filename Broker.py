@@ -26,7 +26,7 @@ def _load_config(path: str = "broker.config") -> dict:
         if "=" in line:
             key, _, val = line.partition("=")
             key = key.strip().replace("-", "_")
-            val = val.strip()
+            val = val.split("#")[0].strip()   # strip inline comments
             if val.lower() == "true":
                 defaults[key] = True
             elif val.lower() == "false":

@@ -65,6 +65,8 @@ def fetch_spy_returns(
             return pd.Series(dtype=float)
 
         rets = raw["Close"].pct_change().dropna()
+        if isinstance(rets, pd.DataFrame):
+            rets = rets.iloc[:, 0]   # flatten if yfinance returns DataFrame
         rets.index = pd.to_datetime(rets.index).normalize()
         return rets
     except Exception as e:
@@ -247,64 +249,97 @@ def plot_benchmark(
     label: str = "Strategy",
 ):
     """
-    4-panel chart:
-      1. Equity curves (strategy vs SPY vs equal-weight)
-      2. Strategy drawdown vs SPY drawdown
-      3. Rolling 63-day relative performance vs SPY
-      4. Rolling 252-day relative performance vs SPY
+    4-panel chart with plain-English titles and annotations.
+
+    Panel 1: Portfolio value over time — if $1 invested at start, what is it worth now?
+    Panel 2: Drawdown — how far below the peak are you at each point?
+    Panel 3: 3-month rolling outperformance vs SPY — are you beating SPY recently?
+    Panel 4: 12-month rolling outperformance vs SPY — are you beating SPY over the year?
     """
     os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
 
     n = min(len(portfolio_rets), len(spy_rets))
     p = np.asarray(portfolio_rets[:n])
     s = np.asarray(spy_rets[:n])
-    x = dates[:n] if dates else range(n)
+    x = list(range(n))
 
-    fig, axes = plt.subplots(4, 1, figsize=(14, 16),
+    p_equity = np.cumprod(1 + p)
+    s_equity = np.cumprod(1 + s)
+
+    fig, axes = plt.subplots(4, 1, figsize=(14, 18),
                              gridspec_kw={"height_ratios": [3, 1.5, 1.5, 1.5]})
-    fig.suptitle(f"{label} vs SPY Benchmark", fontsize=14, fontweight="bold")
+    fig.suptitle(f"{label}  vs  SPY  —  Performance Report",
+                 fontsize=15, fontweight="bold", y=0.98)
 
-    # ── 1. Equity curves ──────────────────────────────────────────────────────
+    # ── Panel 1: Portfolio value ───────────────────────────────────────────────
     ax = axes[0]
-    ax.plot(x, np.cumprod(1 + p), label=label,        color="#2196F3", lw=1.8)
-    ax.plot(x, np.cumprod(1 + s), label="SPY",        color="#4CAF50", lw=1.4, ls="--")
+    ax.plot(x, (p_equity - 1) * 100, label=label,             color="#2196F3", lw=2.0)
+    ax.plot(x, (s_equity - 1) * 100, label="SPY (benchmark)", color="#4CAF50", lw=1.5, ls="--")
     if ew_rets is not None:
         ew = np.asarray(ew_rets[:n])
-        ax.plot(x, np.cumprod(1 + ew), label="Equal-Weight", color="#FF9800", lw=1.2, ls=":")
-    ax.set_ylabel("Portfolio Value ($1 start)")
-    ax.legend(); ax.grid(alpha=0.3)
+        ax.plot(x, (np.cumprod(1 + ew) - 1) * 100,
+                label="Equal-weight baseline", color="#FF9800", lw=1.2, ls=":")
 
-    # ── 2. Drawdown comparison ────────────────────────────────────────────────
+    # Annotate final values
+    ax.annotate(f"  {label}: {(p_equity[-1]-1)*100:+.1f}%",
+                xy=(n-1, (p_equity[-1]-1)*100), fontsize=9, color="#2196F3")
+    ax.annotate(f"  SPY: {(s_equity[-1]-1)*100:+.1f}%",
+                xy=(n-1, (s_equity[-1]-1)*100), fontsize=9, color="#4CAF50")
+
+    ax.set_title("Total Return  (% gain/loss since start — higher is better)",
+                 fontsize=11, pad=8)
+    ax.set_ylabel("Return (%)")
+    ax.set_xlabel("Trading days since start")
+    ax.legend(loc="upper left"); ax.grid(alpha=0.3)
+    ax.axhline(0, color="gray", lw=0.8, ls=":", alpha=0.5)
+
+    # ── Panel 2: Drawdown ─────────────────────────────────────────────────────
     ax2 = axes[1]
-    def _dd_series(rets):
+
+    def _dd(rets):
         eq   = np.cumprod(1 + rets)
         peak = np.maximum.accumulate(eq)
         return (eq - peak) / (peak + 1e-9)
 
-    ax2.fill_between(x, _dd_series(p), 0, alpha=0.5, color="#F44336", label=f"{label} DD")
-    ax2.plot(x, _dd_series(s), color="#4CAF50", lw=1.2, ls="--", label="SPY DD")
-    ax2.set_ylabel("Drawdown")
-    ax2.legend(fontsize=8); ax2.grid(alpha=0.3)
+    p_dd = _dd(p)
+    s_dd = _dd(s)
+    ax2.fill_between(x, p_dd * 100, 0, alpha=0.5, color="#F44336",
+                     label=f"{label} drawdown")
+    ax2.plot(x, s_dd * 100, color="#4CAF50", lw=1.2, ls="--",
+             label="SPY drawdown")
+    ax2.set_title("Drawdown  (how far below the peak — closer to 0% is better)",
+                  fontsize=11, pad=8)
+    ax2.set_ylabel("% below peak")
+    ax2.set_xlabel("Trading days since start")
+    ax2.legend(fontsize=9, loc="lower left"); ax2.grid(alpha=0.3)
 
-    # ── 3. Rolling 63-day relative performance ────────────────────────────────
+    # ── Panel 3: Rolling 3-month outperformance ───────────────────────────────
     ax3 = axes[2]
-    roll = rolling_relative_performance(p, s, windows=[63])["63d"]
-    ax3.bar(range(len(roll)), roll, color=np.where(roll >= 0, "#2196F3", "#F44336"), alpha=0.7)
-    ax3.axhline(0, color="black", lw=0.8)
-    ax3.set_ylabel("3-Month Relative Return")
+    roll3 = rolling_relative_performance(p, s, windows=[63])["63d"]
+    colors3 = ["#2196F3" if v >= 0 else "#F44336" for v in roll3]
+    ax3.bar(x, roll3 * 100, color=colors3, alpha=0.7, width=1.0)
+    ax3.axhline(0, color="black", lw=1.0)
+    ax3.set_title("3-Month Rolling Outperformance vs SPY  "
+                  "(blue = beating SPY, red = trailing SPY)",
+                  fontsize=11, pad=8)
+    ax3.set_ylabel("% ahead of SPY (3-month window)")
+    ax3.set_xlabel("Trading days since start")
     ax3.grid(alpha=0.3)
 
-    # ── 4. Rolling 252-day relative performance ───────────────────────────────
+    # ── Panel 4: Rolling 12-month outperformance ──────────────────────────────
     ax4 = axes[3]
     roll12 = rolling_relative_performance(p, s, windows=[252])["252d"]
-    ax4.bar(range(len(roll12)), roll12,
-            color=np.where(roll12 >= 0, "#2196F3", "#F44336"), alpha=0.7)
-    ax4.axhline(0, color="black", lw=0.8)
-    ax4.set_ylabel("12-Month Relative Return")
-    ax4.set_xlabel("Trading Days")
+    colors12 = ["#2196F3" if v >= 0 else "#F44336" for v in roll12]
+    ax4.bar(x, roll12 * 100, color=colors12, alpha=0.7, width=1.0)
+    ax4.axhline(0, color="black", lw=1.0)
+    ax4.set_title("12-Month Rolling Outperformance vs SPY  "
+                  "(blue = beating SPY, red = trailing SPY)",
+                  fontsize=11, pad=8)
+    ax4.set_ylabel("% ahead of SPY (12-month window)")
+    ax4.set_xlabel("Trading days since start")
     ax4.grid(alpha=0.3)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
-    logger.info(f"  Benchmark plot saved → {save_path}")
+    logger.info(f"  Chart saved → {save_path}")

@@ -220,3 +220,91 @@ def daily_integrity_check(portfolio) -> dict:
             report["beating_spy"]  = portfolio.total_return > spy_ret
 
     return report
+
+
+def plot_live_performance(save_path: str = "plots/live_performance.png"):
+    """
+    Generate a live performance chart from the equity curve CSV.
+    Called automatically after every broker run.
+    """
+    if not EQUITY_PATH.exists():
+        return
+
+    eq = pd.read_csv(EQUITY_PATH, parse_dates=["time"])
+    if len(eq) < 3:
+        return   # not enough data yet
+
+    import os
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+
+    portfolio_rets = eq["equity"].pct_change().dropna().values
+    initial        = eq["equity"].iloc[0]
+    equity_pct     = ((eq["equity"] / initial) - 1) * 100
+    x              = range(len(equity_pct))
+
+    # SPY comparison if available
+    spy_col = eq["spy_price"].dropna()
+    has_spy = len(spy_col) >= 3
+
+    fig, axes = plt.subplots(3 if has_spy else 2, 1, figsize=(14, 12 if has_spy else 8),
+                             gridspec_kw={"height_ratios": ([3, 1.5, 1.5] if has_spy else [3, 1.5])})
+    fig.suptitle("Live Portfolio Performance", fontsize=15, fontweight="bold", y=0.98)
+
+    # ── Panel 1: Return % ─────────────────────────────────────────────────────
+    ax = axes[0]
+    ax.plot(x, equity_pct, color="#2196F3", lw=2.0, label="My Portfolio")
+
+    if has_spy:
+        spy_initial = eq.loc[eq["spy_price"].first_valid_index(), "spy_price"]
+        spy_pct     = ((eq["spy_price"] / spy_initial) - 1) * 100
+        ax.plot(x, spy_pct, color="#4CAF50", lw=1.5, ls="--", label="SPY")
+        ax.annotate(f"  Portfolio: {equity_pct.iloc[-1]:+.1f}%",
+                    xy=(len(x)-1, equity_pct.iloc[-1]), fontsize=9, color="#2196F3")
+        ax.annotate(f"  SPY: {spy_pct.iloc[-1]:+.1f}%",
+                    xy=(len(x)-1, spy_pct.iloc[-1]), fontsize=9, color="#4CAF50")
+    else:
+        ax.annotate(f"  {equity_pct.iloc[-1]:+.1f}%",
+                    xy=(len(x)-1, equity_pct.iloc[-1]), fontsize=9, color="#2196F3")
+
+    ax.axhline(0, color="gray", lw=0.8, ls=":", alpha=0.6)
+    ax.set_title("Total Return  (% gain/loss since start — higher is better)",
+                 fontsize=11, pad=8)
+    ax.set_ylabel("Return (%)")
+    ax.legend(loc="upper left"); ax.grid(alpha=0.3)
+
+    # ── Panel 2: Drawdown ─────────────────────────────────────────────────────
+    ax2 = axes[1]
+    eq_vals = eq["equity"].values
+    peak    = np.maximum.accumulate(eq_vals)
+    dd      = ((eq_vals - peak) / (peak + 1e-9)) * 100
+    ax2.fill_between(x, dd, 0, alpha=0.5, color="#F44336", label="Drawdown")
+    ax2.axhline(0, color="black", lw=0.8)
+    ax2.set_title("Drawdown  (how far below your peak — closer to 0% is better)",
+                  fontsize=11, pad=8)
+    ax2.set_ylabel("% below peak")
+    ax2.legend(fontsize=9); ax2.grid(alpha=0.3)
+
+    # ── Panel 3: vs SPY (if available) ───────────────────────────────────────
+    if has_spy:
+        ax3 = axes[2]
+        spy_rets = eq["spy_price"].pct_change().dropna().values
+        n        = min(len(portfolio_rets), len(spy_rets))
+        active   = (portfolio_rets[:n] - spy_rets[:n]) * 100
+        colors   = ["#2196F3" if v >= 0 else "#F44336" for v in active]
+        ax3.bar(range(len(active)), active, color=colors, alpha=0.7, width=1.0)
+        ax3.axhline(0, color="black", lw=1.0)
+        ax3.set_title("Daily Outperformance vs SPY  (blue = beat SPY, red = trailed SPY)",
+                      fontsize=11, pad=8)
+        ax3.set_ylabel("% vs SPY that day")
+        ax3.set_xlabel("Trading days since start")
+        ax3.grid(alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.info(f"  Performance chart updated → {save_path}")

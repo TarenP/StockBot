@@ -221,6 +221,10 @@ def run_cycle(
     # ── Auto-show full status + cycle summary ─────────────────────────────────
     print_report(portfolio, show_benchmark=True)
 
+    # Update live performance chart
+    from broker.journal import plot_live_performance
+    plot_live_performance("plots/live_performance.png")
+
     # Show only what changed this cycle
     if executed:
         print(f"\n  {'─'*55}")
@@ -252,17 +256,18 @@ def parse_args(config: dict = None):
     )
     cfg = config or {}
     p.add_argument("--cash",           type=float, default=cfg.get("cash",           10_000))
-    p.add_argument("--max_positions",  type=int,   default=cfg.get("max_positions",  20))
-    p.add_argument("--stop_loss",      type=float, default=cfg.get("stop_loss",      0.07))
-    p.add_argument("--take_profit",    type=float, default=cfg.get("take_profit",    0.45))
-    p.add_argument("--min_score",      type=float, default=cfg.get("min_score",      0.50))
-    p.add_argument("--penny_pct",      type=float, default=cfg.get("penny_pct",      0.20))
-    p.add_argument("--max_sector",     type=float, default=cfg.get("max_sector",     0.40))
-    p.add_argument("--avoid_earnings", type=int,   default=cfg.get("avoid_earnings", 3))
-    p.add_argument("--top_n",          type=int,   default=cfg.get("top_n",          1000))
-    p.add_argument("--max_daily_loss", type=float, default=cfg.get("max_daily_loss", 0.03))
-    p.add_argument("--max_drawdown",   type=float, default=cfg.get("max_drawdown",   0.15))
-    p.add_argument("--no_options",     action="store_true", default=cfg.get("no_options", False))
+    p.add_argument("--max_positions",  type=int,   default=cfg.get("max_positions",  10))
+    p.add_argument("--stop_loss",      type=float, default=cfg.get("stop_loss",      0.08))
+    p.add_argument("--take_profit",    type=float, default=cfg.get("take_profit",    0.35))
+    p.add_argument("--partial_profit", type=float, default=cfg.get("partial_profit", 0.15))
+    p.add_argument("--min_score",      type=float, default=cfg.get("min_score",      0.58))
+    p.add_argument("--penny_pct",      type=float, default=cfg.get("penny_pct",      0.03))
+    p.add_argument("--max_sector",     type=float, default=cfg.get("max_sector",     0.25))
+    p.add_argument("--avoid_earnings", type=int,   default=cfg.get("avoid_earnings", 5))
+    p.add_argument("--top_n",          type=int,   default=cfg.get("top_n",          500))
+    p.add_argument("--max_daily_loss", type=float, default=cfg.get("max_daily_loss", 0.025))
+    p.add_argument("--max_drawdown",   type=float, default=cfg.get("max_drawdown",   0.12))
+    p.add_argument("--no_options",     action="store_true", default=cfg.get("no_options", True))
     p.add_argument("--no_market_hours",action="store_true", default=False)
     p.add_argument("--status",         action="store_true")
     p.add_argument("--trades",         action="store_true")

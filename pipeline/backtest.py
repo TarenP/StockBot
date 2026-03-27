@@ -66,10 +66,11 @@ def run_backtest(
     if spy_rets is None:
         dates = sorted(df_test.index.get_level_values("date").unique())
         if len(dates) >= 2:
-            start = pd.Timestamp(dates[0]).strftime("%Y-%m-%d")
-            end   = (pd.Timestamp(dates[-1]) + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+            start = (pd.Timestamp(dates[0]) - pd.Timedelta(days=5)).strftime("%Y-%m-%d")
+            end   = (pd.Timestamp(dates[-1]) + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
             spy_series = fetch_spy_returns(start=start, end=end)
-            if not spy_series.empty:
+            if not spy_series.empty and len(spy_series) >= 2:
+                # Align SPY to the same number of trading days as policy
                 spy_rets = spy_series.values[:len(policy_rets)]
             else:
                 print("  Warning: could not fetch SPY — benchmark comparison unavailable")
@@ -81,8 +82,9 @@ def run_backtest(
     }
     if spy_rets is not None:
         n = min(len(spy_rets), len(policy_rets))
-        results["spy"]     = compute_metrics(spy_rets[:n], "SPY")
-        results["vs_spy"]  = benchmark_vs_spy(policy_rets, spy_rets)
+        if n >= 2:
+            results["spy"]    = compute_metrics(spy_rets[:n], "SPY")
+            results["vs_spy"] = benchmark_vs_spy(policy_rets[:n], spy_rets[:n])
 
     # ── Print report ──────────────────────────────────────────────────────────
     print_benchmark_report(
