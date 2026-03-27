@@ -100,10 +100,22 @@ def load_master(
         pbar.set_description("Merging sentiment")
         try:
             df_sent = pd.read_csv(sentiment_path)
-            df_sent["date"] = (
-                pd.to_datetime(df_sent["date"], utc=True, errors="coerce")
-                  .dt.tz_convert(None).dt.normalize()
+            # Handle both old format (2020-06-05 10:30:00-04:00) and
+            # new format (2026-03-27) in the same CSV
+            df_sent["date"] = pd.to_datetime(
+                df_sent["date"], utc=False, errors="coerce"
             )
+            # For tz-aware rows, strip timezone; for naive rows, leave as-is
+            def _normalize_date(s):
+                try:
+                    if s.tzinfo is not None:
+                        return s.tz_convert(None).normalize()
+                    return s.normalize()
+                except Exception:
+                    return s
+            df_sent["date"] = df_sent["date"].apply(_normalize_date)
+            df_sent["date"] = pd.to_datetime(df_sent["date"], errors="coerce").dt.normalize()
+            df_sent = df_sent.dropna(subset=["date"])
             df_sent["ticker"] = df_sent["stock"].str.upper()
             # Only keep sentiment for tickers in our universe
             df_sent = df_sent[df_sent["ticker"].isin(universe)]

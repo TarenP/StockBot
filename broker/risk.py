@@ -230,15 +230,23 @@ def validate_startup(
     # ── Sentiment data freshness ──────────────────────────────────────────────
     try:
         sent      = pd.read_csv(sentiment_path, usecols=["date"])
-        last_sent = pd.to_datetime(sent["date"], utc=True, errors="coerce").dt.tz_convert(None).max().date()
-        stale     = (today - last_sent).days
-        if stale > max_sentiment_staleness_days:
-            warnings.append(
-                f"SENTIMENT DATA STALE: last date is {last_sent} ({stale} days ago). "
-                f"Run: python Agent.py --mode update"
-            )
+        # Handle mixed date formats (old: tz-aware strings, new: plain dates)
+        parsed    = pd.to_datetime(sent["date"], utc=False, errors="coerce")
+        # Strip timezone from tz-aware entries
+        parsed    = parsed.apply(lambda x: x.tz_localize(None) if x is not pd.NaT and x.tzinfo else x)
+        last_sent = parsed.max()
+        if pd.isna(last_sent):
+            warnings.append("SENTIMENT DATE UNREADABLE")
         else:
-            logger.info(f"  Sentiment data: current (last: {last_sent})")
+            last_sent = last_sent.date()
+            stale     = (today - last_sent).days
+            if stale > max_sentiment_staleness_days:
+                warnings.append(
+                    f"SENTIMENT DATA STALE: last date is {last_sent} ({stale} days ago). "
+                    f"Run: python Agent.py --mode update"
+                )
+            else:
+                logger.info(f"  Sentiment data: current (last: {last_sent})")
     except Exception as e:
         warnings.append(f"SENTIMENT DATA UNREADABLE: {e}")
 

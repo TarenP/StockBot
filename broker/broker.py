@@ -248,8 +248,8 @@ def parse_args(config: dict = None):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main():
-    args = parse_args()
+def main(config: dict = None):
+    args = parse_args(config)
 
     portfolio = Portfolio(initial_cash=args.cash)
 
