@@ -1,5 +1,29 @@
+# Data files (large, not tracked in git)
+*.parquet
+*.pt
 *.csv
 *.txt
-*.parquet
-*.json
-*.pt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Raw stock data (already parsed into parquet)
+StockData/
+
+# Broker runtime state
+broker/state/
+
+# Logs
+logs/
+
+# Plots (generated output)
+plots/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

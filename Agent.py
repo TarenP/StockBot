@@ -1,195 +1,462 @@
-# Portfolio RL Training Template (TorchRL + PyTorch)
-# Assumes master_df is a MultiIndex [date, ticker] with clean features
+"""
+Stock Predictor Agent — Entry Point
+=====================================
 
-import torch
-import torch.nn as nn
-import pandas as pd
+MODES
+-----
+  python Agent.py --mode train      Train from scratch (walk-forward folds)
+  python Agent.py --mode finetune   Fine-tune best checkpoint on recent data
+  python Agent.py --mode update     Fetch latest market data (run daily)
+  python Agent.py --mode backtest   Evaluate best checkpoint vs benchmarks
+  python Agent.py --mode predict    Print today's recommended portfolio
+  python Agent.py --mode schedule   Start the always-on scheduler daemon
+
+QUICK START
+-----------
+  1. pip install -r requirements.txt
+  2. python Agent.py --mode train          # first-time training (~hours)
+  3. python Agent.py --mode predict        # see today's picks
+  4. python Agent.py --mode schedule       # keep data + model fresh forever
+"""
+
+import argparse
+import glob
+import logging
+import os
+
 import numpy as np
-from gymnasium import Env, spaces
-from torchrl.envs import GymWrapper
-from torchrl.modules import ProbabilisticActor, ValueOperator
-from torchrl.modules.distributions import OneHotCategorical, Dirichlet
-from torchrl.trainers import PPOTrainer
-from torchrl.collectors import SyncDataCollector
-from torchrl.record.loggers import generate_exp_name, get_logger
-from torchrl.data.replay_buffers import TensorDictReplayBuffer, SamplerWithoutReplacement
-from torchrl.data import BoundedTensorSpec, CompositeSpec
+import pandas as pd
+import torch
 
-# ========== CONFIG ==========
-LOOKBACK = 20
-#Top K assets to select
-TOP_K = 10
-CASH_ASSET = True
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ========== ENVIRONMENT ==========
-class PortfolioEnv(Env):
-    def __init__(self, df, asset_list, lookback=LOOKBACK):
-        super().__init__()
-        self.df = df
-        self.asset_list = asset_list
-        self.n_assets = len(asset_list)
-        self.lookback = lookback
-        self.ptr = 0
 
-        feature_dim = df.shape[1] // self.n_assets
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf,
-            shape=(lookback, self.n_assets, feature_dim), dtype=np.float32)
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
-        self.action_space = spaces.Dict({
-            'mask': spaces.MultiBinary(self.n_assets),
-            'weights': spaces.Box(0, 1, shape=(self.n_assets + int(CASH_ASSET),))
-        })
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Stock Predictor Agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    p.add_argument("--mode", choices=["train", "finetune", "update", "backtest",
+                                       "predict", "schedule", "train_screener", "screen"],
+                   default="predict", help="What to do (default: predict)")
+    p.add_argument("--top_n",        type=int,   default=500,      help="Universe size for portfolio agent")
+    p.add_argument("--top_k",        type=int,   default=10,       help="Stocks to hold / show")
+    p.add_argument("--folds",        type=int,   default=3,        help="Walk-forward folds")
+    p.add_argument("--total_steps",  type=int,   default=100_000,  help="PPO steps per fold")
+    p.add_argument("--finetune_steps", type=int, default=20_000,   help="PPO steps for fine-tune")
+    p.add_argument("--checkpoint",   type=str,   default=None,     help="Path to .pt checkpoint")
+    p.add_argument("--save_dir",     type=str,   default="models", help="Checkpoint directory")
+    p.add_argument("--seed",         type=int,   default=42)
+    p.add_argument("--force_refresh", action="store_true",
+                   help="Re-download last 30 days (--mode update)")
+    # Screener filters
+    p.add_argument("--penny",        action="store_true",
+                   help="Screen penny stocks only (price < $5)")
+    p.add_argument("--min_price",    type=float, default=0.01,     help="Min price filter for screener")
+    p.add_argument("--max_price",    type=float, default=None,     help="Max price filter for screener")
+    p.add_argument("--min_volume",   type=float, default=10_000,   help="Min avg daily volume for screener")
+    p.add_argument("--screener_top_n", type=int, default=50,       help="How many picks to show from screener")
+    return p.parse_args()
 
-        self.dates = sorted(list(set(idx[0] for idx in df.index)))
-        self.reset()
 
-    def reset(self):
-        self.ptr = self.lookback
-        self.portfolio_value = 1.0
-        return self._get_obs()
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-    def step(self, action):
-        mask = action['mask']
-        raw_weights = action['weights'][:self.n_assets]
-        weights = (mask * raw_weights)
-        if weights.sum() > 0:
-            weights = weights / weights.sum()
+def _best_checkpoint(save_dir: str) -> str | None:
+    ckpts = sorted(glob.glob(f"{save_dir}/best_fold*.pt"))
+    return ckpts[-1] if ckpts else None
 
-        today = self.dates[self.ptr - 1]
-        tomorrow = self.dates[self.ptr]
-        prices_today = self._get_prices(today)
-        prices_tomorrow = self._get_prices(tomorrow)
 
-        rets = (prices_tomorrow / prices_today) - 1.0
-        portfolio_return = (weights * rets).sum()
-        self.portfolio_value *= (1 + portfolio_return)
+def _load_data_and_universe(top_n: int):
+    from pipeline.data import load_master, get_asset_universe
+    df = load_master(top_n=top_n)
+    asset_list = get_asset_universe(df, top_n=top_n, lookback_years=5)
+    df = df[df.index.get_level_values("ticker").isin(asset_list)]
+    return df, asset_list
 
-        reward = np.log1p(portfolio_return)
-        self.ptr += 5
-        done = self.ptr >= len(self.dates) - 5
-        return self._get_obs(), reward, done, {}
 
-    def _get_obs(self):
-        obs_dates = self.dates[self.ptr - self.lookback: self.ptr]
-        obs = []
-        for date in obs_dates:
-            slice_df = self.df.loc[date].loc[self.asset_list].values
-            obs.append(slice_df)
-        return np.stack(obs).astype(np.float32)
+# ── Mode: update ──────────────────────────────────────────────────────────────
 
-    def _get_prices(self, date):
-        return self.df.loc[date]['close'].values
+def run_update(args):
+    from pipeline.updater   import update_parquet
+    from pipeline.sentiment import update_sentiment
 
-# ========== MODEL ==========
-class MLP(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, output_dim)
-        )
+    logger.info("Fetching latest market data...")
+    n_price = update_parquet(save_dir=args.save_dir, force_full_refresh=args.force_refresh)
+    if n_price:
+        logger.info(f"Price data: {n_price} new rows added.")
+    else:
+        logger.info("Price data already up to date.")
 
-    def forward(self, x):
-        return self.net(x)
+    # Sentiment update — use universe from checkpoint
+    try:
+        from pipeline.updater import _load_trained_universe
+        universe = _load_trained_universe(args.save_dir)
+        if universe is None:
+            df, universe = _load_data_and_universe(args.top_n)
+        logger.info(f"Fetching news sentiment for {len(universe)} tickers...")
+        n_sent = update_sentiment(universe, lookback_days=7 if args.force_refresh else 3)
+        logger.info(f"Sentiment: {n_sent} new headlines scored.")
+    except Exception as e:
+        logger.warning(f"Sentiment update skipped: {e}")
 
-# ========== POLICY + VALUE ==========
-def build_agent(input_shape, n_assets):
-    flat_input = np.prod(input_shape)
 
-    selector_net = MLP(flat_input, n_assets)
-    allocator_net = MLP(flat_input + n_assets, n_assets + int(CASH_ASSET))
-    value_net = MLP(flat_input, 1)
+# ── Mode: train ───────────────────────────────────────────────────────────────
 
-    selector = ProbabilisticActor(
-        module=selector_net,
-        in_keys=["observation"],
-        out_keys=["mask"],
-        distribution_class=OneHotCategorical
+def run_train(args):
+    from pipeline.data  import walk_forward_split
+    from pipeline.train import train_fold, PPO_CFG, fold_is_complete
+
+    df, asset_list = _load_data_and_universe(args.top_n)
+    logger.info(f"Universe: {len(asset_list)} tickers")
+
+    folds = walk_forward_split(df, train_years=8, val_years=1, test_years=1)
+    logger.info(f"Walk-forward folds available: {len(folds)}")
+
+    cfg = {**PPO_CFG, "total_steps": args.total_steps}
+    best_ckpts = []
+
+    for i, fold in enumerate(folds[:args.folds]):
+        if fold_is_complete(args.save_dir, i):
+            logger.info(f"Fold {i} already complete — skipping.")
+            import glob
+            ckpt = f"{args.save_dir}/best_fold{i}.pt"
+            if os.path.exists(ckpt):
+                import torch
+                meta = torch.load(ckpt, map_location="cpu", weights_only=False)
+                best_ckpts.append((ckpt, meta.get("val_sharpe", 0.0)))
+            continue
+
+        try:
+            ckpt_path, val_sharpe = train_fold(
+                df_train   = fold["train"],
+                df_val     = fold["val"],
+                asset_list = asset_list,
+                fold_idx   = i,
+                cfg        = cfg,
+                save_dir   = args.save_dir,
+                device     = DEVICE,
+                seed       = args.seed,
+                top_n      = args.top_n,
+            )
+            best_ckpts.append((ckpt_path, val_sharpe))
+        except KeyboardInterrupt:
+            logger.info("Training interrupted. Run the same command to resume.")
+            break
+
+    if best_ckpts:
+        best = max(best_ckpts, key=lambda x: x[1])
+        logger.info(f"\nBest checkpoint: {best[0]}  (val Sharpe={best[1]:.3f})")
+
+
+# ── Mode: finetune ────────────────────────────────────────────────────────────
+
+def run_finetune(args):
+    from pipeline.data     import walk_forward_split
+    from pipeline.train    import train_fold, PPO_CFG
+    from pipeline.backtest import load_model
+
+    df, asset_list = _load_data_and_universe(args.top_n)
+
+    # Use only the most recent 2 years for fine-tuning
+    dates   = sorted(df.index.get_level_values("date").unique())
+    cutoff  = pd.Timestamp(dates[-1]) - pd.DateOffset(months=24)
+    df_recent = df[df.index.get_level_values("date") >= cutoff]
+
+    folds = walk_forward_split(df_recent, train_years=1, val_years=3, test_years=3)
+    if not folds:
+        logger.error("Not enough recent data for fine-tuning (need ~18 months).")
+        return
+
+    fold = folds[-1]
+
+    # Load pretrained weights
+    ckpt_path = args.checkpoint or _best_checkpoint(args.save_dir)
+    pretrained_state = None
+    model_cfg        = None
+    if ckpt_path:
+        ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+        pretrained_state = ckpt["model_state"]
+        model_cfg        = ckpt["model_cfg"]
+        logger.info(f"Fine-tuning from: {ckpt_path}")
+    else:
+        logger.info("No checkpoint found — training from scratch.")
+
+    cfg = {**PPO_CFG, "total_steps": args.finetune_steps}
+
+    # Version the fine-tuned checkpoint
+    fold_idx = len(glob.glob(f"{args.save_dir}/best_fold*.pt"))
+
+    new_ckpt, val_sharpe = train_fold(
+        df_train         = fold["train"],
+        df_val           = fold["val"],
+        asset_list       = asset_list,
+        fold_idx         = fold_idx,
+        cfg              = cfg,
+        model_cfg        = model_cfg,
+        save_dir         = args.save_dir,
+        device           = DEVICE,
+        seed             = args.seed,
+        pretrained_state = pretrained_state,
+    )
+    logger.info(f"Fine-tune done. Val Sharpe={val_sharpe:.3f} | Saved: {new_ckpt}")
+
+
+# ── Mode: backtest ────────────────────────────────────────────────────────────
+
+def run_backtest_mode(args):
+    from pipeline.data     import walk_forward_split
+    from pipeline.backtest import run_backtest, load_model
+
+    ckpt_path = args.checkpoint or _best_checkpoint(args.save_dir)
+    if not ckpt_path:
+        logger.error("No checkpoint found. Run --mode train first.")
+        return
+
+    import torch
+    meta  = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    top_n = meta.get("top_n", args.top_n)
+
+    df, asset_list = _load_data_and_universe(top_n)
+    folds = walk_forward_split(df, train_years=8, val_years=1, test_years=1)
+    if not folds:
+        logger.error("Not enough data for a full fold.")
+        return
+
+    df_test   = folds[-1]["test"]
+    ckpt_path = args.checkpoint or _best_checkpoint(args.save_dir)
+    if not ckpt_path:
+        logger.error("No checkpoint found. Run --mode train first.")
+        return
+
+    model = load_model(ckpt_path, DEVICE)
+    run_backtest(
+        model      = model,
+        df_test    = df_test,
+        asset_list = asset_list,
+        device     = DEVICE,
+        save_plot  = "plots/backtest.png",
     )
 
-    allocator = ProbabilisticActor(
-        module=allocator_net,
-        in_keys=["observation", "mask"],
-        out_keys=["weights"],
-        distribution_class=Dirichlet
+
+# ── Mode: predict ─────────────────────────────────────────────────────────────
+
+def run_predict(args):
+    from pipeline.backtest import load_model
+    from pipeline.features import FEATURE_COLS
+
+    ckpt_path = args.checkpoint or _best_checkpoint(args.save_dir)
+    if not ckpt_path:
+        logger.error("No checkpoint found. Run --mode train first.")
+        return
+
+    # Read top_n from checkpoint so universe always matches training
+    import torch
+    meta   = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    top_n  = meta.get("top_n", args.top_n)
+    if top_n != args.top_n and args.top_n == 500:   # user didn't override
+        logger.info(f"Using universe size from checkpoint: {top_n} tickers")
+
+    df, asset_list = _load_data_and_universe(top_n)
+
+    ckpt_path = args.checkpoint or _best_checkpoint(args.save_dir)
+    if not ckpt_path:
+        logger.error("No checkpoint found. Run --mode train first.")
+        return
+
+    model = load_model(ckpt_path, DEVICE)
+
+    lookback = 20
+    dates    = sorted(df.index.get_level_values("date").unique())
+    if len(dates) < lookback:
+        logger.error("Not enough data for prediction.")
+        return
+
+    recent_dates = dates[-lookback:]
+    df_recent    = df[df.index.get_level_values("date").isin(recent_dates)]
+
+    # ── Sentiment freshness warning ──────────────────────────────────────────
+    last_date = recent_dates[-1]
+    try:
+        sent_raw  = pd.read_csv("Sentiment/analyst_ratings_with_sentiment.csv",
+                                usecols=["date"])
+        sent_last = pd.to_datetime(sent_raw["date"], utc=True,
+                                   errors="coerce").dt.tz_convert(None).max()
+        gap_days  = (pd.Timestamp(last_date) - sent_last).days
+        if gap_days > 7:
+            logger.warning(
+                f"Sentiment data is {gap_days} days stale (last: {sent_last.date()}). "
+                f"Run --mode update to fetch fresh news — sentiment signals will show n/a until then."
+            )
+    except Exception:
+        pass
+
+    n_features = df.shape[1]
+    n_assets   = len(asset_list)
+    asset_map  = {a: i for i, a in enumerate(asset_list)}
+    obs        = np.zeros((lookback, n_assets, n_features), dtype=np.float32)
+
+    for t_idx, date in enumerate(recent_dates):
+        try:
+            slice_df = df_recent.loc[date]
+            for ticker, row in slice_df.iterrows():
+                if ticker in asset_map:
+                    obs[t_idx, asset_map[ticker], :] = row.values.astype(np.float32)
+        except KeyError:
+            pass
+
+    obs_t   = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+    weights = model.get_weights(obs_t).squeeze(0).cpu().numpy()
+
+    asset_weights = weights[:-1]
+    cash_weight   = weights[-1]
+
+    # ── Build ranked output table ────────────────────────────────────────────
+    # Grab the most recent feature snapshot per ticker for signal context
+    last_date    = recent_dates[-1]
+    feature_cols = [c for c in FEATURE_COLS if c in df.columns]
+
+    rows = []
+    for idx, ticker in enumerate(asset_list):
+        w = asset_weights[idx]
+        if w < 1e-4:
+            continue
+        row = {"ticker": ticker, "weight": w}
+        try:
+            feats = df_recent.loc[(last_date, ticker)]
+            # Map a few key signals to human-readable columns
+            feat_dict = dict(zip(feature_cols, feats.values))
+            row["momentum_20d"] = feat_dict.get("ret_20d",   np.nan)
+            row["rsi"]          = feat_dict.get("rsi",        np.nan)
+            row["sentiment"]    = feat_dict.get("sent_net",   np.nan)
+            row["vol_ratio"]    = feat_dict.get("vol_ratio",  np.nan)
+        except KeyError:
+            row["momentum_20d"] = np.nan
+            row["rsi"]          = np.nan
+            row["sentiment"]    = np.nan
+            row["vol_ratio"]    = np.nan
+        rows.append(row)
+
+    picks = (
+        pd.DataFrame(rows)
+          .sort_values("weight", ascending=False)
+          .head(args.top_k)
+          .reset_index(drop=True)
+    )
+    picks.index += 1   # 1-based rank
+
+    # ── Signal legend (z-scored, so interpret relative to universe) ──────────
+    print(f"\n{'='*72}")
+    print(f"  Weekly Portfolio Picks  —  as of {last_date.date()}")
+    print(f"  Universe: {n_assets} stocks  |  Showing top {args.top_k}")
+    print(f"{'='*72}")
+    print(f"  {'#':<4} {'Ticker':<8} {'Weight':>7}  {'Mom20d':>8}  {'RSI':>6}  {'Sentiment':>10}  {'Vol Ratio':>10}")
+    print(f"  {'-'*66}")
+    for rank, row in picks.iterrows():
+        mom  = f"{row['momentum_20d']:+.2f}" if not np.isnan(row['momentum_20d']) else "  n/a"
+        rsi  = f"{row['rsi']:+.2f}"          if not np.isnan(row['rsi'])          else "  n/a"
+        sent = f"{row['sentiment']:+.2f}"    if not np.isnan(row['sentiment'])    else "  n/a"
+        vol  = f"{row['vol_ratio']:+.2f}"    if not np.isnan(row['vol_ratio'])    else "  n/a"
+        print(f"  {rank:<4} {row['ticker']:<8} {row['weight']:>6.2%}  {mom:>8}  {rsi:>6}  {sent:>10}  {vol:>10}")
+    print(f"  {'-'*66}")
+    print(f"  {'CASH':<12} {cash_weight:>6.2%}")
+    print(f"{'='*72}")
+    print(f"  Signals are cross-sectionally z-scored (0 = universe avg).")
+    print(f"  Rebalance weekly. Not financial advice.\n")
+
+
+# ── Mode: train_screener ──────────────────────────────────────────────────────
+
+def run_train_screener(args):
+    from pipeline.screener import train_screener
+    from pipeline.data import load_master
+
+    # Load ALL tickers — no universe cap for the screener
+    logger.info("Loading full dataset for screener training (all tickers)...")
+    df = load_master(
+        min_price      = args.min_price,
+        min_avg_volume = args.min_volume,
+        top_n          = 99_999,   # effectively no cap
+    )
+    train_screener(df, device=DEVICE, epochs=10)
+
+
+# ── Mode: screen ──────────────────────────────────────────────────────────────
+
+def run_screen(args):
+    from pipeline.screener import run_screener, print_screener_results
+    from pipeline.data import load_master
+
+    min_price = 0.01
+    max_price = None
+    label     = "All stocks"
+
+    if args.penny:
+        max_price = 5.0
+        label     = "Penny stocks (< $5)"
+        logger.info("Penny stock mode — scanning stocks under $5")
+    elif args.max_price:
+        max_price = args.max_price
+        label     = f"Stocks under ${max_price}"
+
+    if args.min_price != 0.01:
+        min_price = args.min_price
+
+    logger.info("Loading full dataset for screening...")
+    df = load_master(
+        min_price      = min_price,
+        min_avg_volume = args.min_volume,
+        top_n          = 99_999,
     )
 
-    value = ValueOperator(module=value_net, in_keys=["observation"])
-    return selector, allocator, value
-
-# ========== TRAINING LOOP ==========
-def train(df, asset_list):
-    env = PortfolioEnv(df, asset_list)
-    wrapped_env = GymWrapper(env)
-
-    input_shape = wrapped_env.reset().shape
-    selector, allocator, value = build_agent(input_shape, len(asset_list))
-
-    class CombinedPolicy(nn.Module):
-        def forward(self, tensordict):
-            mask_td = selector(tensordict)
-            full_td = allocator(mask_td)
-            return full_td
-
-    policy = CombinedPolicy()
-
-    trainer = PPOTrainer(
-        env=wrapped_env,
-        policy=policy,
-        value_network=value,
-        lr=3e-4,
-        gamma=0.99,
-        num_epochs=10,
-        frames_per_batch=128,
-        total_frames=50_000,
-        device=DEVICE,
-        logger=get_logger('stdout', exp_name=generate_exp_name("portfolio_rl")),
+    results = run_screener(
+        df         = df,
+        device     = DEVICE,
+        top_n      = args.screener_top_n,
+        min_price  = min_price,
+        max_price  = max_price,
+        min_volume = args.min_volume,
     )
 
-    trainer.train()
-
-# ========== EVALUATION LOOP ==========
-def evaluate_policy(policy, df_test, asset_list):
-    env = PortfolioEnv(df_test, asset_list)
-    obs = env.reset()
-    done = False
-    portfolio_values = [env.portfolio_value]
-    
-    while not done:
-        obs_tensor = torch.tensor(obs).unsqueeze(0).to(DEVICE)
-        tensordict = {"observation": obs_tensor}
-        
-        with torch.no_grad():
-            mask_td = policy.selector(tensordict)
-            full_td = policy.allocator(mask_td)
-
-        action = {
-            'mask': full_td['mask'][0].cpu().numpy(),
-            'weights': full_td['weights'][0].cpu().numpy()
-        }
-        
-        obs, reward, done, _ = env.step(action)
-        portfolio_values.append(env.portfolio_value)
-
-    final_return = portfolio_values[-1] / portfolio_values[0] - 1
-    log_return = np.log(portfolio_values[-1]) - np.log(portfolio_values[0])
-    print(f"Final portfolio return: {final_return:.2%}")
-    print(f"Log return: {log_return:.4f}")
-
-# ========== ENTRY ==========
-# Usage: load your dataframe and call train()
-# df = pd.read_parquet("master_dataframe.parquet")
-# asset_list = sorted(df.index.get_level_values(1).unique())
-# train(df, asset_list)
-# ========== ENTRY ==========
-df = pd.read_parquet("Master_cleaned.parquet")
-asset_list = sorted(df.index.get_level_values(1).unique())
+    print_screener_results(results, label=label)
 
 
-evaluate_policy(trained_policy, df.loc['2019'], asset_list)
+# ── Mode: schedule ────────────────────────────────────────────────────────────
+
+def run_schedule(args):
+    from pipeline.scheduler import run_scheduler
+    # Pass the universe so the scheduler knows what to update
+    try:
+        from pipeline.data import load_master, get_asset_universe
+        df = load_master()
+        universe = get_asset_universe(df, top_n=args.top_n)
+    except Exception:
+        universe = None   # scheduler will infer from parquet
+    run_scheduler(universe=universe)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    args = parse_args()
+    logger.info(f"Mode: {args.mode} | Device: {DEVICE}")
+
+    dispatch = {
+        "update":         run_update,
+        "train":          run_train,
+        "finetune":       run_finetune,
+        "backtest":       run_backtest_mode,
+        "predict":        run_predict,
+        "schedule":       run_schedule,
+        "train_screener": run_train_screener,
+        "screen":         run_screen,
+    }
+    dispatch[args.mode](args)
