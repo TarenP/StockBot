@@ -217,6 +217,29 @@ def run_cycle(
         )
 
     print(portfolio.summary())
+
+    # ── Auto-show full status + cycle summary ─────────────────────────────────
+    print_report(portfolio, show_benchmark=True)
+
+    # Show only what changed this cycle
+    if executed:
+        print(f"\n  {'─'*55}")
+        print(f"  This cycle — {len(executed)} trade(s):")
+        print(f"  {'─'*55}")
+        for d in executed:
+            if d.action == "BUY":
+                print(f"  BOUGHT  {d.ticker:<8} {d.shares:.2f} shares @ ${d.price:.2f}")
+            elif d.action in ("SELL", "SELL_PARTIAL"):
+                label = "SOLD   " if d.action == "SELL" else "SOLD 50%"
+                print(f"  {label} {d.ticker:<8} {d.shares:.2f} shares @ ${d.price:.2f}  ({d.reason.split('|')[0].strip()})")
+            elif d.action == "OPEN_OPTION":
+                print(f"  OPTION  {d.ticker:<8} {d.reason[:60]}")
+            elif d.action == "CLOSE_OPTION":
+                print(f"  CLOSED  {d.ticker:<8} option — {d.reason[:50]}")
+        print(f"  {'─'*55}\n")
+    else:
+        print(f"\n  No trades this cycle.\n")
+
     brain.min_score = brain._base_min_score
 
 

@@ -1,14 +1,29 @@
 # StockBot — AI Stock Predictor & Autonomous Broker
 
-A complete AI-powered stock trading system built on reinforcement learning,
-transformer models, and live news sentiment. It has two main components that
-work together:
+---
 
-- **Agent** (`Agent.py`) — trains a model, generates weekly stock picks,
-  backtests performance, and screens the full market universe
-- **Broker** (`Broker.py`) — autonomously manages a live portfolio, makes
-  buy/sell/options decisions, tracks performance vs SPY, and handles all
-  risk management
+## Agent vs Broker — what's the difference?
+
+Think of it like this:
+
+**Agent (`Agent.py`) = the researcher and trainer.**
+It studies the market, learns patterns from 60+ years of historical data,
+and tells you what stocks look promising. It does not manage money. It does
+not buy or sell anything. It's the brain that gets trained.
+
+**Broker (`Broker.py`) = the portfolio manager.**
+It uses what the Agent learned, plus live data and news, to actually manage
+a portfolio. It buys stocks, sells them, handles options, enforces risk
+limits, and tracks performance vs SPY. This is the thing that runs daily.
+
+In practice:
+- You train the Agent once (takes hours), then occasionally retrain it
+- You run the Broker every day (takes minutes), and it handles everything
+
+Most of the time you only need one command:
+```bash
+python Broker.py
+```
 
 ---
 
@@ -37,7 +52,6 @@ the average stock on that signal.
 ## Setup
 
 ```bash
-# Install all dependencies
 pip install -r requirements.txt
 ```
 
@@ -52,7 +66,7 @@ FinBERT (~500MB) downloads automatically the first time sentiment scoring runs.
 python Agent.py --mode train --folds 10
 
 # Step 2: Seed your portfolio with starting positions (optional)
-# Edit seed_portfolio.py first, then run:
+# Edit seed_portfolio.py first, then:
 python seed_portfolio.py
 
 # Step 3: Run the broker
@@ -66,15 +80,15 @@ Everything else is automatic.
 
 ## broker.config — Your persistent settings
 
-Edit `broker.config` to set your preferences. These become the defaults
-every time you run `python Broker.py`. You never need to pass flags unless
-you want a one-off override.
+Edit `broker.config` once. These become your defaults every run — no flags needed.
 
 ```
 cash           = 10000    # starting cash (first run only — ignored after that)
 max_positions  = 20       # max stocks held at once
 stop_loss      = 0.07     # minimum stop-loss (ATR-adjusted upward per stock)
-take_profit    = 0.45     # full exit at +45% (partial exit at +20%)
+take_profit    = 0.45     # full exit threshold — sells remaining shares at this gain
+partial_profit = 0.20     # sell 50% here, let rest run to take_profit
+                          # set partial_profit > take_profit to disable partial exits
 min_score      = 0.50     # minimum signal score to buy (0-1)
 penny_pct      = 0.10     # max % of portfolio in $2-$5 stocks
 max_sector     = 0.40     # hard cap per sector
@@ -106,26 +120,28 @@ Every run automatically:
 9. Logs everything and compares to SPY
 10. Exits
 
+At the end of every run you automatically see:
+- Full portfolio summary (all positions, cash, total return, unrealised P&L per stock)
+- SPY benchmark comparison (beta, alpha, information ratio, beats SPY yes/no)
+- What changed this cycle — what was bought, what was sold, and why
+
 Your portfolio balance, positions, and trade history persist between runs
 in `broker/state/`. Nothing resets. The `cash` value in `broker.config`
 is only used on the very first run ever.
 
-### Check your portfolio
+### Check portfolio without trading
 ```bash
 python Broker.py --status
 ```
-Shows full portfolio summary including:
-- Current positions with unrealised P&L per stock
-- Open options positions with Greeks
-- Total return vs SPY (beta, alpha, information ratio, upside/downside capture)
-- Max drawdown, Sharpe ratio, win rate
+Shows the same full output as after a normal run, but without executing
+any trades. Use this any time you want to check in without triggering a cycle.
 
-### See recent trades
+### See more trade history
 ```bash
 python Broker.py --trades
 ```
-Shows the last 30 trades with full reasoning — what signal triggered each
-buy or sell, the score at time of decision, and the price.
+Shows the last 30 trades with full reasoning. The normal run shows 10 —
+use this when you want to dig deeper into trade history.
 
 ### Override a setting for one run
 ```bash
@@ -137,7 +153,8 @@ python Broker.py --no_market_hours     # run outside market hours (testing)
 
 ### Schedule it
 Run once daily after market close. The broker enforces market hours
-internally — new entries are blocked outside 9:30am–4:00pm ET.
+internally — new entries are blocked outside 9:30am–4:00pm ET, but
+exits and price updates still run.
 
 Windows Task Scheduler:
 - Program: `python`
@@ -164,11 +181,15 @@ previous price is used and a warning is logged.
 - **Stop-loss:** ATR-adjusted per stock. A volatile stock gets a wider stop
   than a stable one. Floor set by `stop_loss` in config (default 7%).
   Ceiling is 25% regardless of volatility.
-- **Partial take-profit:** At +20% gain, sells 50% of the position and
-  locks in profit. The remaining 50% continues running.
-- **Full take-profit:** At +45% gain, exits the remaining position entirely.
+- **Partial take-profit:** At the `partial_profit` threshold (default +20%),
+  sells 50% of the position and locks in profit. The remaining 50% runs on.
+- **Full take-profit:** At the `take_profit` threshold (default +45%),
+  exits the remaining shares entirely. The company is fully exited.
 - **Signal deterioration:** If the composite score of a held stock drops
   below 0.35, the position is sold regardless of P&L.
+
+To exit everything in one shot instead of two stages, set
+`partial_profit` higher than `take_profit` in `broker.config`.
 
 ### Risk engine (checked every run)
 - **Daily loss limit:** If the portfolio is down more than `max_daily_loss`
@@ -218,16 +239,17 @@ Set `no_options = true` in `broker.config` to disable.
 
 ## Agent — Research and training commands
 
+You only need these occasionally. The broker runs daily on its own.
+
 ### Get weekly stock picks
 ```bash
 python Agent.py --mode predict
 ```
 Outputs a ranked table of top picks with portfolio weights and signal
-breakdown. Run this Monday morning for the week's recommendations.
+breakdown. Useful for a manual sanity check on what the model thinks.
 
 ```bash
 python Agent.py --mode predict --top_k 20      # show top 20 instead of 10
-python Agent.py --mode predict --top_n 500     # use smaller universe
 ```
 
 ### Screen all stocks including penny stocks
@@ -242,14 +264,11 @@ python Agent.py --mode screen
 python Agent.py --mode screen --penny
 
 # Custom price range
-python Agent.py --mode screen --min_price 1 --max_price 10
-
-# Show more results
-python Agent.py --mode screen --penny --screener_top_n 100
+python Agent.py --mode screen --min_price 1 --max_price 10 --screener_top_n 100
 ```
 
 The screener has no universe size limit — it scores every ticker
-individually so it handles the full parquet including sub-$5 stocks.
+individually including sub-$5 stocks.
 
 ### Train the RL model from scratch
 ```bash
@@ -269,73 +288,55 @@ python Agent.py --mode train --folds 5  --top_n 500            # faster, smaller
 ```
 
 Training time: ~2–6 hours on CPU per fold, ~30–60 min on GPU.
-Check if you have a GPU: `python -c "import torch; print(torch.cuda.is_available())"`
+Check if you have a GPU:
+```bash
+python -c "import torch; print(torch.cuda.is_available())"
+```
 
 ### Fine-tune on recent data
 ```bash
 python Agent.py --mode finetune
 ```
 Takes the best existing checkpoint and continues training on the most recent
-2 years of data. Run this after major market regime changes (crashes, rate
-cycles, etc.). Takes ~20 minutes.
-
-```bash
-python Agent.py --mode finetune --finetune_steps 30000
-```
+2 years of data. Run this after major market regime changes. Takes ~20 min.
 
 ### Backtest the RL agent vs SPY
 ```bash
 python Agent.py --mode backtest
 ```
 Evaluates the trained RL policy on the held-out test period. SPY is fetched
-automatically. Produces a full metrics table and saves a 4-panel chart to
-`plots/backtest.png` showing:
-- Equity curves (policy vs SPY vs equal-weight)
-- Drawdown comparison vs SPY
-- Rolling 3-month relative performance
-- Rolling 12-month relative performance
+automatically. Saves a 4-panel chart to `plots/backtest.png`.
 
 ### Broker replay backtest
 ```bash
 python Agent.py --mode replay
 ```
-Runs the **actual broker decision logic** over historical data — same
-screening, sector allocation, stops, take-profits, and execution costs as
-the live broker. This is the honest performance number for the broker, not
-the RL agent's idealized backtest.
+Runs the actual broker decision logic over historical data — same screening,
+sector allocation, stops, take-profits, and execution costs as the live
+broker. This is the honest performance number for the broker.
 
 ```bash
 python Agent.py --mode replay --replay_years 5     # use 5 years of history
 python Agent.py --mode replay --sensitivity        # also run sensitivity sweep
 ```
 
-The sensitivity sweep runs the replay across 13 parameter combinations
-(varying min_score, stop-loss, take-profit, execution spread) to test
-whether results are robust or collapse under parameter changes.
+The sensitivity sweep runs the replay across 13 parameter combinations to
+test whether results are robust or collapse under parameter changes.
 
 ### Update data manually
 ```bash
 python Agent.py --mode update
 ```
-Fetches latest prices and scores fresh news headlines. The broker does this
-automatically on every run, so you only need this manually if you want to
-update without running a full broker cycle.
+The broker does this automatically on every run, so you only need this
+manually if you want to update data without running a full broker cycle.
 
-```bash
-python Agent.py --mode update --force_refresh   # re-download last 30 days
-```
-
-### Keep data updated automatically (background scheduler)
+### Background scheduler (optional)
 ```bash
 python Agent.py --mode schedule
 ```
-Runs continuously in the background:
-- 17:00 Mon–Fri: fetch new prices + news, score with FinBERT
-- Sunday 20:00: fine-tune model on recent 2 years of data
-
-Logs to `logs/scheduler.log`. Use this if you want the model to keep
-improving automatically. Otherwise the broker's built-in auto-update
-on each run is sufficient.
+Runs continuously: fetches prices + news at 17:00 Mon–Fri, fine-tunes the
+model every Sunday at 20:00. Only needed if you want the model to keep
+improving automatically without manual retraining.
 
 ---
 
@@ -369,7 +370,7 @@ and writes the portfolio state. The broker takes over from there.
 ## SPY benchmark — how performance is measured
 
 Every broker run fetches the current SPY price and tracks it alongside your
-equity. `python Broker.py --status` shows:
+equity. Shown automatically at the end of every run and via `--status`:
 
 - **Beta** — how much your portfolio moves relative to SPY (1.0 = moves with market)
 - **Alpha** — annualised return above what beta alone would predict
@@ -448,7 +449,7 @@ logs/                         broker.log, scheduler.log
 ```bash
 python Broker.py
 ```
-That's it. Everything else is automatic.
+That's it. Automatically updates data, makes decisions, shows you everything.
 
 **Weekly (Monday morning, optional):**
 ```bash
@@ -460,8 +461,8 @@ See the model's top picks for the week with signal breakdown.
 ```bash
 python Agent.py --mode replay --sensitivity
 ```
-Check whether the broker is actually beating SPY and whether results are
-robust across parameter changes.
+Check whether the broker is actually beating SPY and whether results hold
+up across parameter changes.
 
 **After major market events:**
 ```bash
