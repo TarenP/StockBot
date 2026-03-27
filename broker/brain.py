@@ -64,6 +64,7 @@ class BrokerBrain:
         rl_phase:             int   = 1,
         rl_exit_threshold:    float = 0.30,
         rl_conviction_drop:   float = 0.20,
+        rl_min_score:         float = 0.0,   # separate threshold for RL scores (0 = top-k only)
     ):
         self.portfolio            = portfolio
         self.max_positions        = max_positions
@@ -84,6 +85,7 @@ class BrokerBrain:
         self.rl_phase             = rl_phase
         self.rl_exit_threshold    = rl_exit_threshold
         self.rl_conviction_drop   = rl_conviction_drop
+        self.rl_min_score         = rl_min_score
 
         # Cache sector map across cycles (refreshed weekly)
         self._sector_map:   dict[str, str]   = {}
@@ -126,16 +128,13 @@ class BrokerBrain:
             )
             self.portfolio.update_prices(clean_prices)
 
-        # ── 3. RL exit checks (Phase 2) — runs before heuristic exits ───────────
+        # ── 3. RL exit checks (Phase 2) — deferred until after RL scoring ───────
+        # rl_scores must be computed first so exits use the cross-sectional pass.
+        # The actual call is made after step 6 below.
         rl_exited_tickers: set[str] = set()
-        if self.rl_enabled and self.rl_phase >= 2:
-            rl_exit_decisions = self._rl_exit_checks(
-                df_features, list(self.portfolio.positions.keys())
-            )
-            decisions.extend(rl_exit_decisions)
-            rl_exited_tickers = {d.ticker for d in rl_exit_decisions}
 
         # ── 4. Heuristic exit decisions ───────────────────────────────────────
+        # (RL-exited tickers are excluded once rl_exited_tickers is populated)
         for ticker in list(self.portfolio.positions.keys()):
             # Skip tickers that already have an RL-driven exit decision
             if ticker in rl_exited_tickers:
@@ -224,6 +223,14 @@ class BrokerBrain:
                 )
                 return decisions
 
+        # ── Phase 2: RL exit checks — now that rl_scores is available ─────────
+        if self.rl_enabled and self.rl_phase >= 2 and rl_scores is not None:
+            rl_exit_decisions = self._rl_exit_checks(
+                list(self.portfolio.positions.keys()), rl_scores
+            )
+            decisions.extend(rl_exit_decisions)
+            rl_exited_tickers = {d.ticker for d in rl_exit_decisions}
+
         # ── 7. Buy decisions ──────────────────────────────────────────────────
         sells_pending = sum(1 for d in decisions if d.action in ("SELL",))
         n_slots = self.max_positions - (
@@ -259,7 +266,7 @@ class BrokerBrain:
 
                 # Apply min_score threshold
                 if self.rl_enabled:
-                    if rl_score_val is None or rl_score_val < self.min_score:
+                    if rl_score_val is None or rl_score_val < self.rl_min_score:
                         continue
                 else:
                     if composite < self.min_score:
@@ -343,7 +350,8 @@ class BrokerBrain:
 
                 # ── Position sizing ───────────────────────────────────────────
                 # Base size from conviction
-                conviction  = (score - self.min_score) / (1.0 - self.min_score)
+                score_floor = self.rl_min_score if (self.rl_enabled and rl_score_val is not None) else self.min_score
+                conviction  = (score - score_floor) / max(1.0 - score_floor, 1e-6)
                 alloc_pct   = self.max_position_pct * conviction
                 alloc_pct   = np.clip(alloc_pct, 0.01, self.max_position_pct)
                 alloc_value = equity * alloc_pct
@@ -487,14 +495,21 @@ class BrokerBrain:
 
     # ── RL model validation ───────────────────────────────────────────────────
 
-    def _assert_model_available(self, shortlist: list | None = None) -> None:
+    def _assert_model_available(self) -> None:
         """
-        Validate that the RL checkpoint exists and (optionally) that its
-        architecture matches the current shortlist size.
+        Validate that the RL checkpoint exists and contains the required keys.
 
-        Raises RuntimeError (logged as CRITICAL) if:
-          - The checkpoint file does not exist.
-          - shortlist is provided and model_cfg["n_assets"] != len(shortlist).
+        The inference wrapper builds a dynamic observation tensor sized to the
+        current shortlist, so we do NOT check n_assets == len(shortlist) here —
+        that check is both brittle (shortlist length varies cycle to cycle) and
+        wrong (the model accepts any asset_list length at inference time).
+
+        Instead we verify:
+          - The checkpoint file exists on disk.
+          - The file loads without error.
+          - The required keys (model_cfg, model_state) are present.
+
+        Raises RuntimeError (logged as CRITICAL) on any failure.
         """
         if not self.rl_checkpoint_path or not os.path.exists(self.rl_checkpoint_path):
             msg = (
@@ -504,40 +519,40 @@ class BrokerBrain:
             logger.critical(msg)
             raise RuntimeError(msg)
 
-        if shortlist is not None:
-            try:
-                ckpt = torch.load(self.rl_checkpoint_path, map_location="cpu", weights_only=False)
-                model_cfg = ckpt.get("model_cfg", {})
-                n_assets_ckpt = model_cfg.get("n_assets")
-                if n_assets_ckpt is not None and n_assets_ckpt != len(shortlist):
-                    msg = (
-                        f"RL checkpoint architecture mismatch: checkpoint has "
-                        f"n_assets={n_assets_ckpt} but shortlist has {len(shortlist)} tickers. "
-                        "Aborting cycle."
-                    )
-                    logger.critical(msg)
-                    raise RuntimeError(msg)
-            except RuntimeError:
-                raise
-            except Exception as exc:
-                msg = f"Failed to load RL checkpoint '{self.rl_checkpoint_path}': {exc}"
-                logger.critical(msg)
-                raise RuntimeError(msg) from exc
+        try:
+            ckpt = torch.load(self.rl_checkpoint_path, map_location="cpu", weights_only=False)
+        except Exception as exc:
+            msg = f"Failed to load RL checkpoint '{self.rl_checkpoint_path}': {exc}"
+            logger.critical(msg)
+            raise RuntimeError(msg) from exc
+
+        missing = [k for k in ("model_cfg", "model_state") if k not in ckpt]
+        if missing:
+            msg = (
+                f"RL checkpoint '{self.rl_checkpoint_path}' is missing required keys: "
+                f"{missing}. Aborting cycle."
+            )
+            logger.critical(msg)
+            raise RuntimeError(msg)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _rl_exit_checks(
         self,
-        df_features: pd.DataFrame,
         held_tickers: list[str],
+        rl_scores: "pd.Series",
     ) -> list[Decision]:
         """
-        Phase 2: For each held ticker, fetch current RL score and compare to
-        the score recorded at entry.  Returns SELL or SELL_PARTIAL decisions.
+        Phase 2: Compare each held ticker's current RL score (from the
+        cycle-level scoring pass) against the score recorded at entry.
 
-        - SELL if current_rl_score < rl_exit_threshold
-        - SELL_PARTIAL (50%) if (entry_rl_score - current_rl_score) > rl_conviction_drop
-        - On inference failure: retain position and log a warning (no spurious exit)
+        Accepts the rl_scores Series already computed in run_cycle so that
+        held positions are evaluated in the same cross-sectional context as
+        buy candidates — not in isolation.  Tickers not present in rl_scores
+        (e.g. held names that fell off the shortlist) are skipped rather than
+        generating spurious exits.
+
+        Returns SELL or SELL_PARTIAL decisions.
         """
         exit_decisions: list[Decision] = []
 
@@ -546,25 +561,21 @@ class BrokerBrain:
             if pos is None:
                 continue
 
+            # Skip tickers not covered by this cycle's RL scoring pass.
+            # A held name absent from the shortlist means the screener already
+            # de-prioritised it; we let heuristic exits handle it rather than
+            # inferring a score in isolation.
+            if ticker not in rl_scores.index:
+                logger.debug(
+                    "RL exit check: %s not in cycle rl_scores — deferring to heuristic exits",
+                    ticker,
+                )
+                continue
+
+            current_rl_score = float(rl_scores[ticker])
             price = pos.get("last_price", 0.0)
             shares = pos.get("shares", 0.0)
             entry_rl_score = pos.get("rl_score_at_entry")  # may be None
-
-            # Fetch current RL score for this ticker
-            try:
-                rl_series = get_rl_targets(
-                    df_features,
-                    [ticker],
-                    self.rl_checkpoint_path,
-                    mode="rank",
-                )
-                current_rl_score = float(rl_series.get(ticker, 0.0))
-            except Exception as exc:
-                logger.warning(
-                    "RL exit check failed for %s — retaining position: %s",
-                    ticker, exc,
-                )
-                continue
 
             # Check absolute exit threshold
             if current_rl_score < self.rl_exit_threshold:

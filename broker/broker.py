@@ -279,6 +279,7 @@ def parse_args(config: dict = None):
     p.add_argument("--rl_phase",          type=int,   default=cfg.get("rl_phase",          1))
     p.add_argument("--rl_exit_threshold", type=float, default=cfg.get("rl_exit_threshold", 0.30))
     p.add_argument("--rl_conviction_drop",type=float, default=cfg.get("rl_conviction_drop", 0.20))
+    p.add_argument("--rl_min_score",      type=float, default=cfg.get("rl_min_score",      0.0))
     return p.parse_args()
 
 
@@ -321,6 +322,7 @@ def main(config: dict = None):
         rl_phase            = args.rl_phase,
         rl_exit_threshold   = args.rl_exit_threshold,
         rl_conviction_drop  = args.rl_conviction_drop,
+        rl_min_score        = args.rl_min_score,
     )
     brain._base_min_score = args.min_score
 

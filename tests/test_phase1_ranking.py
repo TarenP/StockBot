@@ -37,7 +37,7 @@ def _make_portfolio(cash: float = 100_000.0) -> Portfolio:
     return p
 
 
-def _make_brain(rl_enabled: bool, min_score: float = 0.0) -> BrokerBrain:
+def _make_brain(rl_enabled: bool, min_score: float = 0.0, rl_min_score: float = 0.0) -> BrokerBrain:
     portfolio = _make_portfolio()
     brain = BrokerBrain(
         portfolio=portfolio,
@@ -46,6 +46,7 @@ def _make_brain(rl_enabled: bool, min_score: float = 0.0) -> BrokerBrain:
         rl_enabled=rl_enabled,
         rl_checkpoint_path="models/best_fold9.pt",
         rl_phase=1,
+        rl_min_score=rl_min_score,
     )
     brain._base_min_score = min_score
     brain._sector_map = {}
@@ -174,19 +175,20 @@ class TestPhase1RLRanking(unittest.TestCase):
 
     def test_rl_enabled_min_score_filters_on_rl_score(self):
         """
-        When rl_enabled=True, min_score threshold is applied to rl_score.
-        A ticker with composite_score >= min_score but rl_score < min_score is excluded.
-        A ticker with composite_score < min_score but rl_score >= min_score is included.
+        When rl_enabled=True, rl_min_score threshold is applied to rl_score
+        (not the heuristic min_score).
+        A ticker with composite_score >= rl_min_score but rl_score < rl_min_score is excluded.
+        A ticker with composite_score < rl_min_score but rl_score >= rl_min_score is included.
         """
         tickers = ["PASS_RL", "FAIL_RL"]
         df = _make_df_features(tickers)
-        brain = _make_brain(rl_enabled=True, min_score=0.60)
+        brain = _make_brain(rl_enabled=True, min_score=0.0, rl_min_score=0.60)
 
-        # PASS_RL: composite below threshold, rl_score above → should be included
-        # FAIL_RL: composite above threshold, rl_score below → should be excluded
+        # PASS_RL: composite below rl_min_score, rl_score above → should be included
+        # FAIL_RL: composite above rl_min_score, rl_score below → should be excluded
         composite_scores = {
-            "PASS_RL": 0.40,   # below min_score
-            "FAIL_RL": 0.80,   # above min_score
+            "PASS_RL": 0.40,   # below rl_min_score
+            "FAIL_RL": 0.80,   # above rl_min_score
         }
         rl_scores = pd.Series(
             {"PASS_RL": 0.75, "FAIL_RL": 0.30},  # PASS_RL above, FAIL_RL below
@@ -202,11 +204,11 @@ class TestPhase1RLRanking(unittest.TestCase):
 
         self.assertIn(
             "PASS_RL", buy_tickers,
-            "PASS_RL has rl_score=0.75 >= min_score=0.60 and should be included"
+            "PASS_RL has rl_score=0.75 >= rl_min_score=0.60 and should be included"
         )
         self.assertNotIn(
             "FAIL_RL", buy_tickers,
-            "FAIL_RL has rl_score=0.30 < min_score=0.60 and should be excluded"
+            "FAIL_RL has rl_score=0.30 < rl_min_score=0.60 and should be excluded"
         )
 
     # ── Test 4: RL disabled — get_rl_targets is never called ──────────────────

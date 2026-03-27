@@ -103,6 +103,7 @@ rl_checkpoint_path    = models/best_fold9.pt
 rl_phase              = 1                  # 1=ranking, 2=ranking+exits, 3=weights (future)
 rl_exit_threshold     = 0.30              # Phase 2: sell if rl_score drops below this
 rl_conviction_drop    = 0.20              # Phase 2: sell 50% if score drops by this much
+rl_min_score          = 0.0               # Phase 1: min rl_score to enter (0 = top-k only)
 ```
 
 ---
@@ -231,26 +232,38 @@ activate the RL model for live decisions. The broker operates in hard
 model-required mode — if the checkpoint is missing or fails to load, the
 cycle aborts rather than silently falling back to heuristics.
 
+**Checkpoint contract:** on startup the broker verifies the checkpoint file
+exists, loads without error, and contains the required `model_cfg` and
+`model_state` keys. It does not check `n_assets` against the shortlist size
+— the inference wrapper builds a dynamic observation tensor sized to the
+current shortlist each cycle, so the model works with any shortlist length.
+
 **Phase 1 — RL as ranking controller (default when enabled):**
-The screener still narrows the universe to a shortlist. The RL model then
-ranks candidates by conviction score instead of the heuristic composite
-score. All existing risk controls (sector cap, penny cap, ATR stop, cash
-floor) still apply after RL ranking. Options are suppressed while RL is
-active.
+The screener narrows the universe to a shortlist. The RL model scores the
+entire shortlist in one cross-sectional forward pass and ranks candidates by
+conviction. `rl_min_score` (default `0.0`) sets a floor on RL scores — at
+the default of 0 the broker simply takes the top-k by RL rank with no
+absolute cutoff. Set it to e.g. `0.05` if you want to filter out the
+bottom of the distribution. All existing risk controls (sector cap, penny
+cap, ATR stop, cash floor) still apply after RL ranking. Options are
+suppressed while RL is active.
 
 **Phase 2 — RL conviction-drop exits (`rl_phase = 2`):**
-In addition to Phase 1 ranking, the RL model checks held positions each
-cycle. If the current RL score drops below `rl_exit_threshold` (default
-0.30), the position is sold. If it drops by more than `rl_conviction_drop`
-(default 0.20) relative to the score at entry, 50% of the position is sold.
-RL exits run before heuristic exits each cycle.
+After the shortlist is scored, held positions that appear in the cycle's RL
+scores are checked for exit signals. Scoring uses the same cross-sectional
+pass as entry ranking — held names are evaluated in the live opportunity set,
+not in isolation. If the current RL score drops below `rl_exit_threshold`
+(default 0.30), the position is sold. If it drops by more than
+`rl_conviction_drop` (default 0.20) relative to the score at entry, 50% of
+the position is sold. Held names that fell off the shortlist entirely are
+skipped and handled by heuristic exits instead.
 
 ```bash
 # Enable RL for one run
 python Broker.py --rl_enabled --rl_checkpoint_path models/best_fold9.pt
 
-# Enable Phase 2 exits
-python Broker.py --rl_enabled --rl_phase 2
+# Enable Phase 2 exits, with a score floor for entries
+python Broker.py --rl_enabled --rl_phase 2 --rl_min_score 0.05
 ```
 
 Run the ablation study before enabling RL in production to verify it
@@ -536,6 +549,7 @@ Adapt the model to the new market regime.
   conviction across the universe — often precedes volatile periods
 - If the broker makes no trades, it's usually because nothing scored above
   `min_score`. Lower it in `broker.config` or wait for better setups
+- When RL is enabled, `rl_min_score` controls the entry floor (default 0 = pure top-k ranking). `min_score` only applies to the heuristic path
 - AUDIT.md contains the full production readiness checklist — read it
   before committing real money
 - Run in paper mode for at least 30-90 days before using real capital
