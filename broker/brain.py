@@ -191,6 +191,27 @@ class BrokerBrain:
                     score=report["composite_score"],
                     reason=f"Signal deteriorated (score={report['composite_score']:.2f})",
                 ))
+                continue
+
+            # Delisted / halted ticker check — price hasn't moved in 5+ days
+            if price > 0 and price == pos.get("avg_cost", 0) and pos.get("shares", 0) > 0:
+                # If last_price equals avg_cost and we've never had a price update,
+                # the ticker may be halted. Check if yfinance returns data.
+                try:
+                    from broker.analyst import fetch_ticker_data
+                    recent = fetch_ticker_data(ticker, days=10)
+                    if recent is None or recent.empty:
+                        logger.warning(
+                            "Ticker %s appears delisted or halted — force-closing at last price",
+                            ticker,
+                        )
+                        decisions.append(Decision(
+                            action="SELL", ticker=ticker,
+                            shares=pos["shares"], price=price, score=0.0,
+                            reason="Delisted/halted — no price data available",
+                        ))
+                except Exception:
+                    pass
 
         # ── 5. Sector scoring — broker decides allocations ────────────────────
         sector_scores = score_sectors(df_features, self._sector_map)

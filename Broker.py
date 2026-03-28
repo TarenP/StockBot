@@ -39,6 +39,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_LOCK_FILE = Path("broker/state/.cycle_lock")
+
 
 # ── Config loader ─────────────────────────────────────────────────────────────
 
@@ -84,6 +86,20 @@ if __name__ == "__main__":
 
     # Always reload config fresh — the auto-tuner may have updated it
     config = _load_config()
+
+    # ── Duplicate run prevention ──────────────────────────────────────────────
+    if not (args.status or args.trades):
+        today_str = date.today().isoformat()
+        if _LOCK_FILE.exists():
+            lock_date = _LOCK_FILE.read_text().strip()
+            if lock_date == today_str:
+                logger.warning(
+                    "Broker already ran today (%s). "
+                    "Delete broker/state/.cycle_lock to force a re-run.", today_str
+                )
+                print(f"\n  Already ran today ({today_str}). Use --status to check portfolio.\n")
+                sys.exit(0)
+        _LOCK_FILE.write_text(today_str)
 
     # ── Status / trades — no trading ──────────────────────────────────────────
     if args.status or args.trades:
