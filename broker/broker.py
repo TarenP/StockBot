@@ -64,6 +64,25 @@ MARKET_OPEN  = (9, 30)
 MARKET_CLOSE = (16, 0)
 
 
+# ── Checkpoint resolver ───────────────────────────────────────────────────────
+
+def _resolve_checkpoint(path: str | None) -> str | None:
+    """
+    Resolve 'auto' to the best available checkpoint in models/.
+    Returns the path as-is for any other value.
+    """
+    import glob
+    if not path or str(path).strip().lower() == "auto":
+        ckpts = sorted(glob.glob("models/best_fold*.pt"))
+        resolved = ckpts[-1] if ckpts else None
+        if resolved:
+            logger.info("Checkpoint resolved: %s", resolved)
+        else:
+            logger.warning("No checkpoint found in models/ — RL will be unavailable")
+        return resolved
+    return path
+
+
 # ── Market hours check ────────────────────────────────────────────────────────
 
 def _is_market_hours() -> bool:

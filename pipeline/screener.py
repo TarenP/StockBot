@@ -81,89 +81,77 @@ def train_screener(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    n_features = len([c for c in FEATURE_COLS if c in df.columns])
-    model      = TickerScorer(n_features=n_features).to(device)
-    optimizer  = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    model = None  # defined after sample building (n_features known then)
 
     tqdm.write(f"Training screener on {df.index.get_level_values('ticker').nunique()} tickers...")
 
-    # ── Build supervised dataset ─────────────────────────────────────────────
-    tqdm.write("Building training samples...")
+    # ── Pre-pivot into 3D array for fast O(1) lookups ─────────────────────────
+    # Shape: (n_dates, n_tickers, n_features) — avoids per-ticker pandas scans
+    tqdm.write("Building training samples (pre-pivoting data)...")
     dates   = sorted(df.index.get_level_values("date").unique())
     tickers = sorted(df.index.get_level_values("ticker").unique())
+    feat_cols = [c for c in FEATURE_COLS if c in df.columns]
+    n_features = len(feat_cols)
+
+    date_idx   = {d: i for i, d in enumerate(dates)}
+    ticker_idx = {t: i for i, t in enumerate(tickers)}
+    n_d, n_t   = len(dates), len(tickers)
+
+    # Fill 3D array — missing (date, ticker) pairs stay as NaN
+    arr = np.full((n_d, n_t, n_features), np.nan, dtype=np.float32)
+    for (date, ticker), row in df[feat_cols].iterrows():
+        di = date_idx.get(date)
+        ti = ticker_idx.get(ticker)
+        if di is not None and ti is not None:
+            arr[di, ti, :] = row.values.astype(np.float32)
+
+    # Pre-compute forward returns array: (n_dates, n_tickers)
+    # Use ret_1d column if available, else NaN
+    ret_col = feat_cols.index("ret_1d") if "ret_1d" in feat_cols else None
+    if ret_col is not None:
+        ret_arr = arr[:, :, ret_col].copy()   # (n_dates, n_tickers)
+    else:
+        ret_arr = np.zeros((n_d, n_t), dtype=np.float32)
 
     X_list, y_list = [], []
 
-    for t_idx in tqdm(range(LOOKBACK, len(dates) - forward_days),
-                      desc="Sampling windows", unit="date", colour="cyan",
-                      dynamic_ncols=True):
+    # Sample every SAMPLE_STRIDE dates to keep dataset manageable
+    SAMPLE_STRIDE = 5
+    sample_dates  = range(LOOKBACK, n_d - forward_days, SAMPLE_STRIDE)
 
-        date      = dates[t_idx]
-        fwd_date  = dates[min(t_idx + forward_days, len(dates) - 1)]
-        hist_dates = dates[t_idx - LOOKBACK: t_idx]
+    for t_idx in tqdm(sample_dates, desc="Sampling windows",
+                      unit="date", colour="cyan", dynamic_ncols=True):
 
-        # Forward returns for all tickers on this date
-        try:
-            fwd_prices  = df.loc[fwd_date,  "ret_1d"] if "ret_1d" in df.columns else None
-            curr_prices = df.loc[date,       "ret_1d"] if "ret_1d" in df.columns else None
-        except KeyError:
-            continue
+        # Forward return for each ticker: product of daily returns over next forward_days
+        fwd_end = min(t_idx + forward_days, n_d)
+        fwd_rets_mat = ret_arr[t_idx:fwd_end, :]          # (forward_days, n_tickers)
+        fwd_rets_vec = np.nanprod(1 + fwd_rets_mat, axis=0) - 1  # (n_tickers,)
 
-        # Get tickers available on this date
-        try:
-            available = df.loc[date].index.tolist()
-        except KeyError:
-            continue
+        # Only consider tickers with data on this date
+        has_data = ~np.isnan(arr[t_idx, :, 0])            # (n_tickers,)
+        valid_mask = has_data & np.isfinite(fwd_rets_vec)
 
-        if len(available) < 10:
-            continue
-
-        # Compute forward returns using ret_1d cumsum approximation
-        fwd_rets = {}
-        for ticker in available:
-            try:
-                fwd_slice = df.loc[
-                    df.index.get_level_values("date").isin(
-                        dates[t_idx:t_idx + forward_days]
-                    )
-                ].xs(ticker, level="ticker")["ret_1d"]
-                fwd_rets[ticker] = float((1 + fwd_slice).prod() - 1)
-            except (KeyError, Exception):
-                pass
-
-        if len(fwd_rets) < 5:
+        if valid_mask.sum() < 10:
             continue
 
         # Label: top 20% forward return = 1
-        ret_series = pd.Series(fwd_rets)
-        threshold  = ret_series.quantile(1 - top_pct)
-        labels     = (ret_series >= threshold).astype(float)
+        valid_rets = fwd_rets_vec[valid_mask]
+        threshold  = np.nanpercentile(valid_rets, (1 - top_pct) * 100)
+        labels_vec = (fwd_rets_vec >= threshold).astype(np.float32)
 
-        # Build observation windows
-        for ticker in available:
-            if ticker not in labels:
+        # Build observation windows for each valid ticker
+        hist_slice = arr[t_idx - LOOKBACK: t_idx, :, :]   # (LOOKBACK, n_tickers, n_features)
+
+        for ti, has in enumerate(valid_mask):
+            if not has:
                 continue
-            try:
-                hist = df.loc[
-                    df.index.get_level_values("date").isin(hist_dates)
-                ].xs(ticker, level="ticker")
-
-                feat_cols = [c for c in FEATURE_COLS if c in hist.columns]
-                obs = hist[feat_cols].values.astype(np.float32)
-
-                if obs.shape[0] < LOOKBACK or np.isnan(obs).mean() > 0.3:
-                    continue
-
-                obs = np.nan_to_num(obs[-LOOKBACK:], nan=0.0)
-                X_list.append(obs)
-                y_list.append(float(labels[ticker]))
-            except (KeyError, Exception):
-                pass
-
-        # Sample every 5 dates to keep dataset manageable
-        if t_idx % 5 != 0:
-            X_list.clear(); y_list.clear()   # only keep every 5th date
-            continue
+            obs = hist_slice[:, ti, :]                     # (LOOKBACK, n_features)
+            nan_frac = np.isnan(obs).mean()
+            if nan_frac > 0.3:
+                continue
+            obs = np.nan_to_num(obs, nan=0.0)
+            X_list.append(obs)
+            y_list.append(float(labels_vec[ti]))
 
     if not X_list:
         logger.error("No training samples built. Check data.")
@@ -172,6 +160,9 @@ def train_screener(
     X = np.array(X_list, dtype=np.float32)
     y = np.array(y_list, dtype=np.float32)
     tqdm.write(f"  Samples: {len(X):,}  |  Positive rate: {y.mean():.1%}")
+
+    model     = TickerScorer(n_features=n_features).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     dataset  = torch.utils.data.TensorDataset(
