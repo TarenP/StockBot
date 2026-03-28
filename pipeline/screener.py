@@ -52,7 +52,7 @@ class TickerScorer(nn.Module):
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, 1),
-            nn.Sigmoid(),
+            # No Sigmoid here — BCEWithLogitsLoss expects raw logits
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -105,6 +105,19 @@ def train_screener(
         if di is not None and ti is not None:
             arr[di, ti, :] = row.values.astype(np.float32)
 
+    # Cross-sectional z-score per date (matches RL training normalisation)
+    # For each date, standardise each feature across all tickers
+    tqdm.write("  Normalising features (cross-sectional z-score)...")
+    for di in range(n_d):
+        slice_ = arr[di]                          # (n_tickers, n_features)
+        valid  = ~np.isnan(slice_[:, 0])          # tickers with data on this date
+        if valid.sum() < 2:
+            continue
+        mu  = np.nanmean(slice_[valid], axis=0)   # (n_features,)
+        std = np.nanstd( slice_[valid], axis=0)   # (n_features,)
+        std[std < 1e-9] = 1e-9
+        arr[di, valid] = np.clip((slice_[valid] - mu) / std, -5.0, 5.0)
+
     # Pre-compute forward returns array: (n_dates, n_tickers)
     # Use ret_1d column if available, else NaN
     ret_col = feat_cols.index("ret_1d") if "ret_1d" in feat_cols else None
@@ -116,7 +129,9 @@ def train_screener(
     X_list, y_list = [], []
 
     # Sample every SAMPLE_STRIDE dates to keep dataset manageable
-    SAMPLE_STRIDE = 5
+    SAMPLE_STRIDE   = 20    # every 20 trading days (~monthly)
+    MAX_TICKERS_PER_DATE = 500   # random subsample per date to cap memory
+    rng = np.random.default_rng(42)
     sample_dates  = range(LOOKBACK, n_d - forward_days, SAMPLE_STRIDE)
 
     for t_idx in tqdm(sample_dates, desc="Sampling windows",
@@ -142,9 +157,12 @@ def train_screener(
         # Build observation windows for each valid ticker
         hist_slice = arr[t_idx - LOOKBACK: t_idx, :, :]   # (LOOKBACK, n_tickers, n_features)
 
-        for ti, has in enumerate(valid_mask):
-            if not has:
-                continue
+        valid_indices = np.where(valid_mask)[0]
+        # Subsample tickers if too many to keep memory bounded
+        if len(valid_indices) > MAX_TICKERS_PER_DATE:
+            valid_indices = rng.choice(valid_indices, MAX_TICKERS_PER_DATE, replace=False)
+
+        for ti in valid_indices:
             obs = hist_slice[:, ti, :]                     # (LOOKBACK, n_features)
             nan_frac = np.isnan(obs).mean()
             if nan_frac > 0.3:
@@ -164,6 +182,10 @@ def train_screener(
     model     = TickerScorer(n_features=n_features).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
 
+    # Weighted BCE — upweight positive class to counter 20/80 imbalance
+    pos_weight = torch.tensor([(1 - top_pct) / top_pct], device=device)  # ~4.0
+    criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
     # ── Training loop ─────────────────────────────────────────────────────────
     dataset  = torch.utils.data.TensorDataset(
         torch.tensor(X), torch.tensor(y).unsqueeze(1)
@@ -171,16 +193,14 @@ def train_screener(
     loader   = torch.utils.data.DataLoader(
         dataset, batch_size=batch_size, shuffle=True
     )
-    criterion = nn.BCELoss()
 
     for epoch in range(epochs):
-        model.train()
         total_loss = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}",
                     unit="batch", colour="blue", dynamic_ncols=True)
         for xb, yb in pbar:
             xb, yb = xb.to(device), yb.to(device)
-            pred   = model(xb)
+            pred   = model(xb)          # raw logits
             loss   = criterion(pred, yb)
             optimizer.zero_grad()
             loss.backward()
@@ -278,7 +298,8 @@ def run_screener(
                       desc="Scoring tickers", unit="batch",
                       colour="magenta", dynamic_ncols=True):
             batch  = X[i:i + batch_size]
-            score  = model(batch).squeeze(1).cpu().numpy()
+            logits = model(batch).squeeze(1)
+            score  = torch.sigmoid(logits).cpu().numpy()
             scores.extend(score.tolist())
 
     # ── Build results table ───────────────────────────────────────────────────
