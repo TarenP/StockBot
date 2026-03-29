@@ -58,6 +58,7 @@ def parse_args():
     p.add_argument("--checkpoint",   type=str,   default=None,     help="Path to .pt checkpoint")
     p.add_argument("--save_dir",     type=str,   default="models", help="Checkpoint directory")
     p.add_argument("--seed",         type=int,   default=42)
+    p.add_argument("--force_retrain", action="store_true",         help="Retrain folds even if completion markers already exist")
     p.add_argument("--force_refresh", action="store_true",
                    help="Re-download last 30 days (--mode update)")
     # Screener filters
@@ -228,7 +229,7 @@ def run_train(args):
         dynamic_ncols=True,
     ) as folds_pbar:
         for i, fold in enumerate(selected_folds):
-            if fold_is_complete(args.save_dir, i):
+            if fold_is_complete(args.save_dir, i) and not args.force_retrain:
                 logger.info(f"Fold {i} already complete - skipping.")
                 ckpt = f"{args.save_dir}/best_fold{i}.pt"
                 if os.path.exists(ckpt):
@@ -252,6 +253,7 @@ def run_train(args):
                     device=DEVICE,
                     seed=args.seed,
                     top_n=top_n,
+                    force_restart=args.force_retrain,
                 )
                 best_ckpts.append((ckpt_path, val_sharpe))
                 folds_pbar.update(1)
@@ -277,7 +279,12 @@ def run_train(args):
                 from pipeline.screener import train_screener
 
                 df_all = _load_all(top_n=99_999, include_raw_cols=True)
-                train_screener(df_all, device=DEVICE, epochs=debug_settings["screener_epochs"])
+                train_screener(
+                    df_all,
+                    device=DEVICE,
+                    epochs=debug_settings["screener_epochs"],
+                    force_rebuild_cache=args.force_retrain,
+                )
                 logger.info("Screener training complete.")
             except Exception as exc:
                 logger.warning(f"Screener training failed (continuing): {exc}")
@@ -539,7 +546,12 @@ def run_train_screener(args):
         top_n          = 99_999,   # effectively no cap
         include_raw_cols=True,
     )
-    train_screener(df, device=DEVICE, epochs=args.screener_epochs)
+    train_screener(
+        df,
+        device=DEVICE,
+        epochs=args.screener_epochs,
+        force_rebuild_cache=args.force_retrain,
+    )
 
 
 def run_screen(args):

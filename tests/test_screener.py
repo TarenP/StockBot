@@ -102,3 +102,29 @@ def test_run_screener_applies_filters_and_history_gate(monkeypatch):
     )
 
     assert results["ticker"].tolist() == ["KEEP"]
+
+
+def test_heuristic_scores_from_windows_prefers_stronger_latest_signal():
+    feat_cols = FEATURE_COLS
+    n_features = len(feat_cols)
+    X = np.zeros((2, screener_module.LOOKBACK, n_features), dtype=np.float32)
+    idx = {col: i for i, col in enumerate(feat_cols)}
+
+    X[0, -1, idx["ret_20d"]] = 2.0
+    X[0, -1, idx["ret_5d"]] = 1.5
+    X[0, -1, idx["macd_hist"]] = 1.0
+    X[0, -1, idx["sent_net"]] = 1.0
+    X[0, -1, idx["sent_surprise"]] = 1.0
+
+    X[1, -1, idx["ret_20d"]] = -1.5
+    X[1, -1, idx["ret_5d"]] = -1.0
+    X[1, -1, idx["macd_hist"]] = -1.0
+    X[1, -1, idx["sent_net"]] = -1.0
+    X[1, -1, idx["sent_surprise"]] = -1.0
+
+    scores = screener_module._heuristic_scores_from_windows(X, feat_cols)
+
+    assert scores.shape == (2,)
+    assert 0.0 <= scores[0] <= 1.0
+    assert 0.0 <= scores[1] <= 1.0
+    assert scores[0] > scores[1]

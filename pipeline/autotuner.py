@@ -168,7 +168,7 @@ def tune_parameters(
     pd.DataFrame(results).sort_values("sharpe", ascending=False).to_csv(
         "plots/param_tuning.csv", index=False
     )
-    logger.info("AutoTuner: full parameter results saved → plots/param_tuning.csv")
+    logger.info("AutoTuner: full parameter results saved -> plots/param_tuning.csv")
 
     return best_params
 

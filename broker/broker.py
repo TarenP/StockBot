@@ -170,7 +170,7 @@ def run_cycle(
         return
 
     # ── Run decisions ─────────────────────────────────────────────────────────
-    decisions = brain.run_cycle(df, screener_top_n=100, risk_engine=risk)
+    decisions = brain.run_cycle(df, screener_top_n=50, risk_engine=risk)
 
     if not decisions:
         logger.info("No trades this cycle.")
@@ -285,6 +285,7 @@ def parse_args(config: dict = None):
     p.add_argument("--min_score",      type=float, default=cfg.get("min_score",      0.58))
     p.add_argument("--penny_pct",      type=float, default=cfg.get("penny_pct",      0.03))
     p.add_argument("--max_sector",     type=float, default=cfg.get("max_sector",     0.25))
+    p.add_argument("--max_correlation",type=float, default=cfg.get("max_correlation", 0.80))
     p.add_argument("--avoid_earnings", type=int,   default=cfg.get("avoid_earnings", 5))
     p.add_argument("--top_n",          type=int,   default=cfg.get("top_n",          500))
     p.add_argument("--max_daily_loss", type=float, default=cfg.get("max_daily_loss", 0.025))
@@ -334,6 +335,7 @@ def main(config: dict = None):
         min_score           = args.min_score,
         penny_max_pct       = args.penny_pct,
         max_sector_pct      = args.max_sector,
+        max_pair_correlation = args.max_correlation,
         avoid_earnings_days = args.avoid_earnings,
         device              = DEVICE,
         rl_enabled          = args.rl_enabled,

@@ -11,6 +11,7 @@ from pipeline.features import build_features
 
 
 DATA_DIR = Path("MasterDS")
+SENTIMENT_LAG_SESSIONS = 1
 
 
 def _select_universe_from_raw(
@@ -41,6 +42,50 @@ def _select_universe_from_raw(
     return sorted(vol_rank.index.tolist())
 
 
+def _lag_sentiment_to_next_trading_session(
+    df_sent: pd.DataFrame,
+    df_prices: pd.DataFrame,
+    lag_sessions: int = SENTIMENT_LAG_SESSIONS,
+) -> pd.DataFrame:
+    """
+    Move sentiment to the next available trading session to avoid using same-day
+    headlines in the day's features. This is a conservative point-in-time fix:
+    all sentiment is applied starting on the next market session.
+    """
+    if lag_sessions <= 0 or df_sent.empty:
+        return df_sent
+
+    sent_cols = list(df_sent.columns)
+    shifted_parts: list[pd.DataFrame] = []
+
+    for ticker, grp in df_sent.groupby(level="ticker", sort=False):
+        try:
+            trading_dates = df_prices.xs(ticker, level="ticker").index.to_numpy()
+        except KeyError:
+            continue
+        if len(trading_dates) == 0:
+            continue
+
+        grp_reset = grp.reset_index()
+        sentiment_dates = grp_reset["date"].to_numpy()
+        target_pos = np.searchsorted(trading_dates, sentiment_dates, side="right")
+        target_pos = target_pos + (lag_sessions - 1)
+        valid = target_pos < len(trading_dates)
+        if not np.any(valid):
+            continue
+
+        shifted = grp_reset.loc[valid, ["ticker", *sent_cols]].copy()
+        shifted.insert(0, "date", trading_dates[target_pos[valid]])
+        shifted_parts.append(shifted)
+
+    if not shifted_parts:
+        return df_sent.iloc[0:0]
+
+    shifted_df = pd.concat(shifted_parts, ignore_index=True)
+    shifted_df = shifted_df.groupby(["date", "ticker"], sort=True)[sent_cols].mean()
+    return shifted_df
+
+
 def load_master(
     price_path: str = str(DATA_DIR / "stooq_panel.parquet"),
     sentiment_path: str = "Sentiment/analyst_ratings_with_sentiment.csv",
@@ -50,6 +95,7 @@ def load_master(
     universe: list[str] | None = None,   # pre-filter to these tickers before features
     top_n: int = 500,                    # used to auto-select universe if not provided
     include_raw_cols: bool = False,
+    sentiment_lag_sessions: int = SENTIMENT_LAG_SESSIONS,
 ) -> pd.DataFrame:
     """
     Load, merge, filter, and feature-engineer the master dataset.
@@ -119,6 +165,11 @@ def load_master(
             df_sent = df_sent[df_sent["ticker"].isin(universe)]
             sent_cols = ["neg_score", "neutral_score", "pos_score"]
             df_sent = df_sent.groupby(["date", "ticker"])[sent_cols].mean()
+            df_sent = _lag_sentiment_to_next_trading_session(
+                df_sent,
+                df_prices,
+                lag_sessions=sentiment_lag_sessions,
+            )
             df_prices = df_prices.join(df_sent, how="left")
             n_sent = df_prices["pos_score"].notna().sum()
             tqdm.write(f"  Sentiment rows matched: {n_sent:,}")

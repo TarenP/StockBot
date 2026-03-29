@@ -179,6 +179,7 @@ def train_fold(
     seed: int = 42,
     pretrained_state: dict = None,
     top_n: int = 500,
+    force_restart: bool = False,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -217,7 +218,7 @@ def train_fold(
     best_ckpt_path  = _best_path(save_dir, fold_idx)
 
     resume_path = _resume_path(save_dir, fold_idx)
-    if os.path.exists(resume_path):
+    if os.path.exists(resume_path) and not force_restart:
         tqdm.write(f"  Resuming fold {fold_idx} from {resume_path} ...")
         ckpt = _load_resume(resume_path, device)
         model.load_state_dict(ckpt["model_state"])
@@ -235,6 +236,8 @@ def train_fold(
             tqdm.write("  Loaded pretrained weights for fine-tuning.")
         except Exception as e:
             tqdm.write(f"  Warning: could not load pretrained weights ({e}).")
+    elif force_restart:
+        tqdm.write(f"  Force restart enabled for fold {fold_idx} - ignoring old resume state.")
 
     train_env = PortfolioEnv(df_train, asset_list, lookback=lookback)
     val_env   = PortfolioEnv(df_val,   asset_list, lookback=lookback)

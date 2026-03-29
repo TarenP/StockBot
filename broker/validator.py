@@ -161,10 +161,10 @@ def check_move_is_real(
     explanation = " | ".join(explanations)
 
     if is_real:
-        logger.info(f"  ✓ Move CONFIRMED real ({confirmations}/3 sources agree): {explanation}")
+        logger.info(f"  [OK] Move CONFIRMED real ({confirmations}/3 sources agree): {explanation}")
     else:
         logger.warning(
-            f"  ✗ Move LIKELY BAD DATA ({confirmations}/3 sources agree): {explanation}"
+            f"  [FAIL] Move LIKELY BAD DATA ({confirmations}/3 sources agree): {explanation}"
         )
 
     return is_real, explanation

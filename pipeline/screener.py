@@ -23,12 +23,13 @@ logger = logging.getLogger(__name__)
 
 SCREENER_CKPT = "models/screener.pt"
 SCREENER_SAMPLES = "models/screener_samples.npz"
+SCREENER_CACHE_VERSION = 2
 LOOKBACK = 40
 FORWARD_DAYS = 20
 TOP_PCT = 0.10
 SAMPLE_STRIDE = 5
 MAX_T_PER_DATE = 600
-EVAL_TOP_N = 100
+EVAL_TOP_N = 50
 MIN_HISTORY_COVERAGE = 0.70
 
 
@@ -98,6 +99,7 @@ def _cache_key(
     tickers = df.index.get_level_values("ticker")
     params = "_".join(
         [
+            f"cache_v={SCREENER_CACHE_VERSION}",
             str(len(df)),
             str(dates.nunique()),
             str(tickers.nunique()),
@@ -317,6 +319,56 @@ def _evaluate_ranked_groups(
     }
 
 
+def _heuristic_scores_from_windows(X: np.ndarray, feat_cols: list[str]) -> np.ndarray:
+    """
+    Lightweight cross-sectional alpha built from the most recent normalized
+    screener features. This complements the neural model on obvious momentum /
+    sentiment setups and can be blended using validation.
+    """
+    if len(X) == 0:
+        return np.array([], dtype=np.float32)
+
+    idx = {col: i for i, col in enumerate(feat_cols)}
+    latest = X[:, -1, :]
+    recent5 = X[:, -5:, :].mean(axis=1)
+    recent20 = X.mean(axis=1)
+
+    def col(arr: np.ndarray, name: str) -> np.ndarray:
+        pos = idx.get(name)
+        if pos is None:
+            return np.zeros(len(arr), dtype=np.float32)
+        return arr[:, pos]
+
+    alpha = np.zeros(len(X), dtype=np.float32)
+    alpha += 0.24 * col(latest, "ret_20d")
+    alpha += 0.16 * col(latest, "ret_5d")
+    alpha += 0.12 * col(latest, "macd_hist")
+    alpha += 0.10 * col(latest, "price_pos_52w")
+    alpha += 0.08 * col(latest, "vol_ratio")
+    alpha += 0.10 * col(latest, "sent_net")
+    alpha += 0.08 * col(latest, "sent_surprise")
+    alpha += 0.05 * col(recent5, "sent_accel")
+    alpha += 0.04 * col(recent5, "sent_trend")
+    alpha += 0.03 * col(recent20, "vol_ratio")
+
+    alpha = np.clip(alpha, -8.0, 8.0)
+    return (1.0 / (1.0 + np.exp(-alpha))).astype(np.float32)
+
+
+def _blend_scores(
+    model_probs: np.ndarray,
+    heuristic_probs: np.ndarray,
+    blend_weight: float,
+) -> np.ndarray:
+    if len(model_probs) == 0:
+        return model_probs
+    blend_weight = float(np.clip(blend_weight, 0.0, 1.0))
+    return (
+        blend_weight * model_probs
+        + (1.0 - blend_weight) * heuristic_probs
+    ).astype(np.float32)
+
+
 def _score_epoch(metrics: dict[str, float]) -> float:
     """
     Score a checkpoint based on shortlist quality.
@@ -372,6 +424,7 @@ def train_screener(
     device: torch.device = None,
     label_smoothing: float = 0.05,
     eval_top_n: int = EVAL_TOP_N,
+    force_rebuild_cache: bool = False,
 ):
     """
     Train the screener on real forward returns.
@@ -401,7 +454,9 @@ def train_screener(
     X_val = y_val = r_val = g_val = None
     X_test = y_test = r_test = g_test = None
 
-    if Path(SCREENER_SAMPLES).exists():
+    if force_rebuild_cache:
+        tqdm.write("  Force retrain enabled - rebuilding screener samples cache.")
+    elif Path(SCREENER_SAMPLES).exists():
         try:
             cached = np.load(SCREENER_SAMPLES, allow_pickle=False)
             if str(cached.get("cache_key", b"")) == ck:
@@ -533,6 +588,9 @@ def train_screener(
     best_score = float("-inf")
     best_state = None
     best_val_metrics: dict[str, float] = {}
+    best_blend_weight = 1.0
+    val_heuristic_probs = _heuristic_scores_from_windows(X_val, feat_cols)
+    test_heuristic_probs = _heuristic_scores_from_windows(X_test, feat_cols)
 
     for epoch in range(epochs):
         model.train()
@@ -587,19 +645,39 @@ def train_screener(
             except Exception:
                 pass
 
-            val_metrics = _evaluate_ranked_groups(
-                probs=probs,
-                labels=y_val,
-                forward_returns=r_val,
-                groups=g_val,
-                shortlist_size=eval_top_n,
-            )
-            model_score = _score_epoch(val_metrics)
+            blend_candidates = [1.0, 0.85, 0.70, 0.55]
+            blended_metrics = None
+            blended_score = float("-inf")
+            blended_weight = 1.0
+            for blend_weight in blend_candidates:
+                eval_probs = _blend_scores(probs, val_heuristic_probs, blend_weight)
+                metrics = _evaluate_ranked_groups(
+                    probs=eval_probs,
+                    labels=y_val,
+                    forward_returns=r_val,
+                    groups=g_val,
+                    shortlist_size=eval_top_n,
+                )
+                score = _score_epoch(metrics)
+                if score > blended_score:
+                    blended_score = score
+                    blended_metrics = metrics
+                    blended_weight = blend_weight
+
+            val_metrics = blended_metrics or {
+                "precision_at_k": 0.0,
+                "recall_at_k": 0.0,
+                "mean_return_at_k": 0.0,
+                "baseline_return": 0.0,
+                "lift_at_k": 0.0,
+            }
+            model_score = blended_score
             if model_score > best_score:
                 best_score = model_score
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 best_val_metrics = dict(val_metrics)
                 best_val_metrics["val_auc"] = float(val_auc)
+                best_blend_weight = blended_weight
 
         tqdm.write(
             f"  Epoch {epoch + 1:>2}/{epochs}  loss={avg_loss:.4f}  "
@@ -607,7 +685,8 @@ def train_screener(
             f"p@{eval_top_n}={val_metrics['precision_at_k']:.1%}  "
             f"r@{eval_top_n}={val_metrics['recall_at_k']:.1%}  "
             f"ret@{eval_top_n}={val_metrics['mean_return_at_k']:.2%}  "
-            f"lift={val_metrics['lift_at_k']:.2f}"
+            f"lift={val_metrics['lift_at_k']:.2f}  "
+            f"blend={best_blend_weight:.2f}"
             + (" <- best" if best_state is not None and best_score == _score_epoch(val_metrics) else "")
         )
 
@@ -616,7 +695,8 @@ def train_screener(
         tqdm.write(
             f"  Restored best model "
             f"(p@{eval_top_n}={best_val_metrics.get('precision_at_k', 0.0):.1%}, "
-            f"r@{eval_top_n}={best_val_metrics.get('recall_at_k', 0.0):.1%})"
+            f"r@{eval_top_n}={best_val_metrics.get('recall_at_k', 0.0):.1%}, "
+            f"blend={best_blend_weight:.2f})"
         )
 
     test_auc = 0.0
@@ -641,6 +721,7 @@ def train_screener(
             test_auc = roc_auc_score(y_test, test_probs)
         except Exception:
             pass
+        test_probs = _blend_scores(test_probs, test_heuristic_probs, best_blend_weight)
         test_metrics = _evaluate_ranked_groups(
             probs=test_probs,
             labels=y_test,
@@ -666,6 +747,7 @@ def train_screener(
             "forward_days": forward_days,
             "top_pct": top_pct,
             "eval_top_n": eval_top_n,
+            "blend_weight": float(best_blend_weight),
             "val_metrics": best_val_metrics,
             "test_metrics": {**test_metrics, "test_auc": float(test_auc)},
         },
@@ -682,6 +764,8 @@ def load_screener(device: torch.device) -> TickerScorer:
     ckpt = torch.load(SCREENER_CKPT, map_location=device, weights_only=False)
     model = TickerScorer(n_features=ckpt["n_features"]).to(device)
     model.load_state_dict(ckpt["model_state"])
+    model._blend_weight = float(ckpt.get("blend_weight", 1.0))
+    model._feature_cols = ckpt.get("feature_cols", [])
     model.eval()
     return model
 
@@ -779,7 +863,8 @@ def run_screener(
         logger.error("No valid observations for screener.")
         return pd.DataFrame()
 
-    X = torch.tensor(np.array(obs_list, dtype=np.float32), device=device)
+    obs_arr = np.array(obs_list, dtype=np.float32)
+    X = torch.tensor(obs_arr, device=device)
 
     scores = []
     model.eval()
@@ -787,6 +872,14 @@ def run_screener(
         for i in range(0, len(X), batch_size):
             logits = model(X[i:i + batch_size]).squeeze(1)
             scores.extend(torch.sigmoid(logits).cpu().numpy().tolist())
+
+    heuristic_scores = _heuristic_scores_from_windows(obs_arr, feat_cols)
+    blend_weight = float(getattr(model, "_blend_weight", 1.0))
+    scores = _blend_scores(
+        np.array(scores, dtype=np.float32),
+        heuristic_scores,
+        blend_weight,
+    ).tolist()
 
     rows = []
     for ticker, score in zip(valid_tickers, scores):

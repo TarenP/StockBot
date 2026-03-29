@@ -29,12 +29,14 @@ Path("logs").mkdir(exist_ok=True)
 Path("plots").mkdir(exist_ok=True)
 Path("broker/state").mkdir(parents=True, exist_ok=True)
 
+import sys
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.FileHandler("logs/broker.log", encoding="utf-8"),
-        logging.StreamHandler(),
+        logging.StreamHandler(stream=open(sys.stdout.fileno(), mode='w', encoding='utf-8', closefd=False)),
     ],
 )
 logger = logging.getLogger(__name__)

@@ -290,6 +290,8 @@ def run_replay(
     take_profit: float = 0.45,
     penny_pct: float = 0.20,
     max_sector_pct: float = 0.40,
+    max_pair_correlation: float = 0.80,
+    correlation_lookback_days: int = 60,
     execution_spread: float = 0.001,  # 10 bps flat for replay simplicity
     label: str | None = None,
 ) -> tuple[np.ndarray, list]:
@@ -622,6 +624,8 @@ def _run_replay_v2(
     take_profit: float = 0.45,
     penny_pct: float = 0.20,
     max_sector_pct: float = 0.40,
+    max_pair_correlation: float = 0.80,
+    correlation_lookback_days: int = 60,
     execution_spread: float = 0.001,
     label: str | None = None,
 ) -> tuple[np.ndarray, list]:
@@ -861,6 +865,8 @@ def _run_replay_v2(
         min_score=min_score,
         penny_max_pct=penny_pct,
         max_sector_pct=max_sector_pct,
+        max_pair_correlation=max_pair_correlation,
+        correlation_lookback_days=correlation_lookback_days,
         device=None,
         rl_enabled=(strategy == "screener_rl"),
         rl_checkpoint_path=checkpoint_path,
@@ -1281,7 +1287,7 @@ def run_ablation(
     # ── Save CSV report ───────────────────────────────────────────────────────
     os.makedirs(os.path.dirname(save_report) if os.path.dirname(save_report) else ".", exist_ok=True)
     report_df.to_csv(save_report, index=False)
-    logger.info("Ablation report saved → %s", save_report)
+    logger.info("Ablation report saved -> %s", save_report)
 
     # ── Save Sharpe bar chart ─────────────────────────────────────────────────
     os.makedirs(os.path.dirname(save_plot) if os.path.dirname(save_plot) else ".", exist_ok=True)
@@ -1305,6 +1311,6 @@ def run_ablation(
     plt.tight_layout()
     plt.savefig(save_plot, dpi=150, bbox_inches="tight")
     plt.close()
-    logger.info("Ablation chart saved → %s", save_plot)
+    logger.info("Ablation chart saved -> %s", save_plot)
 
     return report_df

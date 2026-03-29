@@ -342,4 +342,4 @@ def plot_benchmark(
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
-    logger.info(f"  Chart saved → {save_path}")
+    logger.info(f"  Chart saved -> {save_path}")

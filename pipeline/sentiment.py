@@ -41,18 +41,20 @@ def _get_finbert():
     global _finbert_pipeline
     if _finbert_pipeline is None:
         try:
+            import torch
             from transformers import pipeline as hf_pipeline
             logger.info("Loading FinBERT model (first run downloads ~500MB)...")
+            device = 0 if torch.cuda.is_available() else -1
             _finbert_pipeline = hf_pipeline(
                 "text-classification",
                 model="ProsusAI/finbert",
                 tokenizer="ProsusAI/finbert",
-                top_k=None,          # return all 3 label scores
-                device=-1,           # CPU; set to 0 for GPU
+                top_k=None,
+                device=device,
                 truncation=True,
                 max_length=512,
             )
-            logger.info("FinBERT loaded.")
+            logger.info("FinBERT loaded on %s.", "GPU" if device == 0 else "CPU")
         except ImportError:
             raise ImportError(
                 "transformers and torch are required for sentiment scoring.\n"
@@ -72,11 +74,11 @@ def _score_headlines(headlines: list[str]) -> list[dict]:
     pipe    = _get_finbert()
     results = []
 
-    batches = list(range(0, len(headlines), 32))
+    batches = list(range(0, len(headlines), 64))
     pbar = tqdm(batches, desc="  Scoring headlines", unit="batch",
                 leave=False, colour="yellow")
     for i in pbar:
-        batch = headlines[i:i + 32]
+        batch = headlines[i:i + 64]
         pbar.set_postfix(headlines=f"{i}–{i+len(batch)}")
         try:
             outputs = pipe(batch)
@@ -208,47 +210,52 @@ def fetch_and_score(
 ) -> pd.DataFrame:
     """
     Fetch recent headlines for all tickers and score with FinBERT.
+    Collects all headlines first, then scores in one batched pass for speed.
     Returns a DataFrame in the same schema as the existing sentiment CSV.
     """
     from_date = (datetime.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     to_date   = datetime.today().strftime("%Y-%m-%d")
 
-    all_rows = []
+    # ── Phase 1: fetch all headlines (fast — just HTTP) ───────────────────────
+    raw_rows: list[dict] = []
     pbar = tqdm(tickers, desc="Fetching news", unit="ticker", colour="green")
     for ticker in pbar:
         pbar.set_postfix(ticker=ticker)
         raw = []
 
-        # Try NewsAPI first (best quality), fall back to scrapers
         if NEWSAPI_KEY:
             raw = _fetch_newsapi(ticker, from_date, to_date)
-            time.sleep(0.1)
+            time.sleep(0.05)
 
         if not raw:
             raw = _fetch_finviz_rss(ticker)
-            time.sleep(0.15)
+            time.sleep(0.10)
 
         if not raw:
             raw = _fetch_yahoo_rss(ticker)
-            time.sleep(0.15)
+            time.sleep(0.10)
 
-        if raw:
-            headlines = [r["title"] for r in raw]
-            scores    = _score_headlines(headlines)
-            for row, score in zip(raw, scores):
-                all_rows.append({
-                    "title":         row["title"],
-                    "date":          row["date"],
-                    "stock":         row["stock"],
-                    "neg_score":     score["neg_score"],
-                    "neutral_score": score["neutral_score"],
-                    "pos_score":     score["pos_score"],
-                    "sentiment":     score["sentiment"],
-                })
-            pbar.set_postfix(ticker=ticker, headlines=len(raw))
+        raw_rows.extend(raw)
 
-    if not all_rows:
+    if not raw_rows:
         return pd.DataFrame()
+
+    # ── Phase 2: score all headlines in one batched FinBERT pass ─────────────
+    all_headlines = [r["title"] for r in raw_rows]
+    logger.info("Scoring %d headlines with FinBERT...", len(all_headlines))
+    scores = _score_headlines(all_headlines)
+
+    all_rows = []
+    for row, score in zip(raw_rows, scores):
+        all_rows.append({
+            "title":         row["title"],
+            "date":          row["date"],
+            "stock":         row["stock"],
+            "neg_score":     score["neg_score"],
+            "neutral_score": score["neutral_score"],
+            "pos_score":     score["pos_score"],
+            "sentiment":     score["sentiment"],
+        })
 
     return pd.DataFrame(all_rows)
 

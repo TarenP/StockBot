@@ -157,7 +157,7 @@ def run_maintenance(initial_cash: float = 10_000.0, save_dir: str = "models") ->
     _setup_logging()
     state = _load_state()
 
-    logger.info("─" * 50)
+    logger.info("-" * 50)
     logger.info("Maintenance check: %s", datetime.now().strftime("%Y-%m-%d %H:%M"))
 
     # Load universe for data updates
@@ -167,6 +167,17 @@ def run_maintenance(initial_cash: float = 10_000.0, save_dir: str = "models") ->
         universe = _load_trained_universe(save_dir)
     except Exception:
         pass
+
+    # If no checkpoint universe, use top liquid tickers from parquet
+    # to avoid updating all 11,500 tickers on first run
+    if not universe:
+        try:
+            from pipeline.data import load_master, get_asset_universe
+            df_raw = load_master(top_n=750)
+            universe = get_asset_universe(df_raw, top_n=750)
+            logger.info("Maintenance: using top-%d liquid tickers (no checkpoint yet)", len(universe))
+        except Exception:
+            pass
 
     _check_prices(state, universe)
     _check_sentiment(state, universe)

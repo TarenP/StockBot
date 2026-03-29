@@ -332,7 +332,7 @@ def validate_top_genomes(
             genome["max_drawdown"] = round(compute_metrics(rets)["max_drawdown"], 4)
             genome["validated"]    = True
         except Exception as exc:
-            logger.debug("Validation failed for genome %d: %s", i, exc)
+            logger.warning("Validation failed for genome %d: %s", i, exc)
             genome["sharpe"]    = -1.0
             genome["validated"] = False
 
@@ -693,13 +693,9 @@ def run_historical_warmup(
     validated = [g for g in population if g.get("validated") and not g.get("is_baseline")]
     if validated:
         best = max(validated, key=lambda g: float(g.get("sharpe", -99)))
-        baseline_sharpe = float(next(
-            (g["sharpe"] for g in population if g.get("is_baseline")), 0.0
-        ))
-
         logger.info(
-            "Warm-up complete. Best genome: Sharpe=%.3f (baseline=%.3f)",
-            float(best.get("sharpe", 0)), baseline_sharpe,
+            "Warm-up complete. Best validated genome: Sharpe=%.3f",
+            float(best.get("sharpe", 0)),
         )
 
         # Always promote after warm-up — this is the best we found on history

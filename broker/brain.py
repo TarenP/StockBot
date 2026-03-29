@@ -32,6 +32,52 @@ from pipeline.rl_inference import get_rl_targets
 logger = logging.getLogger(__name__)
 
 
+def _build_recent_return_frame(
+    df_features: pd.DataFrame,
+    lookback_days: int,
+) -> pd.DataFrame:
+    if "ret_1d" not in df_features.columns:
+        return pd.DataFrame()
+    dates = sorted(df_features.index.get_level_values("date").unique())
+    if not dates:
+        return pd.DataFrame()
+    recent_dates = dates[-lookback_days:]
+    recent = df_features[df_features.index.get_level_values("date").isin(recent_dates)]
+    try:
+        return recent["ret_1d"].unstack("ticker")
+    except Exception:
+        return pd.DataFrame()
+
+
+def _candidate_correlation_stats(
+    returns_frame: pd.DataFrame,
+    candidate: str,
+    held_tickers: list[str],
+    min_obs: int = 20,
+) -> dict | None:
+    if returns_frame.empty or candidate not in returns_frame.columns or not held_tickers:
+        return None
+
+    corrs = []
+    for held in held_tickers:
+        if held not in returns_frame.columns:
+            continue
+        pair = returns_frame[[candidate, held]].dropna()
+        if len(pair) < min_obs:
+            continue
+        corr = float(pair[candidate].corr(pair[held]))
+        if np.isfinite(corr):
+            corrs.append(abs(corr))
+
+    if not corrs:
+        return None
+
+    return {
+        "max_abs_corr": float(np.max(corrs)),
+        "mean_abs_corr": float(np.mean(corrs)),
+    }
+
+
 @dataclass
 class Decision:
     action:  str          # "BUY", "SELL", "SELL_PARTIAL", "HOLD"
@@ -57,6 +103,8 @@ class BrokerBrain:
         penny_max_pct:        float = 0.20,
         penny_threshold:      float = 5.0,
         max_sector_pct:       float = 0.40,   # hard cap per sector
+        max_pair_correlation: float = 0.80,
+        correlation_lookback_days: int = 60,
         avoid_earnings_days:  int   = 3,       # skip stocks within N days of earnings
         device=None,
         rl_enabled:           bool  = False,
@@ -78,6 +126,8 @@ class BrokerBrain:
         self.penny_max_pct        = penny_max_pct
         self.penny_threshold      = penny_threshold
         self.max_sector_pct       = max_sector_pct
+        self.max_pair_correlation = max_pair_correlation
+        self.correlation_lookback_days = correlation_lookback_days
         self.avoid_earnings_days  = avoid_earnings_days
         self.device               = device
         self.rl_enabled           = rl_enabled
@@ -98,7 +148,7 @@ class BrokerBrain:
     def run_cycle(
         self,
         df_features: pd.DataFrame,
-        screener_top_n: int = 100,
+        screener_top_n: int = 50,
         risk_engine=None,   # PortfolioRiskEngine instance
     ) -> list[Decision]:
         decisions = []
@@ -193,8 +243,12 @@ class BrokerBrain:
                 ))
                 continue
 
-            # Delisted / halted ticker check — price hasn't moved in 5+ days
-            if price > 0 and price == pos.get("avg_cost", 0) and pos.get("shares", 0) > 0:
+            # Delisted / halted ticker check — only for positions held 5+ days
+            # with no price movement. Avoids false positives on newly opened positions
+            # where last_price == avg_cost by definition.
+            days_held = pos.get("days_held", 0)
+            pos["days_held"] = days_held + 1
+            if price > 0 and price == pos.get("avg_cost", 0) and days_held >= 5:
                 # If last_price equals avg_cost and we've never had a price update,
                 # the ticker may be halted. Check if yfinance returns data.
                 try:
@@ -269,10 +323,19 @@ class BrokerBrain:
         threshold_skips = 0
         penny_budget_skips = 0
         sector_budget_skips = 0
+        correlation_blocked_skips = 0
         risk_blocked_skips = 0
         tiny_alloc_skips = 0
         buyable_count = 0
         if n_slots > 0 and candidates:
+            held_tickers_now = list(self.portfolio.positions.keys())
+            recent_return_frame = (
+                _build_recent_return_frame(
+                    df_features,
+                    lookback_days=self.correlation_lookback_days,
+                )
+                if held_tickers_now else pd.DataFrame()
+            )
             for ticker in candidates[:min(n_slots * 3, 40)]:
                 shortlist_considered += 1
                 if ticker in self.portfolio.positions:
@@ -418,6 +481,24 @@ class BrokerBrain:
                     sector_budget_skips += 1
                     continue
 
+                corr_stats = _candidate_correlation_stats(
+                    recent_return_frame,
+                    ticker,
+                    held_tickers_now,
+                )
+                if (
+                    corr_stats is not None
+                    and corr_stats["max_abs_corr"] > self.max_pair_correlation
+                ):
+                    logger.debug(
+                        "Correlation cap blocked %s (max_abs_corr=%.2f > %.2f)",
+                        ticker,
+                        corr_stats["max_abs_corr"],
+                        self.max_pair_correlation,
+                    )
+                    correlation_blocked_skips += 1
+                    continue
+
                 # ── Position sizing ───────────────────────────────────────────
                 # Base size from conviction
                 score_floor = self.rl_min_score if (self.rl_enabled and rl_score_val is not None) else self.min_score
@@ -432,6 +513,14 @@ class BrokerBrain:
 
                 # Constrain by sector budget
                 alloc_value = min(alloc_value, sector_budget)
+
+                if corr_stats is not None:
+                    diversification_scale = np.clip(
+                        1.0 - 0.35 * corr_stats["mean_abs_corr"],
+                        0.60,
+                        1.0,
+                    )
+                    alloc_value *= diversification_scale
 
                 # Constrain by penny budget
                 if is_penny:
@@ -464,19 +553,25 @@ class BrokerBrain:
                     earnings_note = f" | Earnings in {days_to}d"
 
                 if self.rl_enabled and rl_score_val is not None:
+                    corr_note = ""
+                    if corr_stats is not None:
+                        corr_note = f" | MaxCorr={corr_stats['max_abs_corr']:.2f}"
                     reason = (
                         f"rl_score={rl_score_val:.4f} | composite_score={composite:.4f} | "
                         f"rl_mode=true | Sector={sector} "
                         f"(target={target_alloc:.0%}) | "
-                        f"Sentiment={sent_label}{earnings_note} | "
+                        f"Sentiment={sent_label}{earnings_note}{corr_note} | "
                         f"{'PENNY ' if is_penny else ''}"
                         f"{(report.get('headlines') or [''])[0][:50]}"
                     )
                 else:
+                    corr_note = ""
+                    if corr_stats is not None:
+                        corr_note = f" | MaxCorr={corr_stats['max_abs_corr']:.2f}"
                     reason = (
                         f"Score={composite:.2f} | Sector={sector} "
                         f"(target={target_alloc:.0%}) | "
-                        f"Sentiment={sent_label}{earnings_note} | "
+                        f"Sentiment={sent_label}{earnings_note}{corr_note} | "
                         f"{'PENNY ' if is_penny else ''}"
                         f"{(report.get('headlines') or [''])[0][:50]}"
                     )
@@ -499,12 +594,13 @@ class BrokerBrain:
 
             logger.debug(
                 "Buy funnel: researched=%d slots=%d buys=%d penny_blocked=%d "
-                "sector_blocked=%d risk_blocked=%d tiny_alloc=%d",
+                "sector_blocked=%d corr_blocked=%d risk_blocked=%d tiny_alloc=%d",
                 len(researched),
                 n_slots,
                 buyable_count,
                 penny_budget_skips,
                 sector_budget_skips,
+                correlation_blocked_skips,
                 risk_blocked_skips,
                 tiny_alloc_skips,
             )

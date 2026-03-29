@@ -28,6 +28,8 @@
 - Volatility scaling (scale position sizes down when realized vol is elevated)
 - Pre-trade risk check before every BUY
 - Execution cost model (spread estimate by price tier + market impact)
+- Pairwise correlation cap on new entries, with allocation down-scaling for
+  moderately correlated candidates
 
 ### Options trading
 - Long Call, Bull Call Spread, Long Put, Cash-Secured Put strategies
@@ -52,6 +54,8 @@
 - Startup validation: price data freshness, sentiment freshness, portfolio consistency
 - Portfolio state validation on load: negative cash reset, invalid positions removed
 - Options cash reservation consistency check at startup
+- Sentiment is lagged to the next available trading session before feature
+  generation to preserve point-in-time correctness
 
 ### Automation
 - Single command: `python Broker.py` — everything else is automatic
@@ -94,24 +98,6 @@ but mark-to-market between cycles uses stale IV.
 **Mitigation:** Options are disabled by default (`no_options = true`) and
 only auto-enable after 30 days of shadow proof. The shadow proof uses the
 same daily data, so the bar is consistent.
-
-### 4. Point-in-time correctness in sentiment
-Headlines published after market close are used in the same day's features.
-In live trading, those headlines arrive after the close and should only
-affect the next day's decisions. This is a subtle look-ahead leak in training.
-
-**Mitigation:** Small effect in practice since most headlines are intraday.
-Monitor whether live sentiment signals match backtest expectations.
-
-### 5. No correlation cap between positions
-The broker can hold 10 highly correlated tech stocks. This is not 10
-independent bets — it's concentrated sector exposure with extra steps.
-The sector cap (`max_sector`) partially addresses this but doesn't measure
-pairwise correlation.
-
-**Mitigation:** The sector cap (default 25%) limits single-sector exposure.
-The shadow population evolves `max_sector` automatically. Monitor sector
-concentration in `--status` output.
 
 ---
 

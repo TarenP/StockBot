@@ -307,4 +307,4 @@ def plot_live_performance(save_path: str = "plots/live_performance.png"):
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
-    logger.info(f"  Performance chart updated → {save_path}")
+    logger.info(f"  Performance chart updated -> {save_path}")
