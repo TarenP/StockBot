@@ -470,7 +470,7 @@ class BrokerBrain:
                         f"(target={target_alloc:.0%}) | "
                         f"Sentiment={sent_label}{earnings_note} | "
                         f"{'PENNY ' if is_penny else ''}"
-                        f"{report.get('headlines', [''])[0][:50]}"
+                        f"{(report.get('headlines') or [''])[0][:50]}"
                     )
                 else:
                     reason = (
@@ -478,7 +478,7 @@ class BrokerBrain:
                         f"(target={target_alloc:.0%}) | "
                         f"Sentiment={sent_label}{earnings_note} | "
                         f"{'PENNY ' if is_penny else ''}"
-                        f"{report.get('headlines', [''])[0][:50]}"
+                        f"{(report.get('headlines') or [''])[0][:50]}"
                     )
 
                 decisions.append(Decision(

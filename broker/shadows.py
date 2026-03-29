@@ -671,9 +671,6 @@ def run_historical_warmup(
             top_n=validation_top_n, replay_years=replay_years,
         )
 
-        # Evolve
-        population = evolve_population(population, live_config)
-
         validated = [g for g in population if g.get("validated")]
         if validated:
             best = max(validated, key=lambda g: float(g.get("sharpe", -99)))
@@ -685,6 +682,11 @@ def run_historical_warmup(
                 float(best.get("stop_loss", 0)),
                 float(best.get("take_profit", 0)),
             )
+
+        # Evolve between generations, but keep the final generation's validated
+        # genomes intact so warm-up can promote and persist the actual winners.
+        if gen < generations - 1:
+            population = evolve_population(population, live_config)
 
     # Promote the best genome found across all generations
     promoted = False
