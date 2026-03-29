@@ -840,7 +840,9 @@ def _run_replay_v2(
         rl_enabled=(strategy == "screener_rl"),
         rl_checkpoint_path=checkpoint_path,
         rl_phase=2,
-        rl_min_score=min_score if strategy == "screener_rl" else 0.0,
+        # Replay should mirror live RL defaults: top-k ranking unless the
+        # caller explicitly configures an RL floor elsewhere.
+        rl_min_score=0.0,
     )
     brain._base_min_score = min_score
     brain._sector_map = sector_map.copy()

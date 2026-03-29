@@ -50,7 +50,7 @@ def parse_args():
                                        "predict", "schedule", "train_screener",
                                        "screen", "replay", "ablation"],
                    default="predict", help="What to do (default: predict)")
-    p.add_argument("--top_n",        type=int,   default=1000,      help="Universe size for portfolio agent")
+    p.add_argument("--top_n",        type=int,   default=None,      help="Universe size for portfolio agent (defaults to broker.config)")
     p.add_argument("--top_k",        type=int,   default=10,       help="Stocks to hold / show")
     p.add_argument("--folds",        type=int,   default=3,        help="Walk-forward folds")
     p.add_argument("--total_steps",  type=int,   default=100_000,  help="PPO steps per fold")
@@ -80,6 +80,35 @@ def _best_checkpoint(save_dir: str) -> str | None:
     return ckpts[-1] if ckpts else None
 
 
+def _load_broker_config(path: str = "broker.config") -> dict:
+    cfg = {}
+    config_path = os.path.abspath(path)
+    if not os.path.exists(config_path):
+        return cfg
+
+    with open(config_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            cfg[key.strip()] = value.split("#")[0].strip()
+    return cfg
+
+
+def _resolve_top_n(args) -> int:
+    if args.top_n is not None:
+        return int(args.top_n)
+
+    cfg = _load_broker_config()
+    try:
+        top_n = int(cfg.get("top_n", 500))
+    except (TypeError, ValueError):
+        top_n = 500
+    logger.info("Using top_n=%d from broker.config", top_n)
+    return top_n
+
+
 def _load_data_and_universe(top_n: int):
     from pipeline.data import load_master, get_asset_universe
     df = load_master(top_n=top_n)
@@ -106,7 +135,7 @@ def run_update(args):
         from pipeline.updater import _load_trained_universe
         universe = _load_trained_universe(args.save_dir)
         if universe is None:
-            df, universe = _load_data_and_universe(args.top_n)
+            df, universe = _load_data_and_universe(_resolve_top_n(args))
         logger.info(f"Fetching news sentiment for {len(universe)} tickers...")
         n_sent = update_sentiment(universe, lookback_days=7 if args.force_refresh else 3)
         logger.info(f"Sentiment: {n_sent} new headlines scored.")
@@ -120,7 +149,8 @@ def run_train(args):
     from pipeline.data import walk_forward_split
     from pipeline.train import PPO_CFG, fold_is_complete, train_fold
 
-    df, asset_list = _load_data_and_universe(args.top_n)
+    top_n = _resolve_top_n(args)
+    df, asset_list = _load_data_and_universe(top_n)
     logger.info(f"Universe: {len(asset_list)} tickers")
 
     folds = walk_forward_split(df, train_years=8, val_years=1, test_years=1)
@@ -161,7 +191,7 @@ def run_train(args):
                     save_dir=args.save_dir,
                     device=DEVICE,
                     seed=args.seed,
-                    top_n=args.top_n,
+                    top_n=top_n,
                 )
                 best_ckpts.append((ckpt_path, val_sharpe))
                 folds_pbar.update(1)
@@ -234,7 +264,8 @@ def run_finetune(args):
     from pipeline.train    import train_fold, PPO_CFG
     from pipeline.backtest import load_model
 
-    df, asset_list = _load_data_and_universe(args.top_n)
+    top_n = _resolve_top_n(args)
+    df, asset_list = _load_data_and_universe(top_n)
 
     # Use only the most recent 2 years for fine-tuning
     dates   = sorted(df.index.get_level_values("date").unique())
@@ -293,7 +324,7 @@ def run_backtest_mode(args):
 
     import torch
     meta  = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    top_n = meta.get("top_n", args.top_n)
+    top_n = meta.get("top_n", _resolve_top_n(args))
 
     df, asset_list = _load_data_and_universe(top_n)
     folds = walk_forward_split(df, train_years=8, val_years=1, test_years=1)
@@ -331,8 +362,9 @@ def run_predict(args):
     # Read top_n from checkpoint so universe always matches training
     import torch
     meta   = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    top_n  = meta.get("top_n", args.top_n)
-    if top_n != args.top_n and args.top_n == 500:   # user didn't override
+    configured_top_n = _resolve_top_n(args)
+    top_n  = meta.get("top_n", configured_top_n)
+    if args.top_n is None and top_n != configured_top_n:
         logger.info(f"Using universe size from checkpoint: {top_n} tickers")
 
     df, asset_list = _load_data_and_universe(top_n)

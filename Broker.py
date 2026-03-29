@@ -155,7 +155,7 @@ if __name__ == "__main__":
             from broker.shadows import run_shadow_cycle, get_shadow_summary
 
             logger.info("Loading data for shadow portfolios...")
-            df_features  = load_master(top_n=int(config.get("top_n", 1000)))
+            df_features  = load_master(top_n=int(config.get("top_n", 500)))
             price_lookup = _build_price_lookup()
 
             run_shadow_cycle(

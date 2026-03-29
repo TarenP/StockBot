@@ -262,18 +262,33 @@ class BrokerBrain:
         n_slots = max(0, n_slots)
 
         researched: list[dict] = []
+        shortlist_considered = 0
+        already_held_skips = 0
+        earnings_skips = 0
+        research_none_skips = 0
+        threshold_skips = 0
+        penny_budget_skips = 0
+        sector_budget_skips = 0
+        risk_blocked_skips = 0
+        tiny_alloc_skips = 0
+        buyable_count = 0
         if n_slots > 0 and candidates:
             for ticker in candidates[:min(n_slots * 3, 40)]:
+                shortlist_considered += 1
                 if ticker in self.portfolio.positions:
+                    already_held_skips += 1
                     continue
 
                 # Skip if earnings are imminent
-                if self._near_earnings(ticker):
+                near_earnings = self._near_earnings(ticker)
+                if near_earnings:
+                    earnings_skips += 1
                     logger.debug(f"Skipping {ticker} — near earnings window")
                     continue
 
                 report = research(ticker)
                 if report is None:
+                    research_none_skips += 1
                     continue
 
                 composite = report["composite_score"]
@@ -290,9 +305,11 @@ class BrokerBrain:
                 # Apply min_score threshold
                 if self.rl_enabled:
                     if rl_score_val is None or rl_score_val < self.rl_min_score:
+                        threshold_skips += 1
                         continue
                 else:
                     if composite < self.min_score:
+                        threshold_skips += 1
                         continue
 
                 report["sector"] = self._sector_map.get(ticker.upper(), "Unknown")
@@ -328,6 +345,23 @@ class BrokerBrain:
                     "RL cycle summary: scored=%d  rank_diffs=%d  top5=%s",
                     n_scored, n_rank_diff, " ".join(top5),
                 )
+                if not researched:
+                    logger.info(
+                        "RL cycle produced no buyable candidates after research/filtering "
+                        "(rl_min_score=%.3f).",
+                        self.rl_min_score,
+                    )
+                logger.info(
+                    "RL filter counts: shortlisted=%d considered=%d researched=%d "
+                    "held=%d earnings=%d no_research=%d threshold=%d",
+                    n_scored,
+                    shortlist_considered,
+                    len(researched),
+                    already_held_skips,
+                    earnings_skips,
+                    research_none_skips,
+                    threshold_skips,
+                )
 
             equity      = self.portfolio.equity
             penny_value = sum(
@@ -354,6 +388,7 @@ class BrokerBrain:
                     penny_budget = equity * self.penny_max_pct - penny_value
                     if penny_budget <= 0:
                         logger.debug(f"Penny cap reached, skipping {ticker}")
+                        penny_budget_skips += 1
                         continue
 
                 # ── Sector budget check ───────────────────────────────────────
@@ -369,6 +404,7 @@ class BrokerBrain:
                         f"Sector budget exhausted for {sector} "
                         f"(target={target_alloc:.1%}), skipping {ticker}"
                     )
+                    sector_budget_skips += 1
                     continue
 
                 # ── Position sizing ───────────────────────────────────────────
@@ -398,10 +434,12 @@ class BrokerBrain:
                     allowed, reason = risk_engine.check_pre_trade(alloc_value, self.portfolio)
                     if not allowed:
                         logger.debug(f"Pre-trade check blocked {ticker}: {reason}")
+                        risk_blocked_skips += 1
                         continue
 
                 shares = alloc_value / price if price > 0 else 0
                 if shares < 0.001 or alloc_value < 1.0:
+                    tiny_alloc_skips += 1
                     continue
 
                 # Build reason
@@ -446,6 +484,19 @@ class BrokerBrain:
                 sector_spent[sector] = sector_spent.get(sector, 0.0) + alloc_value
                 if is_penny:
                     penny_value += alloc_value
+                buyable_count += 1
+
+            logger.info(
+                "Buy funnel: researched=%d slots=%d buys=%d penny_blocked=%d "
+                "sector_blocked=%d risk_blocked=%d tiny_alloc=%d",
+                len(researched),
+                n_slots,
+                buyable_count,
+                penny_budget_skips,
+                sector_budget_skips,
+                risk_blocked_skips,
+                tiny_alloc_skips,
+            )
 
         # ── 8. Options decisions (suppressed when RL enabled) ─────────────────
         if not self.rl_enabled:

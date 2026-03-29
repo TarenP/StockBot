@@ -263,14 +263,25 @@ def _evaluate_ranked_groups(
     baseline_returns = []
     lifts = []
 
-    for group_id in np.unique(groups):
-        mask = groups == group_id
-        if mask.sum() < 2:
+    # _build_samples appends examples date-by-date, so groups arrive in
+    # contiguous order already. Avoiding a full argsort here saves a large
+    # temporary int64 index allocation during validation/test on big datasets.
+    groups_view = groups
+    probs_view = probs
+    labels_view = labels
+    returns_view = forward_returns
+
+    boundaries = np.flatnonzero(np.diff(groups_view)) + 1
+    starts = np.concatenate(([0], boundaries))
+    stops = np.concatenate((boundaries, [len(groups_view)]))
+
+    for start, stop in zip(starts, stops):
+        if stop - start < 2:
             continue
 
-        grp_probs = probs[mask]
-        grp_labels = labels[mask]
-        grp_returns = forward_returns[mask]
+        grp_probs = probs_view[start:stop]
+        grp_labels = labels_view[start:stop]
+        grp_returns = returns_view[start:stop]
         k = min(shortlist_size, len(grp_probs))
 
         order = np.argsort(grp_probs)[-k:]

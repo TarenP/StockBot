@@ -58,6 +58,13 @@ def _read_config(path: str = "broker.config") -> dict:
     return cfg
 
 
+def _config_int(cfg: dict, key: str, default: int) -> int:
+    try:
+        return int(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
 def _write_config_key(key: str, value: str, path: str = "broker.config") -> None:
     """Update a single key in broker.config in-place, preserving all comments."""
     with open(path) as f:
@@ -243,8 +250,10 @@ def run_autotuner(
         from pipeline.data import load_master
         from broker.replay import _build_price_lookup
 
+        cfg = _read_config(config_path)
+        top_n = _config_int(cfg, "top_n", 500)
         logger.info("AutoTuner: loading market data...")
-        df_features = load_master(top_n=1000)
+        df_features = load_master(top_n=top_n)
         price_lookup = _build_price_lookup()
 
         # Step 1: tune heuristic parameters
