@@ -302,11 +302,11 @@ def compute_target_allocations(
 
     target = dict(zip(sectors, weights.tolist()))
 
-    logger.info("Sector allocation targets:")
+    logger.debug("Sector allocation targets:")
     for s, w in sorted(target.items(), key=lambda x: x[1], reverse=True):
         current = current_sector_weights.get(s, 0.0)
         arrow   = "^" if w > current + 0.02 else ("v" if w < current - 0.02 else "=")
-        logger.info(f"  {s:<28} {w:.1%}  {arrow}  (current: {current:.1%})")
+        logger.debug(f"  {s:<28} {w:.1%}  {arrow}  (current: {current:.1%})")
 
     return target
 

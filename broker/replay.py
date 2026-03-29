@@ -32,6 +32,32 @@ logger = logging.getLogger(__name__)
 
 # ── Historical research stub ──────────────────────────────────────────────────
 
+def _historical_feature_score(report: dict) -> float:
+    """
+    Score historical replay reports built from z-scored cross-sectional
+    features. The live analyst score expects raw indicator scales and will
+    systematically under-score normalized replay features.
+    """
+    def _bounded(value: float, scale: float = 1.0) -> float:
+        return float(np.tanh(float(value) / max(scale, 1e-6)))
+
+    score = 0.5
+    score += 0.12 * _bounded(report.get("ret_5d", 0.0), 1.0)
+    score += 0.08 * _bounded(report.get("ret_20d", 0.0), 1.0)
+    score += 0.10 * _bounded(report.get("macd_hist", 0.0), 1.0)
+    score += 0.08 * _bounded(report.get("vol_ratio", 0.0), 1.0)
+    score += 0.06 * _bounded(report.get("vol_zscore", 0.0), 1.0)
+    score += 0.06 * _bounded(report.get("price_pos_52w", 0.0), 1.0)
+    score += 0.12 * _bounded(report.get("sent_net", 0.0), 1.0)
+    score += 0.10 * _bounded(report.get("sent_surprise", 0.0), 1.0)
+    score += 0.06 * _bounded(report.get("sent_accel", 0.0), 1.0)
+    score += 0.04 * _bounded(report.get("sent_trend", 0.0), 1.0)
+    score += 0.04 * max(0.0, 1.0 - min(abs(float(report.get("rsi", 0.0))) / 3.0, 1.0))
+    score += 0.04 * max(0.0, 1.0 - min(abs(float(report.get("bb_pct", 0.0))) / 3.0, 1.0))
+    score += 0.04 * max(0.0, 1.0 - min(max(float(report.get("atr", 0.0)), 0.0) / 3.0, 1.0))
+    return float(np.clip(score, 0.0, 1.0))
+
+
 def _make_historical_research(
     df_features: pd.DataFrame,
     price_lookup: pd.DataFrame,
@@ -43,7 +69,6 @@ def _make_historical_research(
     No lookahead: only data up to and including as_of_date is visible.
     """
     from pipeline.features import FEATURE_COLS
-    from broker.analyst import _composite_score
 
     def historical_research(ticker: str, days: int = 90) -> dict | None:
         try:
@@ -76,7 +101,7 @@ def _make_historical_research(
                 "headlines": [],
             }
             report.update(feat_dict)
-            report["composite_score"] = _composite_score(report, sent)
+            report["composite_score"] = _historical_feature_score(report)
             return report
 
         except (KeyError, Exception):

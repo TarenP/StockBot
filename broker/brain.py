@@ -362,6 +362,17 @@ class BrokerBrain:
                     research_none_skips,
                     threshold_skips,
                 )
+            else:
+                logger.debug(
+                    "Heuristic filter counts: considered=%d researched=%d "
+                    "held=%d earnings=%d no_research=%d threshold=%d",
+                    shortlist_considered,
+                    len(researched),
+                    already_held_skips,
+                    earnings_skips,
+                    research_none_skips,
+                    threshold_skips,
+                )
 
             equity      = self.portfolio.equity
             penny_value = sum(
@@ -486,7 +497,7 @@ class BrokerBrain:
                     penny_value += alloc_value
                 buyable_count += 1
 
-            logger.info(
+            logger.debug(
                 "Buy funnel: researched=%d slots=%d buys=%d penny_blocked=%d "
                 "sector_blocked=%d risk_blocked=%d tiny_alloc=%d",
                 len(researched),

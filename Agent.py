@@ -48,7 +48,7 @@ def parse_args():
     )
     p.add_argument("--mode", choices=["train", "finetune", "update", "backtest",
                                        "predict", "schedule", "train_screener",
-                                       "screen", "replay", "ablation"],
+                                       "screen", "replay", "ablation", "warmup"],
                    default="predict", help="What to do (default: predict)")
     p.add_argument("--top_n",        type=int,   default=None,      help="Universe size for portfolio agent (defaults to broker.config)")
     p.add_argument("--top_k",        type=int,   default=10,       help="Stocks to hold / show")
@@ -67,6 +67,12 @@ def parse_args():
     p.add_argument("--max_price",    type=float, default=None,     help="Max price filter for screener")
     p.add_argument("--min_volume",   type=float, default=10_000,   help="Min avg daily volume for screener")
     p.add_argument("--screener_top_n", type=int, default=50,       help="How many picks to show from screener")
+    p.add_argument("--screener_epochs", type=int, default=10,      help="Epochs for screener training")
+    p.add_argument("--skip_screener_train", action="store_true",   help="Skip screener retraining in --mode train")
+    p.add_argument("--shadow_generations", type=int, default=5,    help="Generations for shadow warm-up")
+    p.add_argument("--shadow_replay_years", type=int, default=3,   help="Replay years for shadow warm-up")
+    p.add_argument("--shadow_validation_top_n", type=int, default=20, help="Top genomes to fully validate in shadow warm-up")
+    p.add_argument("--debug_fast", action="store_true",            help="Use fast debug defaults to reach replay validation quickly")
     p.add_argument("--replay_years",  type=int, default=3,         help="Years of history to replay (--mode replay)")
     p.add_argument("--sensitivity",   action="store_true",         help="Run sensitivity sweep during replay")
     p.add_argument("--rl_checkpoint", type=str, default=None,      help="Path to RL checkpoint for ablation/RL modes")
@@ -109,12 +115,65 @@ def _resolve_top_n(args) -> int:
     return top_n
 
 
+def _load_typed_config(path: str = "broker.config") -> dict:
+    cfg = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            value = value.split("#")[0].strip()
+            cfg[key.strip()] = (
+                True if value.lower() == "true" else
+                False if value.lower() == "false" else
+                (int(value) if value.lstrip("-").isdigit() else
+                 (float(value) if value.replace(".", "", 1).lstrip("-").isdigit() else value))
+            )
+    return cfg
+
+
 def _load_data_and_universe(top_n: int):
     from pipeline.data import load_master, get_asset_universe
     df = load_master(top_n=top_n)
     asset_list = get_asset_universe(df, top_n=top_n, lookback_years=5)
     df = df[df.index.get_level_values("ticker").isin(asset_list)]
     return df, asset_list
+
+
+def _effective_debug_settings(args) -> dict:
+    settings = {
+        "folds": args.folds,
+        "total_steps": args.total_steps,
+        "screener_epochs": args.screener_epochs,
+        "skip_screener_train": args.skip_screener_train,
+        "shadow_generations": args.shadow_generations,
+        "shadow_replay_years": args.shadow_replay_years,
+        "shadow_validation_top_n": args.shadow_validation_top_n,
+    }
+    if args.debug_fast:
+        settings.update({
+            "folds": 1,
+            "total_steps": min(args.total_steps, 2_048),
+            "screener_epochs": 1,
+            "skip_screener_train": True,
+            "shadow_generations": 1,
+            "shadow_replay_years": 2,
+            "shadow_validation_top_n": 5,
+        })
+        logger.info(
+            "Debug-fast enabled: folds=%d total_steps=%d screener_epochs=%d "
+            "skip_screener=%s shadow_generations=%d shadow_replay_years=%d "
+            "shadow_validation_top_n=%d",
+            settings["folds"],
+            settings["total_steps"],
+            settings["screener_epochs"],
+            settings["skip_screener_train"],
+            settings["shadow_generations"],
+            settings["shadow_replay_years"],
+            settings["shadow_validation_top_n"],
+        )
+    return settings
 
 
 # ── Mode: update ──────────────────────────────────────────────────────────────
@@ -149,6 +208,7 @@ def run_train(args):
     from pipeline.data import walk_forward_split
     from pipeline.train import PPO_CFG, fold_is_complete, train_fold
 
+    debug_settings = _effective_debug_settings(args)
     top_n = _resolve_top_n(args)
     df, asset_list = _load_data_and_universe(top_n)
     logger.info(f"Universe: {len(asset_list)} tickers")
@@ -156,9 +216,9 @@ def run_train(args):
     folds = walk_forward_split(df, train_years=8, val_years=1, test_years=1)
     logger.info(f"Walk-forward folds available: {len(folds)}")
 
-    cfg = {**PPO_CFG, "total_steps": args.total_steps}
+    cfg = {**PPO_CFG, "total_steps": debug_settings["total_steps"]}
     best_ckpts = []
-    selected_folds = folds[:args.folds]
+    selected_folds = folds[:debug_settings["folds"]]
 
     with tqdm(
         total=len(selected_folds),
@@ -207,17 +267,20 @@ def run_train(args):
         best = max(best_ckpts, key=lambda x: x[1])
         logger.info(f"\nBest checkpoint: {best[0]}  (val Sharpe={best[1]:.3f})")
 
-        logger.info("\nTraining screener on full universe...")
-        logger.info("The screener narrows 11,500+ tickers to a shortlist for the RL agent.")
-        try:
-            from pipeline.data import load_master as _load_all
-            from pipeline.screener import train_screener
+        if debug_settings["skip_screener_train"]:
+            logger.info("\nSkipping screener retraining for this run.")
+        else:
+            logger.info("\nTraining screener on full universe...")
+            logger.info("The screener narrows 11,500+ tickers to a shortlist for the RL agent.")
+            try:
+                from pipeline.data import load_master as _load_all
+                from pipeline.screener import train_screener
 
-            df_all = _load_all(top_n=99_999, include_raw_cols=True)
-            train_screener(df_all, device=DEVICE, epochs=10)
-            logger.info("Screener training complete.")
-        except Exception as exc:
-            logger.warning(f"Screener training failed (continuing): {exc}")
+                df_all = _load_all(top_n=99_999, include_raw_cols=True)
+                train_screener(df_all, device=DEVICE, epochs=debug_settings["screener_epochs"])
+                logger.info("Screener training complete.")
+            except Exception as exc:
+                logger.warning(f"Screener training failed (continuing): {exc}")
 
         logger.info("\nRunning shadow warm-up on historical data...")
         logger.info("This finds the best broker parameters from history so you")
@@ -225,36 +288,23 @@ def run_train(args):
         try:
             from broker.replay import _build_price_lookup
             from broker.shadows import run_historical_warmup
-            from pathlib import Path as _Path
 
-            def _load_cfg(path="broker.config"):
-                cfg = {}
-                for line in _Path(path).read_text().splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, _, v = line.partition("=")
-                    v = v.split("#")[0].strip()
-                    cfg[k.strip()] = (
-                        True if v.lower() == "true" else
-                        False if v.lower() == "false" else
-                        (int(v) if v.lstrip("-").isdigit() else
-                         (float(v) if v.replace(".", "", 1).lstrip("-").isdigit() else v))
-                    )
-                return cfg
-
-            live_config = _load_cfg()
+            live_config = _load_typed_config()
             price_lookup = _build_price_lookup()
 
-            run_historical_warmup(
+            promoted = run_historical_warmup(
                 df_features=df,
                 price_lookup=price_lookup,
                 checkpoint_path=best[0],
                 live_config=live_config,
-                generations=5,
-                replay_years=3,
+                generations=debug_settings["shadow_generations"],
+                replay_years=debug_settings["shadow_replay_years"],
+                validation_top_n=debug_settings["shadow_validation_top_n"],
             )
-            logger.info("Shadow warm-up complete. broker.config updated with best historical parameters.")
+            if promoted:
+                logger.info("Shadow warm-up complete. broker.config updated with best historical parameters.")
+            else:
+                logger.info("Shadow warm-up complete. broker.config left unchanged.")
         except Exception as exc:
             logger.warning(f"Shadow warm-up failed (broker.config unchanged): {exc}")
 
@@ -489,7 +539,7 @@ def run_train_screener(args):
         top_n          = 99_999,   # effectively no cap
         include_raw_cols=True,
     )
-    train_screener(df, device=DEVICE, epochs=10)
+    train_screener(df, device=DEVICE, epochs=args.screener_epochs)
 
 
 def run_screen(args):
@@ -555,6 +605,43 @@ def run_ablation_mode(args):
     print(report.to_string(index=False))
 
 
+def run_warmup_mode(args):
+    from broker.replay import _build_price_lookup
+    from broker.shadows import run_historical_warmup
+    import torch
+
+    debug_settings = _effective_debug_settings(args)
+    ckpt_path = args.checkpoint or _best_checkpoint(args.save_dir)
+    if not ckpt_path:
+        logger.error("No checkpoint found. Run --mode train first or pass --checkpoint.")
+        return
+
+    top_n = _resolve_top_n(args)
+    try:
+        meta = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        top_n = int(meta.get("top_n", top_n))
+    except Exception:
+        pass
+    df, asset_list = _load_data_and_universe(top_n)
+    logger.info("Warm-up mode using universe: %d tickers", len(asset_list))
+
+    live_config = _load_typed_config()
+    price_lookup = _build_price_lookup()
+    promoted = run_historical_warmup(
+        df_features=df,
+        price_lookup=price_lookup,
+        checkpoint_path=ckpt_path,
+        live_config=live_config,
+        generations=debug_settings["shadow_generations"],
+        replay_years=debug_settings["shadow_replay_years"],
+        validation_top_n=debug_settings["shadow_validation_top_n"],
+    )
+    if promoted:
+        logger.info("Warm-up mode complete. broker.config updated.")
+    else:
+        logger.info("Warm-up mode complete. broker.config left unchanged.")
+
+
 # ── Mode: schedule ────────────────────────────────────────────────────────────
 
 def run_schedule(args):
@@ -586,5 +673,6 @@ if __name__ == "__main__":
         "screen":         run_screen,
         "replay":         run_replay_mode,
         "ablation":       run_ablation_mode,
+        "warmup":         run_warmup_mode,
     }
     dispatch[args.mode](args)

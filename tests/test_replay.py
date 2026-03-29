@@ -108,3 +108,45 @@ def test_run_replay_preserves_rl_entry_metadata(monkeypatch):
     assert len(returns) >= 2
     assert any(t["action"] == "BUY" for t in trade_log)
     assert captured["rl_entry_scores"][0] == 0.87
+
+
+def test_historical_feature_score_handles_normalized_features():
+    strong_report = {
+        "ret_5d": 1.6,
+        "ret_20d": 1.2,
+        "macd_hist": 1.1,
+        "vol_ratio": 1.0,
+        "vol_zscore": 0.8,
+        "price_pos_52w": 1.1,
+        "sent_net": 1.4,
+        "sent_surprise": 1.0,
+        "sent_accel": 0.7,
+        "sent_trend": 0.6,
+        "rsi": 0.1,
+        "bb_pct": 0.2,
+        "atr": 0.3,
+    }
+    weak_report = {
+        "ret_5d": -1.3,
+        "ret_20d": -1.0,
+        "macd_hist": -1.1,
+        "vol_ratio": -0.8,
+        "vol_zscore": -0.7,
+        "price_pos_52w": -0.9,
+        "sent_net": -1.2,
+        "sent_surprise": -0.8,
+        "sent_accel": -0.6,
+        "sent_trend": -0.5,
+        "rsi": 2.8,
+        "bb_pct": 2.5,
+        "atr": 2.7,
+    }
+
+    strong_score = replay_module._historical_feature_score(strong_report)
+    weak_score = replay_module._historical_feature_score(weak_report)
+
+    assert 0.0 <= weak_score <= 1.0
+    assert 0.0 <= strong_score <= 1.0
+    assert strong_score > 0.60
+    assert weak_score < 0.50
+    assert strong_score > weak_score

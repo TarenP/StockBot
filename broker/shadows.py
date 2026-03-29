@@ -217,12 +217,17 @@ def _fast_score_genome(genome: dict, snap: pd.DataFrame) -> float:
         std  = float(selected.std()) if len(selected) > 1 else 1.0
         proxy_sharpe = mean / max(std, 0.01)
 
-        # Penalise extreme parameters (overfitting risk)
+        # Penalise overly selective genomes in the fast proxy. On short debug
+        # windows they can look good by selecting almost nothing, then produce
+        # near-zero trades in full replay validation.
         penalty = 0.0
         if float(genome.get("stop_loss", 0.08)) < 0.05:
             penalty += 0.1
-        if float(genome.get("min_score", 0.58)) > 0.75:
-            penalty += 0.1
+        min_score_val = float(genome.get("min_score", 0.58))
+        if min_score_val > 0.65:
+            penalty += min(0.30, (min_score_val - 0.65) * 2.0)
+        if len(selected) < 5:
+            penalty += 0.15
 
         return round(proxy_sharpe - penalty, 4)
 
@@ -273,10 +278,34 @@ def validate_top_genomes(
 
     logger.info("Shadows: validating top %d genomes with full replay...", top_n)
 
+    # Quick sanity check: verify price_lookup has data for the replay window
+    if price_lookup is not None and not price_lookup.empty:
+        pl_dates = price_lookup.index.get_level_values("date")
+        feat_dates = df_features.index.get_level_values("date")
+        overlap = len(set(pl_dates) & set(feat_dates))
+        logger.info(
+            "Shadows: price_lookup has %d dates, df_features has %d dates, overlap=%d",
+            pl_dates.nunique(), feat_dates.nunique(), overlap,
+        )
+        if overlap == 0:
+            logger.warning(
+                "Shadows: NO DATE OVERLAP between price_lookup and df_features — "
+                "all replays will make zero trades. Check date formats."
+            )
+            # Mark all as validated with Sharpe=0 so warm-up can still promote
+            for genome in to_validate:
+                genome["sharpe"]       = 0.0
+                genome["total_return"] = 0.0
+                genome["max_drawdown"] = 0.0
+                genome["validated"]    = True
+            return population
+
     for i, genome in enumerate(to_validate):
-        rl_enabled = genome.get("rl_enabled", False)
-        ckpt = checkpoint_path if (rl_enabled and checkpoint_path and os.path.exists(checkpoint_path)) else None
-        strategy = "screener_rl" if ckpt else "heuristics_only"
+        # During validation, always use heuristics_only strategy.
+        # RL genomes are validated during live shadow cycles, not warm-up,
+        # because replay research() calls need live yfinance data.
+        strategy = "heuristics_only"
+        ckpt     = None
 
         try:
             rets, _ = run_replay(
@@ -465,7 +494,7 @@ def run_shadow_cycle(
     live_config: dict,
     checkpoint_path: str | None = None,
     config_path: str = "broker.config",
-) -> None:
+) -> bool:
     """
     One shadow cycle — called from Broker.py after the live cycle.
 
@@ -590,8 +619,9 @@ def run_historical_warmup(
     live_config: dict,
     generations: int = 5,
     replay_years: int = 3,
+    validation_top_n: int = VALIDATION_TOP_N,
     config_path: str = "broker.config",
-) -> None:
+) -> bool:
     """
     Warm-start the shadow population using historical data immediately after
     training. Runs `generations` full evolutionary cycles on the historical
@@ -631,7 +661,7 @@ def run_historical_warmup(
         # Full replay validation of top 20
         population = validate_top_genomes(
             population, df_hist, price_lookup, checkpoint_path,
-            top_n=VALIDATION_TOP_N, replay_years=replay_years,
+            top_n=validation_top_n, replay_years=replay_years,
         )
 
         # Evolve
@@ -650,6 +680,7 @@ def run_historical_warmup(
             )
 
     # Promote the best genome found across all generations
+    promoted = False
     validated = [g for g in population if g.get("validated") and not g.get("is_baseline")]
     if validated:
         best = max(validated, key=lambda g: float(g.get("sharpe", -99)))
@@ -680,6 +711,7 @@ def run_historical_warmup(
             _write_config_key("rl_enabled", "false", config_path)
 
         logger.info("broker.config updated with warm-up winner.")
+        promoted = True
     else:
         logger.warning("Warm-up: no validated genomes found — broker.config unchanged.")
 
@@ -701,3 +733,4 @@ def run_historical_warmup(
         len([g for g in population if g.get("validated")]),
         _STATE_FILE,
     )
+    return promoted

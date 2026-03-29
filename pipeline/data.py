@@ -138,7 +138,7 @@ def load_master(
     tqdm.write(f"  Features: {df_features.shape[1]}")
     tqdm.write(f"  Rows    : {len(df_features):,}")
     tqdm.write(f"  Dates   : {df_features.index.get_level_values('date').min().date()} "
-               f"→ {df_features.index.get_level_values('date').max().date()}")
+               f"to {df_features.index.get_level_values('date').max().date()}")
 
     return df_features
 
