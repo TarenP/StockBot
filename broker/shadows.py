@@ -307,6 +307,13 @@ def validate_top_genomes(
         strategy = "heuristics_only"
         ckpt     = None
 
+        # Cap min_score at 0.55 for replay validation.
+        # df_features uses z-scored features, so composite_score in run_replay
+        # tops out around 0.62-0.65. Using the genome's own min_score (0.64+)
+        # would filter out almost everything. We're tuning stop_loss/take_profit/
+        # max_sector here — the threshold is held constant across all genomes.
+        effective_min_score = 0.55
+
         try:
             rets, _ = run_replay(
                 df_val,
@@ -314,7 +321,7 @@ def validate_top_genomes(
                 strategy=strategy,
                 checkpoint_path=ckpt,
                 initial_cash=10_000.0,
-                min_score=float(genome.get("min_score", 0.58)),
+                min_score=effective_min_score,
                 stop_loss_floor=float(genome.get("stop_loss", 0.08)),
                 take_profit=float(genome.get("take_profit", 0.35)),
                 max_sector_pct=float(genome.get("max_sector", 0.25)),
