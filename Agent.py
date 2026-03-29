@@ -27,6 +27,7 @@ import os
 import numpy as np
 import pandas as pd
 import torch
+from tqdm import tqdm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -116,8 +117,8 @@ def run_update(args):
 # ── Mode: train ───────────────────────────────────────────────────────────────
 
 def run_train(args):
-    from pipeline.data  import walk_forward_split
-    from pipeline.train import train_fold, PPO_CFG, fold_is_complete
+    from pipeline.data import walk_forward_split
+    from pipeline.train import PPO_CFG, fold_is_complete, train_fold
 
     df, asset_list = _load_data_and_universe(args.top_n)
     logger.info(f"Universe: {len(asset_list)} tickers")
@@ -127,60 +128,75 @@ def run_train(args):
 
     cfg = {**PPO_CFG, "total_steps": args.total_steps}
     best_ckpts = []
+    selected_folds = folds[:args.folds]
 
-    for i, fold in enumerate(folds[:args.folds]):
-        if fold_is_complete(args.save_dir, i):
-            logger.info(f"Fold {i} already complete — skipping.")
-            import glob
-            ckpt = f"{args.save_dir}/best_fold{i}.pt"
-            if os.path.exists(ckpt):
-                import torch
-                meta = torch.load(ckpt, map_location="cpu", weights_only=False)
-                best_ckpts.append((ckpt, meta.get("val_sharpe", 0.0)))
-            continue
+    with tqdm(
+        total=len(selected_folds),
+        desc="Training folds",
+        unit="fold",
+        colour="magenta",
+        dynamic_ncols=True,
+    ) as folds_pbar:
+        for i, fold in enumerate(selected_folds):
+            if fold_is_complete(args.save_dir, i):
+                logger.info(f"Fold {i} already complete - skipping.")
+                ckpt = f"{args.save_dir}/best_fold{i}.pt"
+                if os.path.exists(ckpt):
+                    import torch
 
-        try:
-            ckpt_path, val_sharpe = train_fold(
-                df_train   = fold["train"],
-                df_val     = fold["val"],
-                asset_list = asset_list,
-                fold_idx   = i,
-                cfg        = cfg,
-                save_dir   = args.save_dir,
-                device     = DEVICE,
-                seed       = args.seed,
-                top_n      = args.top_n,
-            )
-            best_ckpts.append((ckpt_path, val_sharpe))
-        except KeyboardInterrupt:
-            logger.info("Training interrupted. Run the same command to resume.")
-            break
+                    meta = torch.load(ckpt, map_location="cpu", weights_only=False)
+                    best_ckpts.append((ckpt, meta.get("val_sharpe", 0.0)))
+                folds_pbar.update(1)
+                folds_pbar.set_postfix(done=f"{i + 1}/{len(selected_folds)}")
+                continue
+
+            try:
+                folds_pbar.set_postfix(current=f"{i + 1}/{len(selected_folds)}")
+                ckpt_path, val_sharpe = train_fold(
+                    df_train=fold["train"],
+                    df_val=fold["val"],
+                    asset_list=asset_list,
+                    fold_idx=i,
+                    cfg=cfg,
+                    save_dir=args.save_dir,
+                    device=DEVICE,
+                    seed=args.seed,
+                    top_n=args.top_n,
+                )
+                best_ckpts.append((ckpt_path, val_sharpe))
+                folds_pbar.update(1)
+                folds_pbar.set_postfix(
+                    done=f"{i + 1}/{len(selected_folds)}",
+                    val_sharpe=f"{val_sharpe:.3f}",
+                )
+            except KeyboardInterrupt:
+                logger.info("Training interrupted. Run the same command to resume.")
+                break
 
     if best_ckpts:
         best = max(best_ckpts, key=lambda x: x[1])
         logger.info(f"\nBest checkpoint: {best[0]}  (val Sharpe={best[1]:.3f})")
 
-        # ── Post-training: train screener then warm-start shadow population ─────
         logger.info("\nTraining screener on full universe...")
         logger.info("The screener narrows 11,500+ tickers to a shortlist for the RL agent.")
         try:
             from pipeline.data import load_master as _load_all
-            df_all = _load_all(top_n=99_999)
             from pipeline.screener import train_screener
+
+            df_all = _load_all(top_n=99_999, include_raw_cols=True)
             train_screener(df_all, device=DEVICE, epochs=10)
             logger.info("Screener training complete.")
         except Exception as exc:
             logger.warning(f"Screener training failed (continuing): {exc}")
-        # ── Post-training: warm-start shadow population on historical data ────
+
         logger.info("\nRunning shadow warm-up on historical data...")
         logger.info("This finds the best broker parameters from history so you")
         logger.info("start with a pre-tuned config on day one. Takes ~10-20 min.")
         try:
             from broker.replay import _build_price_lookup
             from broker.shadows import run_historical_warmup
-
-            # Load broker.config for baseline genome
             from pathlib import Path as _Path
+
             def _load_cfg(path="broker.config"):
                 cfg = {}
                 for line in _Path(path).read_text().splitlines():
@@ -197,23 +213,21 @@ def run_train(args):
                     )
                 return cfg
 
-            live_config  = _load_cfg()
+            live_config = _load_cfg()
             price_lookup = _build_price_lookup()
 
             run_historical_warmup(
-                df_features     = df,
-                price_lookup    = price_lookup,
-                checkpoint_path = best[0],
-                live_config     = live_config,
-                generations     = 5,
-                replay_years    = 3,
+                df_features=df,
+                price_lookup=price_lookup,
+                checkpoint_path=best[0],
+                live_config=live_config,
+                generations=5,
+                replay_years=3,
             )
             logger.info("Shadow warm-up complete. broker.config updated with best historical parameters.")
         except Exception as exc:
             logger.warning(f"Shadow warm-up failed (broker.config unchanged): {exc}")
 
-
-# ── Mode: finetune ────────────────────────────────────────────────────────────
 
 def run_finetune(args):
     from pipeline.data     import walk_forward_split
@@ -441,11 +455,10 @@ def run_train_screener(args):
         min_price      = args.min_price,
         min_avg_volume = args.min_volume,
         top_n          = 99_999,   # effectively no cap
+        include_raw_cols=True,
     )
     train_screener(df, device=DEVICE, epochs=10)
 
-
-# ── Mode: screen ──────────────────────────────────────────────────────────────
 
 def run_screen(args):
     from pipeline.screener import run_screener, print_screener_results
@@ -471,6 +484,7 @@ def run_screen(args):
         min_price      = min_price,
         min_avg_volume = args.min_volume,
         top_n          = 99_999,
+        include_raw_cols=True,
     )
 
     results = run_screener(

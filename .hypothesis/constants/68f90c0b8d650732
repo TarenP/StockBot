@@ -1,0 +1,4 @@
+# file: C:\Users\taren\Documents\Github Repositories\StockBot\pipeline\screener.py
+# hypothesis_version: 6.151.9
+
+[-5.0, 0.0, 1e-09, 0.0001, 0.0003, 0.05, 0.1, 0.15, 0.2, 0.25, 0.5, 0.55, 0.7, 1.0, 5.0, 100, 128, 512, 600, 2048, 10000, '  Samples', '  n/a', ' <- best', ',', '-inf', 'All stocks', 'X_test', 'X_train', 'X_val', '_', 'baseline_return', 'batch', 'blue', 'cache_key', 'close', 'cpu', 'cuda', 'cyan', 'date', 'eval_top_n', 'feature_cols', 'forward_days', 'g_test', 'g_train', 'g_val', 'lift_at_k', 'lookback', 'mean_return_at_k', 'model_state', 'models', 'models/screener.pt', 'momentum_20d', 'momentum_5d', 'n_features', 'precision_at_k', 'r_test', 'r_train', 'r_val', 'recall_at_k', 'ret_20d', 'ret_5d', 'rsi', 'score', 'sent_net', 'sent_surprise', 'sentiment', 'test_auc', 'test_metrics', 'ticker', 'top_pct', 'val_auc', 'val_metrics', 'vol_ratio', 'volume', 'y_test', 'y_train', 'y_val']

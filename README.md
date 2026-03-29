@@ -47,6 +47,36 @@ All features are cross-sectionally z-scored against the full universe each
 day, so a value of +1.5 means that stock is 1.5 standard deviations above
 the average stock on that signal.
 
+### Two-stage ML pipeline
+
+```
+11,500+ tickers
+    ↓  Stage 1: TickerScorer (screener)
+~50-100 shortlist
+    ↓  Stage 2: PortfolioTransformer (RL agent)
+Final ranked candidates → broker execution
+```
+
+**Stage 1 — Screener (`pipeline/screener.py`):**
+A bidirectional GRU with attention pooling trained to identify stocks likely
+to be in the top decile of 20-day forward returns. Trained on 60+ years of
+cross-sectionally normalised features across all 7,000+ tickers. Cuts the
+universe from 11,500 to ~50-100 candidates before the RL agent sees anything.
+
+Key design choices: labels are built from raw forward returns computed from
+raw `close` prices, not from already-normalised features; the model consumes
+the engineered feature window directly without a second normalisation pass;
+sample validity is based on real history coverage rather than `!= 0` checks;
+and checkpoints are selected on shortlist quality (`precision@k`,
+`recall@k`, lift, and mean forward return at `k`) rather than AUC alone.
+That keeps the screener aligned with its real job in the bot: narrowing the
+universe to the best broker shortlist, not just maximizing classifier metrics.
+
+**Stage 2 — RL agent (`pipeline/model.py`):**
+A PortfolioTransformer trained via PPO walk-forward to allocate weights across
+the screener's shortlist. Trained cross-sectionally — it sees all shortlist
+tickers simultaneously and learns relative conviction, not absolute scores.
+
 ---
 
 ## Setup
@@ -97,7 +127,7 @@ no_options     = true     # disabled until stock-side edge is proven in paper tr
 
 # RL integration (opt-in — defaults to heuristic mode)
 rl_enabled            = false              # set true to activate RL ranking
-rl_checkpoint_path    = models/best_fold9.pt
+rl_checkpoint_path    = auto               # auto = use best available checkpoint in models/
 rl_phase              = 1                  # 1=ranking, 2=ranking+exits, 3=weights (future)
 rl_exit_threshold     = 0.30              # Phase 2: sell if rl_score drops below this
 rl_conviction_drop    = 0.20              # Phase 2: sell 50% if score drops by this much
@@ -286,7 +316,9 @@ python Agent.py --mode screen --min_price 1 --max_price 10 --screener_top_n 100
 ```
 
 The screener has no universe size limit — it scores every ticker
-individually including sub-$5 stocks.
+individually including sub-$5 stocks. In live screening and screener training,
+raw `close`/`volume` columns are loaded alongside engineered features so
+price, liquidity, and history-coverage filters are enforced consistently.
 
 ### Train the RL model from scratch
 ```bash
@@ -329,9 +361,11 @@ automatically. Saves a 4-panel chart to `plots/backtest.png`.
 ```bash
 python Agent.py --mode replay
 ```
-Runs the actual broker decision logic over historical data — same screening,
-sector allocation, stops, take-profits, and execution costs as the live
-broker. This is the honest performance number for the broker.
+Runs the broker over historical data using the same decision engine the live
+system uses. Replay now routes through `BrokerBrain.run_cycle()` with
+historical research, historical price fetching, sector allocation, stop/take-
+profit logic, risk-engine checks, and execution-cost-adjusted fills. This is
+the closest estimate of live broker behaviour in the repository.
 
 ```bash
 python Agent.py --mode replay --replay_years 5     # use 5 years of history
@@ -446,7 +480,7 @@ pipeline/
   train.py                    PPO walk-forward training with resume support
   backtest.py                 RL agent backtest vs SPY
   benchmark.py                SPY benchmark metrics (beta, alpha, IR, capture)
-  screener.py                 Per-ticker buy signal scorer (all 11,500+ tickers)
+  screener.py                 Bidirectional GRU screener — cuts 11,500 tickers to ~50-100 candidates
   rl_inference.py             RL inference wrapper (get_rl_targets, WeightAdapter stub)
   autotuner.py                Auto-tunes broker params and RL mode from replay data
   maintenance.py              Staleness checks — runs updates automatically from Broker.py

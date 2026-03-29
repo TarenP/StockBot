@@ -49,6 +49,7 @@ def load_master(
     min_avg_volume: float = 500_000,
     universe: list[str] | None = None,   # pre-filter to these tickers before features
     top_n: int = 500,                    # used to auto-select universe if not provided
+    include_raw_cols: bool = False,
 ) -> pd.DataFrame:
     """
     Load, merge, filter, and feature-engineer the master dataset.
@@ -128,6 +129,9 @@ def load_master(
         # ── 5. Feature engineering (only on universe tickers) ────────────────
         pbar.set_description("Building features")
         df_features = build_features(df_prices)
+        if include_raw_cols:
+            raw_cols = df_prices[["close", "volume"]].copy()
+            df_features = df_features.join(raw_cols, how="left")
         pbar.update(1)
 
     tqdm.write(f"  Tickers : {df_features.index.get_level_values('ticker').nunique()}")

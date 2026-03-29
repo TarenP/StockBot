@@ -1,0 +1,4 @@
+# file: C:\Users\taren\Documents\Github Repositories\StockBot\broker\risk.py
+# hypothesis_version: 6.151.9
+
+[0.0, 1e-09, 0.001, 0.005, 0.02, 0.03, 0.05, 0.1, 0.15, 0.5, 0.7, 0.9, 0.95, 1.0, 1.05, 5.0, 20.0, 252, 1000000, 'coerce', 'date', 'equity', 'halt', 'last_price', 'ok', 'shares', 'time', 'warning']

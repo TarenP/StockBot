@@ -1,0 +1,4 @@
+# file: C:\Users\taren\Documents\Github Repositories\StockBot\broker\portfolio.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.001, 1.0, 10000.0, -500, 'BUY', 'SELL', 'action', 'avg_cost', 'cash', 'equity', 'initial_cash', 'last_price', 'last_saved', 'partial_taken', 'positions', 'price', 'reason', 'shares', 'ticker', 'time', 'trade_log', 'value']
