@@ -8,10 +8,27 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from pipeline.features import build_features
+from broker.sectors import get_cached_sector_map
 
 
 DATA_DIR = Path("MasterDS")
 SENTIMENT_LAG_SESSIONS = 1
+
+
+def _prefer_classified_tickers(tickers: list[str], top_n: int) -> list[str]:
+    """
+    Prefer tickers that map to a known sector in the local cache/static map.
+    This trims ETF/fund-heavy "Unknown" names out of the core stock universe
+    whenever we already have enough classified common-stock candidates.
+    """
+    if not tickers:
+        return []
+
+    sector_map = get_cached_sector_map(tickers)
+    classified = [ticker for ticker in tickers if sector_map.get(ticker, "Unknown") != "Unknown"]
+    unknown = [ticker for ticker in tickers if sector_map.get(ticker, "Unknown") == "Unknown"]
+    ordered = classified + unknown
+    return ordered[:top_n]
 
 
 def _select_universe_from_raw(
@@ -38,8 +55,9 @@ def _select_universe_from_raw(
     stats   = recent.groupby(level="ticker")[["close", "volume"]].mean()
     liquid  = stats[(stats["close"] >= min_price) & (stats["volume"] >= min_avg_volume)].index
 
-    vol_rank = stats.loc[liquid, "volume"].nlargest(top_n)
-    return sorted(vol_rank.index.tolist())
+    vol_rank = stats.loc[liquid, "volume"].sort_values(ascending=False)
+    selected = _prefer_classified_tickers(vol_rank.index.tolist(), top_n)
+    return sorted(selected)
 
 
 def _lag_sentiment_to_next_trading_session(
@@ -247,5 +265,6 @@ def get_asset_universe(
     liquid  = counts[counts >= min_coverage * n_dates].index
 
     # Use row count as volume proxy (features are already normalised)
-    ranked = counts[counts.index.isin(liquid)].nlargest(top_n)
-    return sorted(ranked.index.tolist())
+    ranked = counts[counts.index.isin(liquid)].sort_values(ascending=False)
+    selected = _prefer_classified_tickers(ranked.index.tolist(), top_n)
+    return sorted(selected)

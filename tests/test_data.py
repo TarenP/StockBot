@@ -1,6 +1,7 @@
 import pandas as pd
+from unittest.mock import patch
 
-from pipeline.data import _lag_sentiment_to_next_trading_session
+from pipeline.data import _lag_sentiment_to_next_trading_session, _prefer_classified_tickers
 
 
 def test_lag_sentiment_to_next_trading_session_moves_signal_forward():
@@ -41,3 +42,18 @@ def test_lag_sentiment_to_next_trading_session_moves_signal_forward():
     assert (pd.Timestamp("2024-01-05"), "AAA") not in shifted.index
     assert shifted.loc[(pd.Timestamp("2024-01-08"), "AAA"), "pos_score"] == 0.7
     assert shifted.loc[(pd.Timestamp("2024-01-09"), "AAA"), "pos_score"] == 0.6
+
+
+def test_prefer_classified_tickers_ranks_known_sectors_first():
+    with patch(
+        "pipeline.data.get_cached_sector_map",
+        return_value={
+            "ETF1": "Unknown",
+            "AAA": "Technology",
+            "BBB": "Healthcare",
+            "ETF2": "Unknown",
+        },
+    ):
+        selected = _prefer_classified_tickers(["ETF1", "AAA", "BBB", "ETF2"], top_n=3)
+
+    assert selected == ["AAA", "BBB", "ETF1"]

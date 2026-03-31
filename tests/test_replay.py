@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 
 import broker.replay as replay_module
@@ -150,3 +151,251 @@ def test_historical_feature_score_handles_normalized_features():
     assert strong_score > 0.60
     assert weak_score < 0.50
     assert strong_score > weak_score
+
+
+def test_make_historical_research_preserves_neutral_sentiment():
+    dates = pd.date_range("2024-01-01", periods=5, freq="D")
+    index = pd.MultiIndex.from_product([dates, ["AAA"]], names=["date", "ticker"])
+    df_features = pd.DataFrame(
+        {
+            "sent_net": [0.0] * 5,
+            "sent_pos_raw": [0.45] * 5,
+        },
+        index=index,
+    )
+    price_lookup = pd.DataFrame(
+        {
+            "close": [10.0] * 5,
+            "volume": [1_000_000.0] * 5,
+        },
+        index=index,
+    )
+
+    research = replay_module._make_historical_research(
+        df_features,
+        price_lookup,
+        dates[-1],
+    )
+    report = research("AAA")
+
+    assert report is not None
+    assert report["sentiment"]["sentiment"] == "neutral"
+    assert report["sentiment"]["pos_score"] == 0.45
+    assert report["sentiment"]["neg_score"] == 0.45
+
+
+def test_make_historical_research_requires_same_day_features():
+    feature_dates = pd.date_range("2024-01-01", periods=5, freq="D")
+    as_of_date = pd.Timestamp("2024-01-06")
+    feature_index = pd.MultiIndex.from_product(
+        [feature_dates, ["AAA"]],
+        names=["date", "ticker"],
+    )
+    price_index = pd.MultiIndex.from_product(
+        [feature_dates.append(pd.DatetimeIndex([as_of_date])), ["AAA"]],
+        names=["date", "ticker"],
+    )
+    df_features = pd.DataFrame(
+        {
+            "sent_net": [0.0] * len(feature_index),
+            "sent_pos_raw": [0.45] * len(feature_index),
+        },
+        index=feature_index,
+    )
+    price_lookup = pd.DataFrame(
+        {
+            "close": [10.0] * len(price_index),
+            "volume": [1_000_000.0] * len(price_index),
+        },
+        index=price_index,
+    )
+
+    research = replay_module._make_historical_research(
+        df_features,
+        price_lookup,
+        as_of_date,
+    )
+
+    assert research("AAA") is None
+
+
+def test_make_historical_research_requires_same_day_quote():
+    dates = pd.date_range("2024-01-01", periods=5, freq="D")
+    feature_index = pd.MultiIndex.from_product([dates, ["AAA"]], names=["date", "ticker"])
+    quote_index = pd.MultiIndex.from_product([dates[:-1], ["AAA"]], names=["date", "ticker"])
+    df_features = pd.DataFrame(
+        {
+            "sent_net": [0.0] * len(feature_index),
+            "sent_pos_raw": [0.45] * len(feature_index),
+        },
+        index=feature_index,
+    )
+    price_lookup = pd.DataFrame(
+        {
+            "close": [10.0] * len(quote_index),
+            "volume": [1_000_000.0] * len(quote_index),
+        },
+        index=quote_index,
+    )
+
+    research = replay_module._make_historical_research(
+        df_features,
+        price_lookup,
+        dates[-1],
+    )
+
+    assert research("AAA") is None
+
+
+def test_make_historical_research_rejects_subcent_quotes():
+    dates = pd.date_range("2024-01-01", periods=5, freq="D")
+    index = pd.MultiIndex.from_product([dates, ["AAA"]], names=["date", "ticker"])
+    df_features = pd.DataFrame(
+        {
+            "sent_net": [0.0] * len(index),
+            "sent_pos_raw": [0.45] * len(index),
+        },
+        index=index,
+    )
+    price_lookup = pd.DataFrame(
+        {
+            "close": [10.0, 10.0, 10.0, 10.0, 0.0001],
+            "volume": [1_000_000.0] * len(index),
+        },
+        index=index,
+    )
+
+    research = replay_module._make_historical_research(
+        df_features,
+        price_lookup,
+        dates[-1],
+    )
+
+    assert research("AAA") is None
+
+
+def test_adjust_replay_close_series_back_adjusts_split_like_jumps():
+    close = pd.Series(
+        [1.0, 4.0, 8.0, 8.0],
+        index=pd.date_range("2024-01-01", periods=4, freq="D"),
+        name="close",
+    )
+
+    adjusted = replay_module._adjust_replay_close_series(close, split_ratio_threshold=2.0)
+
+    assert adjusted.tolist() == [8.0, 8.0, 8.0, 8.0]
+
+
+def test_make_historical_research_skips_recent_corporate_actions():
+    dates = pd.date_range("2024-01-01", periods=5, freq="D")
+    index = pd.MultiIndex.from_product([dates, ["AAA"]], names=["date", "ticker"])
+    df_features = pd.DataFrame(
+        {
+            "sent_net": [0.0] * len(index),
+            "sent_pos_raw": [0.45] * len(index),
+        },
+        index=index,
+    )
+    price_lookup = pd.DataFrame(
+        {
+            "close": [8.0, 8.0, 8.0, 8.0, 4.0],
+            "close_raw": [1.0, 1.0, 1.0, 4.0, 4.0],
+            "volume": [1_000_000.0] * len(index),
+        },
+        index=index,
+    )
+
+    research = replay_module._make_historical_research(
+        df_features,
+        price_lookup,
+        dates[-1],
+    )
+
+    assert research("AAA") is None
+
+
+def test_run_full_replay_uses_live_config_parameters(monkeypatch):
+    df_features = _feature_frame()
+    captured = {}
+
+    monkeypatch.setattr(replay_module, "_build_price_lookup", lambda: _price_lookup())
+
+    def fake_run_replay(df_features, price_lookup, **kwargs):
+        captured.update(kwargs)
+        return np.array([0.01, 0.0], dtype=np.float32), []
+
+    monkeypatch.setattr(replay_module, "run_replay", fake_run_replay)
+
+    import pipeline.benchmark as benchmark_module
+
+    monkeypatch.setattr(
+        benchmark_module,
+        "fetch_spy_returns",
+        lambda start, end: pd.Series([0.0, 0.0]),
+    )
+    monkeypatch.setattr(benchmark_module, "print_benchmark_report", lambda *args, **kwargs: None)
+    monkeypatch.setattr(benchmark_module, "plot_benchmark", lambda *args, **kwargs: None)
+
+    replay_module.run_full_replay(
+        df_features=df_features,
+        replay_years=1,
+        live_config={
+            "rl_enabled": True,
+            "min_score": 0.57,
+            "stop_loss": 0.09,
+            "take_profit": 0.41,
+            "partial_profit": 0.24,
+            "penny_pct": 0.03,
+            "max_sector": 0.33,
+            "max_correlation": 0.72,
+            "avoid_earnings": 4,
+            "rl_phase": 2,
+            "rl_exit_threshold": 0.27,
+            "rl_conviction_drop": 0.18,
+            "rl_min_score": 0.05,
+        },
+        checkpoint_path="models/best_fold0.pt",
+    )
+
+    assert captured["strategy"] == "screener_rl"
+    assert captured["checkpoint_path"] == "models/best_fold0.pt"
+    assert captured["partial_profit_pct"] == 0.24
+    assert captured["max_pair_correlation"] == 0.72
+    assert captured["avoid_earnings_days"] == 4
+    assert captured["rl_phase"] == 2
+    assert captured["rl_exit_threshold"] == 0.27
+    assert captured["rl_conviction_drop"] == 0.18
+    assert captured["rl_min_score"] == 0.05
+
+
+def test_run_full_replay_prefers_screener_when_rl_disabled(monkeypatch):
+    df_features = _feature_frame()
+    captured = {}
+
+    monkeypatch.setattr(replay_module, "_build_price_lookup", lambda: _price_lookup())
+
+    def fake_run_replay(df_features, price_lookup, **kwargs):
+        captured.update(kwargs)
+        return np.array([0.01, 0.0], dtype=np.float32), []
+
+    monkeypatch.setattr(replay_module, "run_replay", fake_run_replay)
+
+    import pipeline.benchmark as benchmark_module
+
+    monkeypatch.setattr(
+        benchmark_module,
+        "fetch_spy_returns",
+        lambda start, end: pd.Series([0.0, 0.0]),
+    )
+    monkeypatch.setattr(benchmark_module, "print_benchmark_report", lambda *args, **kwargs: None)
+    monkeypatch.setattr(benchmark_module, "plot_benchmark", lambda *args, **kwargs: None)
+    monkeypatch.setattr("os.path.exists", lambda path: str(path).endswith("screener.pt"))
+
+    replay_module.run_full_replay(
+        df_features=df_features,
+        replay_years=1,
+        live_config={"rl_enabled": False},
+        checkpoint_path=None,
+    )
+
+    assert captured["strategy"] == "screener_heuristics"

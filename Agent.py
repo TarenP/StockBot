@@ -595,13 +595,17 @@ def run_screen(args):
 
 def run_replay_mode(args):
     from broker.replay import run_full_replay
+    from broker.broker import _resolve_checkpoint
     df, asset_list = _load_data_and_universe(_resolve_top_n(args))
+    live_config = _load_typed_config()
     run_full_replay(
         df_features          = df,
         initial_cash         = 10_000.0,
         replay_years         = args.replay_years,
         run_sensitivity_sweep= args.sensitivity,
         save_plot            = "plots/replay.png",
+        live_config          = live_config,
+        checkpoint_path      = _resolve_checkpoint(live_config.get("rl_checkpoint_path")),
     )
 
 

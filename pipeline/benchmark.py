@@ -32,6 +32,25 @@ def _quiet():
         finally: sys.stderr = old
 
 
+def _console_safe(text: str) -> str:
+    """
+    Downgrade a few Unicode presentation characters when the active console
+    encoding cannot represent them.
+    """
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        text.encode(encoding)
+        return text
+    except Exception:
+        return (
+            text.replace("─", "-")
+                .replace("—", "-")
+                .replace("→", "->")
+                .replace("•", "*")
+                .replace("…", "...")
+        )
+
+
 # ── SPY data fetcher ──────────────────────────────────────────────────────────
 
 def fetch_spy_returns(
@@ -204,14 +223,15 @@ def print_benchmark_report(
     if ew_rets is not None:
         all_m.append(compute_metrics(ew_rets[:n], "Equal-Weight"))
 
-    print(f"\n{'='*72}")
-    print(f"  Benchmark Report — {label} vs SPY")
-    print(f"{'='*72}")
+    line = "-" * 68
+    print(_console_safe(f"\n{'='*72}"))
+    print(_console_safe(f"  Benchmark Report — {label} vs SPY"))
+    print(_console_safe(f"{'='*72}"))
     header = f"  {'Metric':<22}"
     for c in cols:
         header += f" {c:>14}"
-    print(header)
-    print(f"  {'─'*68}")
+    print(_console_safe(header))
+    print(f"  {line}")
 
     pct_keys = {"total_return", "ann_return", "volatility", "max_drawdown"}
     for key in ["total_return", "ann_return", "volatility", "sharpe", "sortino",
@@ -220,22 +240,22 @@ def print_benchmark_report(
         for m in all_m:
             val = m.get(key, 0)
             row += f" {val:>13.2%}" if key in pct_keys else f" {val:>14.3f}"
-        print(row)
+        print(_console_safe(row))
 
-    print(f"\n  {'─'*68}")
-    print(f"  SPY-Relative Metrics")
-    print(f"  {'─'*68}")
-    print(f"  {'Beta':<22} {rel['beta']:>14.3f}")
-    print(f"  {'Alpha (ann)':<22} {rel['alpha_ann']:>13.2%}")
-    print(f"  {'Information Ratio':<22} {rel['information_ratio']:>14.3f}")
-    print(f"  {'Tracking Error':<22} {rel['tracking_error']:>13.2%}")
+    print(f"\n  {line}")
+    print(_console_safe("  SPY-Relative Metrics"))
+    print(f"  {line}")
+    print(_console_safe(f"  {'Beta':<22} {rel['beta']:>14.3f}"))
+    print(_console_safe(f"  {'Alpha (ann)':<22} {rel['alpha_ann']:>13.2%}"))
+    print(_console_safe(f"  {'Information Ratio':<22} {rel['information_ratio']:>14.3f}"))
+    print(_console_safe(f"  {'Tracking Error':<22} {rel['tracking_error']:>13.2%}"))
     if rel['upside_capture'] is not None:
-        print(f"  {'Upside Capture':<22} {rel['upside_capture']:>14.3f}")
+        print(_console_safe(f"  {'Upside Capture':<22} {rel['upside_capture']:>14.3f}"))
     if rel['downside_capture'] is not None:
-        print(f"  {'Downside Capture':<22} {rel['downside_capture']:>14.3f}")
-    print(f"  {'Beats SPY (return)':<22} {'YES' if rel['beats_spy_return'] else 'NO':>14}")
-    print(f"  {'Beats SPY (Sharpe)':<22} {'YES' if rel['beats_spy_sharpe'] else 'NO':>14}")
-    print(f"{'='*72}\n")
+        print(_console_safe(f"  {'Downside Capture':<22} {rel['downside_capture']:>14.3f}"))
+    print(_console_safe(f"  {'Beats SPY (return)':<22} {'YES' if rel['beats_spy_return'] else 'NO':>14}"))
+    print(_console_safe(f"  {'Beats SPY (Sharpe)':<22} {'YES' if rel['beats_spy_sharpe'] else 'NO':>14}"))
+    print(_console_safe(f"{'='*72}\n"))
 
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
@@ -277,7 +297,8 @@ def plot_benchmark(
     ax.plot(x, (s_equity - 1) * 100, label="SPY (benchmark)", color="#4CAF50", lw=1.5, ls="--")
     if ew_rets is not None:
         ew = np.asarray(ew_rets[:n])
-        ax.plot(x, (np.cumprod(1 + ew) - 1) * 100,
+        x_ew = list(range(len(ew)))
+        ax.plot(x_ew, (np.cumprod(1 + ew) - 1) * 100,
                 label="Equal-weight baseline", color="#FF9800", lw=1.2, ls=":")
 
     # Annotate final values

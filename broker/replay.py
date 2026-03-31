@@ -28,6 +28,9 @@ import pandas as pd
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+_REPLAY_MIN_PRICE = 0.01
+_REPLAY_SPLIT_RATIO_THRESHOLD = 2.0
+_REPLAY_CORP_ACTION_LOOKBACK = 20
 
 
 # ── Historical research stub ──────────────────────────────────────────────────
@@ -81,22 +84,42 @@ def _make_historical_research(
                 return None
 
             latest = ticker_data.iloc[-1]
+            if pd.Timestamp(latest.name) != pd.Timestamp(as_of_date):
+                return None
+
+            quote = _get_historical_quote(price_lookup, ticker, as_of_date)
+            if quote is None:
+                return None
+            if _has_recent_corporate_action(price_lookup, ticker, as_of_date):
+                return None
+            price, volume = quote
+
             feat_dict = {col: float(latest[col]) if col in latest.index and pd.notna(latest[col]) else 0.0
                          for col in FEATURE_COLS}
 
+            sent_net = float(feat_dict.get("sent_net", 0.0))
+            pos_score = float(np.clip(feat_dict.get("sent_pos_raw", 0.45), 0.0, 1.0))
+            neg_score = float(np.clip(pos_score - sent_net, 0.0, 1.0))
+            if sent_net > 1e-6:
+                sent_label = "positive"
+            elif sent_net < -1e-6:
+                sent_label = "negative"
+            else:
+                sent_label = "neutral"
+
             # Reconstruct a minimal sentiment dict from features
             sent = {
-                "sent_net":  feat_dict.get("sent_net", 0.0),
-                "pos_score": feat_dict.get("sent_pos_raw", 0.45),
-                "neg_score": feat_dict.get("sent_pos_raw", 0.45),
-                "sentiment": "positive" if feat_dict.get("sent_net", 0) > 0 else "negative",
+                "sent_net": sent_net,
+                "pos_score": pos_score,
+                "neg_score": neg_score,
+                "sentiment": sent_label,
                 "headlines": [],
             }
 
             report = {
                 "ticker":    ticker,
-                "price":     _get_historical_price(price_lookup, ticker, as_of_date),
-                "volume":    _get_historical_volume(price_lookup, ticker, as_of_date),
+                "price":     price,
+                "volume":    volume,
                 "sentiment": sent,
                 "headlines": [],
             }
@@ -110,19 +133,96 @@ def _make_historical_research(
     return historical_research
 
 
-def _get_historical_price(price_lookup: pd.DataFrame, ticker: str, as_of_date) -> float:
-    """Get the most recent close price for a ticker as of a given date."""
+def _get_historical_quote(
+    price_lookup: pd.DataFrame,
+    ticker: str,
+    as_of_date,
+) -> tuple[float, float] | None:
+    """Require a real same-day quote so replay does not fabricate entries."""
     try:
-        return float(price_lookup.loc[(as_of_date, ticker), "close"])
+        row = price_lookup.loc[(as_of_date, ticker), ["close", "volume"]]
     except Exception:
-        return 100.0
+        return None
+
+    try:
+        price = float(row["close"])
+        volume = float(row["volume"])
+    except Exception:
+        return None
+
+    if not np.isfinite(price) or price < _REPLAY_MIN_PRICE:
+        return None
+    if not np.isfinite(volume) or volume <= 0:
+        return None
+    return price, volume
 
 
-def _get_historical_volume(price_lookup: pd.DataFrame, ticker: str, as_of_date) -> float:
+def _adjust_replay_close_series(
+    close: pd.Series,
+    split_ratio_threshold: float = _REPLAY_SPLIT_RATIO_THRESHOLD,
+) -> pd.Series:
+    """
+    Back-adjust split-like jumps out of replay prices so portfolio PnL and
+    execution do not inherit obvious corporate-action artifacts from the raw
+    panel. Prior history is scaled into continuity with post-event prices.
+    """
+    arr = close.to_numpy(dtype=np.float64, copy=True)
+    n = len(arr)
+    if n <= 1:
+        return close.astype(float)
+
+    event_factors = np.ones(n, dtype=np.float64)
+    prev = arr[:-1]
+    curr = arr[1:]
+    valid = np.isfinite(prev) & np.isfinite(curr) & (prev > 0) & (curr > 0)
+    ratios = np.ones(n - 1, dtype=np.float64)
+    ratios[valid] = curr[valid] / prev[valid]
+
+    event_mask = valid & (
+        (ratios >= split_ratio_threshold) |
+        (ratios <= (1.0 / split_ratio_threshold))
+    )
+    event_factors[1:] = np.where(event_mask, ratios, 1.0)
+
+    future_factor = np.ones(n, dtype=np.float64)
+    running = 1.0
+    for i in range(n - 1, -1, -1):
+        future_factor[i] = running
+        running *= event_factors[i]
+
+    adjusted = arr * future_factor
+    return pd.Series(adjusted, index=close.index, name=close.name)
+
+
+def _has_recent_corporate_action(
+    price_lookup: pd.DataFrame,
+    ticker: str,
+    as_of_date,
+    lookback_sessions: int = _REPLAY_CORP_ACTION_LOOKBACK,
+    split_ratio_threshold: float = _REPLAY_SPLIT_RATIO_THRESHOLD,
+) -> bool:
+    """
+    Skip research on names that recently had split-scale raw price jumps.
+    These events can leak distorted momentum into replay decisions when the
+    underlying historical panel is not fully adjusted.
+    """
+    raw_col = "close_raw" if "close_raw" in price_lookup.columns else "close"
     try:
-        return float(price_lookup.loc[(as_of_date, ticker), "volume"])
+        hist = price_lookup.xs(ticker, level="ticker")[raw_col]
     except Exception:
-        return 1_000_000.0
+        return False
+
+    hist = hist[hist.index <= as_of_date].tail(lookback_sessions + 1)
+    if len(hist) < 2:
+        return False
+
+    prev = hist.shift(1)
+    ratios = hist / prev
+    event_mask = (
+        (ratios >= split_ratio_threshold) |
+        (ratios <= (1.0 / split_ratio_threshold))
+    )
+    return bool(event_mask.fillna(False).any())
 
 
 def _apply_execution_cost(price: float, shares: float, execution_spread: float) -> tuple[float, float]:
@@ -179,13 +279,22 @@ def _make_historical_price_fetcher(price_lookup: pd.DataFrame, as_of_date):
 
 
 def _build_price_lookup(parquet_path: str = "MasterDS/stooq_panel.parquet") -> pd.DataFrame:
-    """Load raw close prices indexed by [date, ticker] for the replay."""
+    """Load replay prices and smooth obvious split-scale jumps in close data."""
     df = pd.read_parquet(parquet_path)
     df = df.reset_index()
     df["date"]   = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.tz_convert(None).dt.normalize()
     df["ticker"] = df["ticker"].str.upper()
     df = df.set_index(["date", "ticker"])[["close", "volume"]].sort_index()
-    return df
+    df["close_raw"] = df["close"]
+
+    adjusted_parts: list[pd.DataFrame] = []
+    for ticker, grp in df.groupby(level="ticker", sort=False):
+        grp = grp.copy()
+        close_raw = grp["close_raw"].droplevel("ticker")
+        grp["close"] = _adjust_replay_close_series(close_raw).to_numpy(dtype=np.float64)
+        adjusted_parts.append(grp)
+
+    return pd.concat(adjusted_parts).sort_index()
 
 
 # ── Replay portfolio (in-memory, no disk I/O) ─────────────────────────────────
@@ -331,8 +440,10 @@ def run_replay(
     original_research = brain_module.research if hasattr(brain_module, "research") else None
 
     # Build a simple sector map from the static map in sectors.py
-    from broker.sectors import _STATIC_SECTOR_MAP
-    sector_map = dict(_STATIC_SECTOR_MAP)
+    from broker.sectors import get_cached_sector_map
+    sector_map = get_cached_sector_map(
+        df_features.index.get_level_values("ticker").unique().tolist()
+    )
 
     pbar = tqdm(range(len(dates)), desc=f"Replay: {label}", unit="day",
                 colour="blue", dynamic_ncols=True)
@@ -622,11 +733,17 @@ def _run_replay_v2(
     min_score: float = 0.60,
     stop_loss_floor: float = 0.07,
     take_profit: float = 0.45,
+    partial_profit_pct: float = 0.20,
     penny_pct: float = 0.20,
     max_sector_pct: float = 0.40,
     max_pair_correlation: float = 0.80,
     correlation_lookback_days: int = 60,
+    avoid_earnings_days: int = 3,
     execution_spread: float = 0.001,
+    rl_phase: int = 1,
+    rl_exit_threshold: float = 0.30,
+    rl_conviction_drop: float = 0.20,
+    rl_min_score: float = 0.0,
     label: str | None = None,
 ) -> tuple[np.ndarray, list]:
     if label is None:
@@ -636,8 +753,8 @@ def _run_replay_v2(
     from broker.brain import BrokerBrain
     from broker.risk import PortfolioRiskEngine
     from broker.sectors import (
-        _STATIC_SECTOR_MAP,
         compute_target_allocations,
+        get_cached_sector_map,
         get_portfolio_sector_weights,
         score_sectors,
     )
@@ -648,7 +765,9 @@ def _run_replay_v2(
     dates = sorted(df_features.index.get_level_values("date").unique())
     portfolio = ReplayPortfolio(initial_cash)
     risk = PortfolioRiskEngine(max_daily_loss=0.05, max_drawdown=0.20)
-    sector_map = dict(_STATIC_SECTOR_MAP)
+    sector_map = get_cached_sector_map(
+        df_features.index.get_level_values("ticker").unique().tolist()
+    )
 
     equity_curve = [initial_cash]
     trade_log = []
@@ -861,19 +980,21 @@ def _run_replay_v2(
         portfolio=portfolio,
         max_positions=max_positions,
         stop_loss_pct_floor=stop_loss_floor,
+        partial_profit_pct=partial_profit_pct,
         full_profit_pct=take_profit,
         min_score=min_score,
         penny_max_pct=penny_pct,
         max_sector_pct=max_sector_pct,
         max_pair_correlation=max_pair_correlation,
         correlation_lookback_days=correlation_lookback_days,
+        avoid_earnings_days=avoid_earnings_days,
         device=None,
         rl_enabled=(strategy == "screener_rl"),
         rl_checkpoint_path=checkpoint_path,
-        rl_phase=2,
-        # Replay should mirror live RL defaults: top-k ranking unless the
-        # caller explicitly configures an RL floor elsewhere.
-        rl_min_score=0.0,
+        rl_phase=rl_phase,
+        rl_exit_threshold=rl_exit_threshold,
+        rl_conviction_drop=rl_conviction_drop,
+        rl_min_score=rl_min_score,
     )
     brain._base_min_score = min_score
     brain._sector_map = sector_map.copy()
@@ -1012,6 +1133,8 @@ def run_full_replay(
     replay_years: int = 3,
     run_sensitivity_sweep: bool = False,
     save_plot: str = "plots/replay.png",
+    live_config: dict | None = None,
+    checkpoint_path: str | None = None,
 ):
     """
     Run the full broker replay and print a side-by-side report vs SPY.
@@ -1020,6 +1143,8 @@ def run_full_replay(
         fetch_spy_returns, compute_metrics, benchmark_vs_spy,
         print_benchmark_report, plot_benchmark,
     )
+    import os
+    from pipeline.screener import SCREENER_CKPT
 
     # Restrict to replay window
     dates  = sorted(df_features.index.get_level_values("date").unique())
@@ -1036,10 +1161,35 @@ def run_full_replay(
     logger.info("Loading raw prices for replay...")
     price_lookup = _build_price_lookup()
 
+    live_config = live_config or {}
+    if live_config.get("rl_enabled", False):
+        strategy = "screener_rl"
+    elif os.path.exists(SCREENER_CKPT):
+        strategy = "screener_heuristics"
+    else:
+        strategy = "heuristics_only"
+
     # Run broker replay
     logger.info("Running broker replay...")
     broker_rets, trade_log = run_replay(
-        df_replay, price_lookup, initial_cash=initial_cash, label="Broker"
+        df_replay,
+        price_lookup,
+        strategy=strategy,
+        checkpoint_path=checkpoint_path,
+        initial_cash=initial_cash,
+        min_score=float(live_config.get("min_score", 0.60)),
+        stop_loss_floor=float(live_config.get("stop_loss", 0.07)),
+        take_profit=float(live_config.get("take_profit", 0.45)),
+        partial_profit_pct=float(live_config.get("partial_profit", 0.20)),
+        penny_pct=float(live_config.get("penny_pct", 0.20)),
+        max_sector_pct=float(live_config.get("max_sector", 0.40)),
+        max_pair_correlation=float(live_config.get("max_correlation", 0.80)),
+        avoid_earnings_days=int(live_config.get("avoid_earnings", 3)),
+        rl_phase=int(live_config.get("rl_phase", 1)),
+        rl_exit_threshold=float(live_config.get("rl_exit_threshold", 0.30)),
+        rl_conviction_drop=float(live_config.get("rl_conviction_drop", 0.20)),
+        rl_min_score=float(live_config.get("rl_min_score", 0.0)),
+        label="Broker",
     )
 
     # Fetch SPY for same period

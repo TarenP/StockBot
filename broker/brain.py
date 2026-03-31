@@ -825,11 +825,16 @@ class BrokerBrain:
         import os
         from pipeline.screener import SCREENER_CKPT
 
-        if os.path.exists(SCREENER_CKPT) and self.device is not None:
+        if os.path.exists(SCREENER_CKPT):
             try:
                 from pipeline.screener import run_screener
-                results = run_screener(df_features, device=self.device, top_n=top_n)
-                return results["ticker"].tolist()
+                screener_device = self.device or torch.device("cpu")
+                results = run_screener(
+                    df_features,
+                    device=screener_device,
+                    top_n=top_n,
+                )
+                return self._filter_screened_tickers(results["ticker"].tolist(), top_n)
             except Exception as e:
                 logger.warning(f"Screener failed, using rule-based fallback: {e}")
 
@@ -843,9 +848,41 @@ class BrokerBrain:
                 snap.get("sent_net",  0) * 0.3 +
                 snap.get("macd_hist", 0) * 0.2
             )
-            return snap.nlargest(top_n, "_rank").index.tolist()
+            return self._filter_screened_tickers(
+                snap.nlargest(top_n, "_rank").index.tolist(),
+                top_n,
+            )
         except Exception:
             return []
+
+    def _filter_screened_tickers(self, tickers: list[str], top_n: int) -> list[str]:
+        """
+        Prefer classified operating-company names over the local Unknown bucket.
+        In practice this strips many ETF/fund/odd-instrument symbols from the
+        shortlist while keeping ordering stable.
+        """
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for ticker in tickers:
+            t = str(ticker).upper()
+            if t in seen or t == "CASH":
+                continue
+            seen.add(t)
+            deduped.append(t)
+
+        classified = [
+            ticker for ticker in deduped
+            if self._sector_map.get(ticker, "Unknown") != "Unknown"
+        ]
+        if classified:
+            dropped = len(deduped) - len(classified)
+            if dropped > 0:
+                logger.debug(
+                    "Shortlist filter dropped %d Unknown-sector ticker(s) before research.",
+                    dropped,
+                )
+            return classified[:top_n]
+        return deduped[:top_n]
 
     def _get_current_prices(self, tickers: list[str]) -> dict[str, float]:
         prices = {}

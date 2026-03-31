@@ -100,3 +100,35 @@ def test_run_cycle_blocks_highly_correlated_new_position():
 
     assert not any(d.action == "BUY" and d.ticker == "BBB" for d in blocked)
     assert any(d.action == "BUY" and d.ticker == "BBB" for d in allowed)
+
+
+def test_screen_candidates_prefers_known_sectors():
+    portfolio = _DummyPortfolio()
+    brain = BrokerBrain(portfolio=portfolio, max_positions=2, min_score=0.60)
+    brain._sector_map = {"AAA": "Technology", "ETF1": "Unknown", "BBB": "Healthcare"}
+
+    filtered = brain._filter_screened_tickers(["ETF1", "AAA", "BBB"], top_n=3)
+
+    assert filtered == ["AAA", "BBB"]
+
+
+def test_screen_candidates_uses_cpu_screener_when_device_missing(monkeypatch):
+    portfolio = _DummyPortfolio()
+    brain = BrokerBrain(portfolio=portfolio, max_positions=2, min_score=0.60, device=None)
+    brain._sector_map = {"AAA": "Technology"}
+
+    captured = {}
+
+    def fake_run_screener(df_features, device, top_n=100, **_kwargs):
+        captured["device"] = device
+        captured["top_n"] = top_n
+        return pd.DataFrame({"ticker": ["AAA"]})
+
+    monkeypatch.setattr("os.path.exists", lambda path: True)
+    monkeypatch.setattr("pipeline.screener.run_screener", fake_run_screener)
+
+    filtered = brain._screen_candidates(_make_df_features(), top_n=7)
+
+    assert filtered == ["AAA"]
+    assert captured["top_n"] == 7
+    assert captured["device"].type == "cpu"

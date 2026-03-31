@@ -331,6 +331,7 @@ def main(config: dict = None):
         portfolio           = portfolio,
         max_positions       = args.max_positions,
         stop_loss_pct_floor = args.stop_loss,
+        partial_profit_pct  = args.partial_profit,
         full_profit_pct     = args.take_profit,
         min_score           = args.min_score,
         penny_max_pct       = args.penny_pct,

@@ -75,6 +75,33 @@ ALL_SECTORS = [
     "Utilities", "Real Estate", "Materials", "Unknown",
 ]
 
+_SECTOR_ALIASES = {
+    "technology": "Technology",
+    "healthcare": "Healthcare",
+    "financial services": "Financials",
+    "financial": "Financials",
+    "financials": "Financials",
+    "consumer cyclical": "Consumer Discretionary",
+    "consumer discretionary": "Consumer Discretionary",
+    "consumer defensive": "Consumer Staples",
+    "consumer staples": "Consumer Staples",
+    "energy": "Energy",
+    "industrials": "Industrials",
+    "communication services": "Communication Services",
+    "real estate": "Real Estate",
+    "utilities": "Utilities",
+    "basic materials": "Materials",
+    "materials": "Materials",
+    "unknown": "Unknown",
+}
+
+
+def normalize_sector_name(sector: str | None) -> str:
+    """Map provider-specific sector labels into the broker's internal buckets."""
+    if not sector:
+        return "Unknown"
+    return _SECTOR_ALIASES.get(str(sector).strip().lower(), "Unknown")
+
 
 def get_sector(ticker: str) -> str:
     """Return GICS sector for a ticker. Tries cache, static map, then yfinance."""
@@ -93,7 +120,7 @@ def get_sector(ticker: str) -> str:
     try:
         import yfinance as yf
         info   = yf.Ticker(ticker).info
-        sector = info.get("sector", "Unknown") or "Unknown"
+        sector = normalize_sector_name(info.get("sector", "Unknown") or "Unknown")
         cache[ticker] = sector
         _save_sector_cache(cache)
         return sector
@@ -139,7 +166,7 @@ def get_sectors_bulk(tickers: list[str]) -> dict[str, str]:
                 sector = "Unknown"
                 try:
                     full   = yf.Ticker(ticker).info
-                    sector = full.get("sector", "Unknown") or "Unknown"
+                    sector = normalize_sector_name(full.get("sector", "Unknown") or "Unknown")
                 except Exception:
                     pass
                 result[ticker] = sector
@@ -162,7 +189,11 @@ def _load_sector_cache() -> dict:
     if SECTOR_CACHE_PATH.exists():
         import json
         try:
-            return json.loads(SECTOR_CACHE_PATH.read_text())
+            raw = json.loads(SECTOR_CACHE_PATH.read_text())
+            return {
+                str(ticker).upper(): normalize_sector_name(sector)
+                for ticker, sector in raw.items()
+            }
         except Exception:
             pass
     return {}
@@ -171,7 +202,23 @@ def _load_sector_cache() -> dict:
 def _save_sector_cache(cache: dict):
     import json
     SECTOR_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SECTOR_CACHE_PATH.write_text(json.dumps(cache, indent=2))
+    normalized = {
+        str(ticker).upper(): normalize_sector_name(sector)
+        for ticker, sector in cache.items()
+    }
+    SECTOR_CACHE_PATH.write_text(json.dumps(normalized, indent=2))
+
+
+def get_cached_sector_map(tickers: list[str] | None = None) -> dict[str, str]:
+    """
+    Return the merged static + disk-cached sector map without any network calls.
+    This keeps replay aligned with the broker's learned sector knowledge.
+    """
+    merged = dict(_STATIC_SECTOR_MAP)
+    merged.update(_load_sector_cache())
+    if tickers is None:
+        return merged
+    return {ticker.upper(): merged.get(ticker.upper(), "Unknown") for ticker in tickers}
 
 
 # ── Sector scoring ────────────────────────────────────────────────────────────
@@ -285,9 +332,9 @@ def compute_target_allocations(
     exp_raw = np.exp(raw / temp)
     weights = exp_raw / exp_raw.sum()
 
-    # Apply hard cap
+    # Apply hard cap and keep the portfolio under-invested if needed rather than
+    # renormalising capped sectors back above the supposed "hard" limit.
     weights = np.minimum(weights, max_single_sector)
-    weights = weights / weights.sum()   # renormalise after capping
 
     # Ensure minimum sector count
     if len(sectors) < min_sectors:
@@ -298,7 +345,10 @@ def compute_target_allocations(
         for s in extras:
             sectors.append(s)
             weights = np.append(weights, 0.05)
-        weights = weights / weights.sum()
+
+    total_weight = float(weights.sum())
+    if total_weight > 1.0:
+        weights = weights / total_weight
 
     target = dict(zip(sectors, weights.tolist()))
 
