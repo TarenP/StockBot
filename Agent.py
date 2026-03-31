@@ -595,7 +595,7 @@ def run_screen(args):
 
 def run_replay_mode(args):
     from broker.replay import run_full_replay
-    df, asset_list = _load_data_and_universe(args.top_n)
+    df, asset_list = _load_data_and_universe(_resolve_top_n(args))
     run_full_replay(
         df_features          = df,
         initial_cash         = 10_000.0,
@@ -607,7 +607,7 @@ def run_replay_mode(args):
 
 def run_ablation_mode(args):
     from broker.replay import run_ablation, _build_price_lookup
-    df_features, _ = _load_data_and_universe(args.top_n)
+    df_features, _ = _load_data_and_universe(_resolve_top_n(args))
     price_lookup = _build_price_lookup()
     report = run_ablation(
         df_features    = df_features,

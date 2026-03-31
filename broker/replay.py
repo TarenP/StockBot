@@ -1075,6 +1075,7 @@ def run_full_replay(
     buys     = sum(1 for t in trade_log if t["action"] == "BUY")
     sells    = n_trades - buys
     logger.info(f"Trades: {n_trades} total ({buys} buys, {sells} sells)")
+    _print_trade_log_report(trade_log)
 
     # Sensitivity sweep
     if run_sensitivity_sweep:
@@ -1168,6 +1169,29 @@ def _equal_weight_returns(
                 pass
         rets.append(float(np.mean(day_rets)) if day_rets else 0.0)
     return np.array(rets)
+
+
+def _print_trade_log_report(trade_log: list[dict]) -> None:
+    print(f"\n{'='*72}")
+    print("  Replay Trades")
+    print(f"{'='*72}")
+    if not trade_log:
+        print("  No trades were executed.")
+        print(f"{'='*72}\n")
+        return
+
+    df_trades = pd.DataFrame(trade_log).copy()
+    preferred_cols = ["date", "action", "ticker", "price", "score", "reason"]
+    df_trades = df_trades[[c for c in preferred_cols if c in df_trades.columns]]
+
+    formatters = {}
+    if "price" in df_trades.columns:
+        formatters["price"] = lambda x: f"${float(x):.2f}" if pd.notna(x) else ""
+    if "score" in df_trades.columns:
+        formatters["score"] = lambda x: f"{float(x):.3f}" if pd.notna(x) else ""
+
+    print(df_trades.to_string(index=False, formatters=formatters, justify="left"))
+    print(f"{'='*72}\n")
 
 
 # ── Ablation report ───────────────────────────────────────────────────────────
