@@ -143,6 +143,7 @@ class PortfolioTransformer(nn.Module):
 
     @torch.no_grad()
     def get_weights(self, obs: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-        """Inference: returns softmax portfolio weights (B, n_assets+1)."""
+        """Inference: returns the mean portfolio weights of the Dirichlet policy."""
         logits, _ = self.forward(obs)
-        return F.softmax(logits / temperature, dim=-1)
+        concentration = F.softplus(logits / temperature) + 1e-6
+        return concentration / concentration.sum(dim=-1, keepdim=True)

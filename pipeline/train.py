@@ -18,6 +18,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 from pipeline.environment import PortfolioEnv
+from pipeline.features import FEATURE_COLS
 from pipeline.model import PortfolioTransformer
 
 
@@ -189,7 +190,15 @@ def train_fold(
 
     os.makedirs(save_dir, exist_ok=True)
 
-    n_features = df_train.shape[1]
+    feature_cols = [col for col in FEATURE_COLS if col in df_train.columns]
+    if not feature_cols:
+        feature_cols = [
+            col for col in df_train.columns
+            if col not in {"close", "close_raw", "volume"}
+        ]
+    if not feature_cols:
+        raise ValueError("No feature columns available for PPO training.")
+    n_features = len(feature_cols)
     lookback   = 20
 
     if model_cfg is None:
@@ -239,8 +248,18 @@ def train_fold(
     elif force_restart:
         tqdm.write(f"  Force restart enabled for fold {fold_idx} - ignoring old resume state.")
 
-    train_env = PortfolioEnv(df_train, asset_list, lookback=lookback)
-    val_env   = PortfolioEnv(df_val,   asset_list, lookback=lookback)
+    train_env = PortfolioEnv(
+        df_train,
+        asset_list,
+        lookback=lookback,
+        feature_cols=feature_cols,
+    )
+    val_env = PortfolioEnv(
+        df_val,
+        asset_list,
+        lookback=lookback,
+        feature_cols=feature_cols,
+    )
 
     tqdm.write(f"\n{'='*60}")
     tqdm.write(f"Fold {fold_idx} | device={device} | "

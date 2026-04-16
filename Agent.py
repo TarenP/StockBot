@@ -23,11 +23,20 @@ import argparse
 import glob
 import logging
 import os
+import sys
 
 import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
+
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if callable(_reconfigure):
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -134,12 +143,40 @@ def _load_typed_config(path: str = "broker.config") -> dict:
     return cfg
 
 
-def _load_data_and_universe(top_n: int):
+def _load_data_and_universe(top_n: int, include_raw_cols: bool = False):
     from pipeline.data import load_master, get_asset_universe
-    df = load_master(top_n=top_n)
+    df = load_master(top_n=top_n, include_raw_cols=include_raw_cols)
     asset_list = get_asset_universe(df, top_n=top_n, lookback_years=5)
     df = df[df.index.get_level_values("ticker").isin(asset_list)]
     return df, asset_list
+
+
+def _bootstrap_universe_size(top_n: int) -> int:
+    return max(int(top_n) * 3, 1_000)
+
+
+def _ensure_price_data(top_n: int, save_dir: str = "models") -> None:
+    from pipeline.updater import PARQUET_PATH, update_parquet
+
+    if PARQUET_PATH.exists():
+        return
+
+    bootstrap_size = _bootstrap_universe_size(top_n)
+    logger.info(
+        "No local price parquet found. Bootstrapping fresh market data "
+        "for ~%d candidate tickers...",
+        bootstrap_size,
+    )
+    update_parquet(
+        save_dir=save_dir,
+        force_full_refresh=True,
+        bootstrap_universe_size=bootstrap_size,
+    )
+    if not PARQUET_PATH.exists():
+        raise RuntimeError(
+            "Price-data bootstrap did not create MasterDS/stooq_panel.parquet. "
+            "Check network access and retry."
+        )
 
 
 def _effective_debug_settings(args) -> dict:
@@ -184,7 +221,11 @@ def run_update(args):
     from pipeline.sentiment import update_sentiment
 
     logger.info("Fetching latest market data...")
-    n_price = update_parquet(save_dir=args.save_dir, force_full_refresh=args.force_refresh)
+    n_price = update_parquet(
+        save_dir=args.save_dir,
+        force_full_refresh=args.force_refresh,
+        bootstrap_universe_size=_bootstrap_universe_size(_resolve_top_n(args)),
+    )
     if n_price:
         logger.info(f"Price data: {n_price} new rows added.")
     else:
@@ -211,7 +252,8 @@ def run_train(args):
 
     debug_settings = _effective_debug_settings(args)
     top_n = _resolve_top_n(args)
-    df, asset_list = _load_data_and_universe(top_n)
+    _ensure_price_data(top_n, save_dir=args.save_dir)
+    df, asset_list = _load_data_and_universe(top_n, include_raw_cols=True)
     logger.info(f"Universe: {len(asset_list)} tickers")
 
     folds = walk_forward_split(df, train_years=8, val_years=1, test_years=1)
@@ -322,7 +364,7 @@ def run_finetune(args):
     from pipeline.backtest import load_model
 
     top_n = _resolve_top_n(args)
-    df, asset_list = _load_data_and_universe(top_n)
+    df, asset_list = _load_data_and_universe(top_n, include_raw_cols=True)
 
     # Use only the most recent 2 years for fine-tuning
     dates   = sorted(df.index.get_level_values("date").unique())
@@ -383,7 +425,7 @@ def run_backtest_mode(args):
     meta  = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     top_n = meta.get("top_n", _resolve_top_n(args))
 
-    df, asset_list = _load_data_and_universe(top_n)
+    df, asset_list = _load_data_and_universe(top_n, include_raw_cols=True)
     folds = walk_forward_split(df, train_years=8, val_years=1, test_years=1)
     if not folds:
         logger.error("Not enough data for a full fold.")
@@ -600,7 +642,7 @@ def run_replay_mode(args):
     live_config = _load_typed_config()
     run_full_replay(
         df_features          = df,
-        initial_cash         = 10_000.0,
+        initial_cash         = float(live_config.get("cash", 10_000.0)),
         replay_years         = args.replay_years,
         run_sensitivity_sweep= args.sensitivity,
         save_plot            = "plots/replay.png",
@@ -638,7 +680,7 @@ def run_warmup_mode(args):
         top_n = int(meta.get("top_n", top_n))
     except Exception:
         pass
-    df, asset_list = _load_data_and_universe(top_n)
+    df, asset_list = _load_data_and_universe(top_n, include_raw_cols=True)
     logger.info("Warm-up mode using universe: %d tickers", len(asset_list))
 
     live_config = _load_typed_config()

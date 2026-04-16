@@ -37,7 +37,7 @@ Path("logs").mkdir(exist_ok=True)
 Path("plots").mkdir(exist_ok=True)
 Path("broker/state").mkdir(parents=True, exist_ok=True)
 
-from broker.portfolio import Portfolio
+from broker.portfolio import CASH_YIELD_ANNUAL_RATE, Portfolio
 from broker.brain     import BrokerBrain
 from broker.risk      import PortfolioRiskEngine, validate_startup
 from broker.journal   import (
@@ -62,6 +62,10 @@ ET     = ZoneInfo("America/New_York")
 
 MARKET_OPEN  = (9, 30)
 MARKET_CLOSE = (16, 0)
+
+
+def _today_et():
+    return datetime.now(ET).date()
 
 
 # ── Checkpoint resolver ───────────────────────────────────────────────────────
@@ -101,34 +105,51 @@ def run_cycle(
     risk: PortfolioRiskEngine,
     top_n: int = 500,
     enforce_market_hours: bool = True,
+    maintenance_context: dict | None = None,
 ):
     now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
     logger.info(f"{'='*55}")
     logger.info(f"Broker cycle | {now_et} | Equity: ${portfolio.equity:,.2f}")
     logger.info(f"{'='*55}")
+    today_iso = _today_et().isoformat()
+    prices_fresh_from_maintenance = (
+        maintenance_context is not None
+        and maintenance_context.get("prices_updated") == today_iso
+    )
+    sentiment_fresh_from_maintenance = (
+        maintenance_context is not None
+        and maintenance_context.get("sentiment_updated") == today_iso
+    )
 
     # ── Auto-update prices + sentiment ────────────────────────────────────────
     logger.info("Fetching latest market data and news...")
     try:
         from pipeline.updater import update_parquet, _load_trained_universe
         # Use checkpoint universe if available, otherwise use top_n from load_master
-        universe = _load_trained_universe("models")
-        n_prices = update_parquet(universe=universe, save_dir="models")
-        if n_prices:
-            logger.info(f"  Prices: {n_prices} new rows added")
+        if prices_fresh_from_maintenance:
+            logger.info("  Prices: already refreshed during maintenance")
         else:
-            logger.info("  Prices: already up to date")
+            universe = _load_trained_universe("models")
+            n_prices = update_parquet(universe=universe, save_dir="models")
+            if n_prices:
+                logger.info(f"  Prices: {n_prices} new rows added")
+            else:
+                logger.info("  Prices: already up to date")
     except Exception as e:
         logger.warning(f"  Price update failed (continuing with cached data): {e}")
 
     try:
         from pipeline.updater import _load_trained_universe
         from pipeline.sentiment import update_sentiment
-        universe = _load_trained_universe("models")
-        if not universe:
+        if sentiment_fresh_from_maintenance:
+            logger.info("  Sentiment: already refreshed during maintenance")
+            universe = []
+        else:
+            universe = _load_trained_universe("models")
+        if not sentiment_fresh_from_maintenance and not universe:
             # No checkpoint yet — sentiment update will happen after first train
             logger.info("  Sentiment: skipping (no checkpoint yet — run --mode train first)")
-        else:
+        elif not sentiment_fresh_from_maintenance:
             n_sent = update_sentiment(universe, lookback_days=3)
             if n_sent:
                 logger.info(f"  Sentiment: {n_sent} new headlines scored")
@@ -163,7 +184,12 @@ def run_cycle(
     logger.info("Loading market data...")
     try:
         from pipeline.data import load_master
-        df = load_master(top_n=top_n, min_price=0.01, min_avg_volume=5_000)
+        df = load_master(
+            top_n=top_n,
+            min_price=0.01,
+            min_avg_volume=5_000,
+            include_raw_cols=True,
+        )
     except Exception as e:
         logger.error(f"Failed to load data: {e}")
         brain.min_score = brain._base_min_score
@@ -238,7 +264,6 @@ def run_cycle(
             f"{len(portfolio.options.positions)} options"
         )
 
-    print(portfolio.summary())
 
     # ── Auto-show full status + cycle summary ─────────────────────────────────
     print_report(portfolio, show_benchmark=True)
@@ -305,10 +330,18 @@ def parse_args(config: dict = None):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main(config: dict = None):
+def main(config: dict = None, maintenance_context: dict | None = None):
     args = parse_args(config)
 
     portfolio = Portfolio(initial_cash=args.cash)
+    cash_yield = portfolio.accrue_cash_yield(_today_et())
+    if cash_yield > 0:
+        logger.info(
+            "Accrued cash yield: $%.2f at %.2f%% annualized",
+            cash_yield,
+            CASH_YIELD_ANNUAL_RATE * 100,
+        )
+        portfolio.save()
 
     # Status / trades — no trading, just reporting
     if args.status:
@@ -359,6 +392,7 @@ def main(config: dict = None):
         risk,
         top_n             = args.top_n,
         enforce_market_hours = not args.no_market_hours,
+        maintenance_context = maintenance_context,
     )
 
 

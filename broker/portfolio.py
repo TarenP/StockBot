@@ -6,12 +6,14 @@ Persists to disk so state survives restarts.
 
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 STATE_PATH = Path("broker/state/portfolio.json")
+CASH_YIELD_ANNUAL_RATE = 0.03
+DAYS_PER_YEAR = 365.25
 
 
 class Portfolio:
@@ -20,6 +22,7 @@ class Portfolio:
         self.cash         = initial_cash
         self.positions    = {}   # ticker -> {shares, avg_cost, last_price}
         self.trade_log    = []
+        self.cash_yield_last_date: date | None = None
         # Options book — lazy import to avoid circular deps
         from broker.options import OptionsBook
         self.options = OptionsBook()
@@ -35,6 +38,10 @@ class Portfolio:
                 self.positions    = data.get("positions", {})
                 self.trade_log    = data.get("trade_log", [])
                 self.initial_cash = float(data.get("initial_cash", self.initial_cash))
+                self.cash_yield_last_date = (
+                    self._coerce_date(data.get("last_cash_yield_date"))
+                    or self._coerce_date(data.get("last_saved"))
+                )
 
                 # Validate state consistency
                 if self.cash < 0:
@@ -59,8 +66,52 @@ class Portfolio:
             "positions":    self.positions,
             "trade_log":    self.trade_log[-500:],   # keep last 500 trades
             "initial_cash": self.initial_cash,
+            "last_cash_yield_date": (
+                self.cash_yield_last_date.isoformat()
+                if self.cash_yield_last_date is not None else None
+            ),
             "last_saved":   datetime.now().isoformat(),
         }, indent=2))
+
+    @staticmethod
+    def _coerce_date(value) -> date | None:
+        if value is None:
+            return None
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        if isinstance(value, datetime):
+            return value.date()
+        try:
+            return datetime.fromisoformat(str(value)).date()
+        except Exception:
+            return None
+
+    def accrue_cash_yield(
+        self,
+        as_of: date | datetime | str | None = None,
+        annual_rate: float = CASH_YIELD_ANNUAL_RATE,
+    ) -> float:
+        """
+        Compound idle cash at a conservative annual rate using elapsed calendar days.
+        """
+        as_of_date = self._coerce_date(as_of) or date.today()
+        if self.cash_yield_last_date is None:
+            self.cash_yield_last_date = as_of_date
+            return 0.0
+
+        last_date = self.cash_yield_last_date
+        if as_of_date <= last_date:
+            return 0.0
+
+        self.cash_yield_last_date = as_of_date
+        if self.cash <= 0 or annual_rate <= 0:
+            return 0.0
+
+        days_elapsed = (as_of_date - last_date).days
+        growth = (1.0 + annual_rate) ** (days_elapsed / DAYS_PER_YEAR)
+        starting_cash = self.cash
+        self.cash *= growth
+        return self.cash - starting_cash
 
     # ── Trade execution ───────────────────────────────────────────────────────
 
@@ -174,6 +225,7 @@ class Portfolio:
             f"  Positions:     {len(self.positions)} stocks, "
             f"{len(self.options.positions)} options",
             f"{'─'*55}",
+            f"  Stock Holdings ({len(self.positions)})",
         ]
         if self.positions:
             lines.append(f"  {'Ticker':<8} {'Shares':>8}  {'Price':>8}  {'Value':>10}  {'P&L':>10}")
@@ -186,6 +238,8 @@ class Portfolio:
                     f"${pos['shares']*pos['last_price']:>9.2f}  "
                     f"{pnl:>+9.2f}"
                 )
+        else:
+            lines.append("  No stock positions")
         lines += self.options.summary_lines()
         lines.append(f"{'='*55}\n")
         return "\n".join(lines)

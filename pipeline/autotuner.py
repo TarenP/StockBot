@@ -1,42 +1,23 @@
 """
 AutoTuner
 =========
-Automatically optimises broker parameters and decides whether to enable RL
+Automatically optimizes broker parameters and decides whether to enable RL
 mode, based entirely on replay data. Called by the scheduler after each
-weekly finetune. Writes results back to broker.config.
-
-What it does:
-  1. Runs the sensitivity sweep over the last 2 years of data and picks the
-     parameter set with the best Sharpe ratio.
-  2. Runs the ablation gate (screener_rl vs heuristics_only). If RL passes,
-     sets rl_enabled = true in broker.config. If it fails, sets it to false.
-  3. Logs every decision with the data that drove it to logs/autotuner.log.
-
-The user never needs to touch broker.config for these settings — the system
-manages them automatically.
-
-Parameters that are NEVER auto-tuned (require human judgment):
-  - cash           (depends on how much money you're deploying)
-  - max_positions  (portfolio concentration preference)
-  - no_options     (risk preference)
+weekly fine-tune. Writes results back to broker.config.
 """
 
-import logging
-import os
-import re
 import glob
-from pathlib import Path
+import logging
+import re
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# ── Parameter search grid ─────────────────────────────────────────────────────
-
 _PARAM_GRID = [
-    # min_score × stop_loss × take_profit × max_sector
     {"min_score": ms, "stop_loss_floor": sl, "take_profit": tp, "max_sector_pct": mx}
     for ms in [0.50, 0.55, 0.60, 0.65]
     for sl in [0.06, 0.08, 0.10]
@@ -44,17 +25,21 @@ _PARAM_GRID = [
     for mx in [0.20, 0.30, 0.40]
 ]
 
-# ── Config file I/O ───────────────────────────────────────────────────────────
+_HOLDOUT_FRACTION = 0.25
+_MIN_HOLDOUT_DAYS = 63
+_MAX_HOLDOUT_DAYS = 126
+_HOLDOUT_FINALISTS = 12
+
 
 def _read_config(path: str = "broker.config") -> dict:
     """Parse broker.config into a dict. Ignores comments and blank lines."""
     cfg = {}
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.split("#")[0].strip()
             if "=" in line:
-                k, v = line.split("=", 1)
-                cfg[k.strip()] = v.strip()
+                key, value = line.split("=", 1)
+                cfg[key.strip()] = value.strip()
     return cfg
 
 
@@ -65,34 +50,108 @@ def _config_int(cfg: dict, key: str, default: int) -> int:
         return default
 
 
+def _config_float(cfg: dict, key: str, default: float) -> float:
+    try:
+        return float(cfg.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
 def _write_config_key(key: str, value: str, path: str = "broker.config") -> None:
-    """Update a single key in broker.config in-place, preserving all comments."""
-    with open(path) as f:
-        content = f.read()
+    """Update one broker.config key in-place and collapse duplicate entries."""
+    with open(path, encoding="utf-8") as f:
+        lines = f.readlines()
 
-    # Match the key at the start of a line (with optional spaces around =)
-    pattern = rf"^({re.escape(key)}\s*=\s*)([^\n#]*)(.*)$"
-    replacement = rf"\g<1>{value}\g<3>"
-    new_content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
+    key_pattern = re.compile(rf"^(\s*{re.escape(key)}\s*=\s*)([^#\r\n]*)(.*)$")
+    new_lines: list[str] = []
+    replaced = False
 
-    if new_content == content:
-        # Key not found — append it
-        new_content = content.rstrip() + f"\n{key:<22} = {value}\n"
+    for line in lines:
+        match = key_pattern.match(line)
+        if not match:
+            new_lines.append(line)
+            continue
 
-    with open(path, "w") as f:
-        f.write(new_content)
+        if replaced:
+            continue
+
+        prefix, old_value, suffix = match.groups()
+        comment_spacing = old_value[len(old_value.rstrip()):]
+        if suffix and not comment_spacing:
+            comment_spacing = " "
+        new_lines.append(f"{prefix}{value}{comment_spacing}{suffix}\n")
+        replaced = True
+
+    if not replaced:
+        if new_lines and not new_lines[-1].endswith("\n"):
+            new_lines[-1] += "\n"
+        new_lines.append(f"{key:<22} = {value}\n")
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
 
     logger.info("broker.config updated: %s = %s", key, value)
 
-
-# ── Best checkpoint helper ────────────────────────────────────────────────────
 
 def _best_checkpoint(save_dir: str = "models") -> str | None:
     ckpts = sorted(glob.glob(f"{save_dir}/best_fold*.pt"))
     return ckpts[-1] if ckpts else None
 
 
-# ── Step 1: Parameter optimisation ───────────────────────────────────────────
+def _split_replay_holdout(
+    df_features: pd.DataFrame,
+    replay_years: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
+    """
+    Split the trailing replay window into an optimization slice and a later
+    holdout slice. Falls back to a shared in-sample window when history is too
+    short to support a meaningful split.
+    """
+    dates = sorted(df_features.index.get_level_values("date").unique())
+    cutoff = pd.Timestamp(dates[-1]) - pd.DateOffset(years=replay_years)
+    df_window = df_features[df_features.index.get_level_values("date") >= cutoff]
+
+    replay_dates = sorted(df_window.index.get_level_values("date").unique())
+    if len(replay_dates) < (_MIN_HOLDOUT_DAYS * 2):
+        logger.warning(
+            "AutoTuner: only %d replay dates available; using a single in-sample window.",
+            len(replay_dates),
+        )
+        return df_window, df_window, False
+
+    holdout_days = int(round(len(replay_dates) * _HOLDOUT_FRACTION))
+    holdout_days = max(_MIN_HOLDOUT_DAYS, holdout_days)
+    holdout_days = min(_MAX_HOLDOUT_DAYS, holdout_days)
+    holdout_days = min(holdout_days, len(replay_dates) - _MIN_HOLDOUT_DAYS)
+    if holdout_days < _MIN_HOLDOUT_DAYS:
+        logger.warning(
+            "AutoTuner: replay split became too short after constraints; using a single in-sample window."
+        )
+        return df_window, df_window, False
+
+    split_date = replay_dates[-holdout_days]
+    df_search = df_window[df_window.index.get_level_values("date") < split_date]
+    df_holdout = df_window[df_window.index.get_level_values("date") >= split_date]
+
+    search_dates = sorted(df_search.index.get_level_values("date").unique())
+    holdout_dates = sorted(df_holdout.index.get_level_values("date").unique())
+    if not search_dates or not holdout_dates:
+        logger.warning(
+            "AutoTuner: failed to build a clean holdout split; using a single in-sample window."
+        )
+        return df_window, df_window, False
+
+    logger.info(
+        "AutoTuner: optimization window %s -> %s (%d days) | holdout %s -> %s (%d days)",
+        search_dates[0].date(),
+        search_dates[-1].date(),
+        len(search_dates),
+        holdout_dates[0].date(),
+        holdout_dates[-1].date(),
+        len(holdout_dates),
+    )
+    return df_search, df_holdout, True
+
 
 def tune_parameters(
     df_features: pd.DataFrame,
@@ -102,78 +161,153 @@ def tune_parameters(
     config_path: str = "broker.config",
 ) -> dict:
     """
-    Run a parameter grid search over the last `replay_years` of data.
-    Writes the best min_score, stop_loss, take_profit, and max_sector
-    back to broker.config.
-
-    Returns the best parameter dict.
+    Run a parameter search over the trailing replay window.
+    Winners are ranked on a holdout slice when enough history is available.
     """
     from broker.replay import run_replay
     from pipeline.benchmark import compute_metrics
 
-    logger.info("AutoTuner: starting parameter optimisation (%d combinations)...",
-                len(_PARAM_GRID))
+    logger.info(
+        "AutoTuner: starting parameter optimisation (%d combinations)...",
+        len(_PARAM_GRID),
+    )
 
-    # Restrict to tuning window
-    dates  = sorted(df_features.index.get_level_values("date").unique())
-    cutoff = pd.Timestamp(dates[-1]) - pd.DateOffset(years=replay_years)
-    df_tune = df_features[df_features.index.get_level_values("date") >= cutoff]
-
-    best_sharpe = -np.inf
-    best_params = _PARAM_GRID[0]
-    results = []
+    cfg = _read_config(config_path)
+    df_search, df_holdout, has_holdout = _split_replay_holdout(
+        df_features,
+        replay_years=replay_years,
+    )
+    results: list[dict] = []
 
     for i, params in enumerate(_PARAM_GRID):
         try:
             rets, _ = run_replay(
-                df_tune,
+                df_search,
                 price_lookup,
                 strategy="heuristics_only",
                 initial_cash=initial_cash,
+                max_positions=_config_int(cfg, "max_positions", 20),
                 min_score=params["min_score"],
                 stop_loss_floor=params["stop_loss_floor"],
                 take_profit=params["take_profit"],
+                partial_profit_pct=_config_float(cfg, "partial_profit", 0.20),
+                penny_pct=_config_float(cfg, "penny_pct", 0.20),
                 max_sector_pct=params["max_sector_pct"],
-                label=f"tune_{i}",
+                max_pair_correlation=_config_float(cfg, "max_correlation", 0.80),
+                avoid_earnings_days=_config_int(cfg, "avoid_earnings", 3),
+                label=f"search_{i}",
             )
             m = compute_metrics(rets, label=str(params))
-            sharpe = m["sharpe"]
-            results.append({**params, "sharpe": sharpe, "max_drawdown": m["max_drawdown"]})
-
-            if sharpe > best_sharpe:
-                best_sharpe = sharpe
-                best_params = params
-
+            results.append({
+                **params,
+                "search_total_return": m["total_return"],
+                "search_ann_return": m["ann_return"],
+                "search_sharpe": m["sharpe"],
+                "search_max_drawdown": m["max_drawdown"],
+                "holdout_total_return": np.nan,
+                "holdout_ann_return": np.nan,
+                "holdout_sharpe": np.nan,
+                "holdout_max_drawdown": np.nan,
+            })
         except Exception as exc:
             logger.warning("AutoTuner: param combo %d failed: %s", i, exc)
 
+    if not results:
+        raise RuntimeError("AutoTuner: no parameter combinations completed successfully.")
+
+    if has_holdout:
+        finalists = sorted(
+            results,
+            key=lambda row: (
+                row["search_sharpe"],
+                row["search_ann_return"],
+                row["search_max_drawdown"],
+            ),
+            reverse=True,
+        )[: min(_HOLDOUT_FINALISTS, len(results))]
+
+        for finalist in finalists:
+            rets, _ = run_replay(
+                df_holdout,
+                price_lookup,
+                strategy="heuristics_only",
+                initial_cash=initial_cash,
+                max_positions=_config_int(cfg, "max_positions", 20),
+                min_score=finalist["min_score"],
+                stop_loss_floor=finalist["stop_loss_floor"],
+                take_profit=finalist["take_profit"],
+                partial_profit_pct=_config_float(cfg, "partial_profit", 0.20),
+                penny_pct=_config_float(cfg, "penny_pct", 0.20),
+                max_sector_pct=finalist["max_sector_pct"],
+                max_pair_correlation=_config_float(cfg, "max_correlation", 0.80),
+                avoid_earnings_days=_config_int(cfg, "avoid_earnings", 3),
+                label=(
+                    "holdout_"
+                    f"{finalist['min_score']:.2f}_"
+                    f"{finalist['stop_loss_floor']:.2f}_"
+                    f"{finalist['take_profit']:.2f}_"
+                    f"{finalist['max_sector_pct']:.2f}"
+                ),
+            )
+            m = compute_metrics(rets, label=str(finalist))
+            finalist["holdout_total_return"] = m["total_return"]
+            finalist["holdout_ann_return"] = m["ann_return"]
+            finalist["holdout_sharpe"] = m["sharpe"]
+            finalist["holdout_max_drawdown"] = m["max_drawdown"]
+
+        best_row = max(
+            finalists,
+            key=lambda row: (
+                row["holdout_sharpe"],
+                row["holdout_ann_return"],
+                row["holdout_max_drawdown"],
+            ),
+        )
+        best_metric_name = "holdout_sharpe"
+    else:
+        best_row = max(
+            results,
+            key=lambda row: (
+                row["search_sharpe"],
+                row["search_ann_return"],
+                row["search_max_drawdown"],
+            ),
+        )
+        best_metric_name = "search_sharpe"
+
+    best_params = {
+        "min_score": best_row["min_score"],
+        "stop_loss_floor": best_row["stop_loss_floor"],
+        "take_profit": best_row["take_profit"],
+        "max_sector_pct": best_row["max_sector_pct"],
+    }
+    best_metric = float(best_row[best_metric_name])
+
     logger.info(
-        "AutoTuner: best params — min_score=%.2f  stop=%.2f  tp=%.2f  "
-        "max_sector=%.2f  Sharpe=%.3f",
+        "AutoTuner: best params - min_score=%.2f  stop=%.2f  tp=%.2f  max_sector=%.2f  %s=%.3f",
         best_params["min_score"],
         best_params["stop_loss_floor"],
         best_params["take_profit"],
         best_params["max_sector_pct"],
-        best_sharpe,
+        best_metric_name,
+        best_metric,
     )
 
-    # Write winners back to config
-    _write_config_key("min_score",   f"{best_params['min_score']:.2f}",    config_path)
-    _write_config_key("stop_loss",   f"{best_params['stop_loss_floor']:.2f}", config_path)
-    _write_config_key("take_profit", f"{best_params['take_profit']:.2f}",  config_path)
-    _write_config_key("max_sector",  f"{best_params['max_sector_pct']:.2f}", config_path)
+    _write_config_key("min_score", f"{best_params['min_score']:.2f}", config_path)
+    _write_config_key("stop_loss", f"{best_params['stop_loss_floor']:.2f}", config_path)
+    _write_config_key("take_profit", f"{best_params['take_profit']:.2f}", config_path)
+    _write_config_key("max_sector", f"{best_params['max_sector_pct']:.2f}", config_path)
 
-    # Save full results for audit
     Path("plots").mkdir(exist_ok=True)
-    pd.DataFrame(results).sort_values("sharpe", ascending=False).to_csv(
-        "plots/param_tuning.csv", index=False
+    sort_col = "holdout_sharpe" if has_holdout else "search_sharpe"
+    pd.DataFrame(results).sort_values(sort_col, ascending=False, na_position="last").to_csv(
+        "plots/param_tuning.csv",
+        index=False,
     )
     logger.info("AutoTuner: full parameter results saved -> plots/param_tuning.csv")
 
     return best_params
 
-
-# ── Step 2: RL gate decision ──────────────────────────────────────────────────
 
 def tune_rl_mode(
     df_features: pd.DataFrame,
@@ -184,52 +318,67 @@ def tune_rl_mode(
     config_path: str = "broker.config",
 ) -> bool:
     """
-    Run the ablation gate. If screener_rl beats heuristics_only by the
+    Run the RL ablation gate. If screener_rl beats heuristics_only by the
     required margin, sets rl_enabled = true in broker.config.
-    Returns True if RL was enabled, False if disabled.
     """
     from broker.replay import run_ablation, _check_ablation_gate
-    from pipeline.benchmark import compute_metrics
 
     checkpoint = _best_checkpoint(save_dir)
     if checkpoint is None:
-        logger.warning("AutoTuner: no checkpoint found — keeping rl_enabled = false")
+        logger.warning("AutoTuner: no checkpoint found - keeping rl_enabled = false")
         _write_config_key("rl_enabled", "false", config_path)
         return False
 
     logger.info("AutoTuner: running RL ablation gate with checkpoint %s...", checkpoint)
 
-    # Restrict to tuning window
-    dates  = sorted(df_features.index.get_level_values("date").unique())
-    cutoff = pd.Timestamp(dates[-1]) - pd.DateOffset(years=replay_years)
-    df_tune = df_features[df_features.index.get_level_values("date") >= cutoff]
+    cfg = _read_config(config_path)
+    df_search, df_holdout, has_holdout = _split_replay_holdout(
+        df_features,
+        replay_years=replay_years,
+    )
+    df_gate = df_holdout if has_holdout else df_search
+    if has_holdout:
+        logger.info("AutoTuner: RL gate will run on the holdout window.")
+    else:
+        logger.info("AutoTuner: RL gate falling back to the full tuning window.")
 
     try:
         report_df = run_ablation(
-            df_tune,
+            df_gate,
             price_lookup,
             checkpoint_path=checkpoint,
             initial_cash=initial_cash,
             replay_years=replay_years,
+            max_positions=_config_int(cfg, "max_positions", 20),
+            min_score=_config_float(cfg, "min_score", 0.60),
+            stop_loss_floor=_config_float(cfg, "stop_loss", 0.07),
+            take_profit=_config_float(cfg, "take_profit", 0.45),
+            partial_profit_pct=_config_float(cfg, "partial_profit", 0.20),
+            penny_pct=_config_float(cfg, "penny_pct", 0.20),
+            max_sector_pct=_config_float(cfg, "max_sector", 0.40),
+            max_pair_correlation=_config_float(cfg, "max_correlation", 0.80),
+            avoid_earnings_days=_config_int(cfg, "avoid_earnings", 3),
+            rl_phase=_config_int(cfg, "rl_phase", 1),
+            rl_exit_threshold=_config_float(cfg, "rl_exit_threshold", 0.30),
+            rl_conviction_drop=_config_float(cfg, "rl_conviction_drop", 0.20),
+            rl_min_score=_config_float(cfg, "rl_min_score", 0.0),
         )
         gate = _check_ablation_gate(report_df)
     except Exception as exc:
-        logger.error("AutoTuner: ablation failed — keeping rl_enabled = false: %s", exc)
+        logger.error("AutoTuner: ablation failed - keeping rl_enabled = false: %s", exc)
         _write_config_key("rl_enabled", "false", config_path)
         return False
 
     if gate == "PASSED":
-        _write_config_key("rl_enabled",         "true",      config_path)
-        _write_config_key("rl_checkpoint_path",  checkpoint,  config_path)
-        logger.info("AutoTuner: RL ENABLED — ablation gate passed.")
+        _write_config_key("rl_enabled", "true", config_path)
+        _write_config_key("rl_checkpoint_path", checkpoint, config_path)
+        logger.info("AutoTuner: RL ENABLED - ablation gate passed.")
         return True
-    else:
-        _write_config_key("rl_enabled", "false", config_path)
-        logger.info("AutoTuner: RL DISABLED — ablation gate failed.")
-        return False
 
+    _write_config_key("rl_enabled", "false", config_path)
+    logger.info("AutoTuner: RL DISABLED - ablation gate failed.")
+    return False
 
-# ── Main entry point ──────────────────────────────────────────────────────────
 
 def run_autotuner(
     initial_cash: float = 10_000.0,
@@ -238,8 +387,8 @@ def run_autotuner(
     config_path: str = "broker.config",
 ) -> None:
     """
-    Full auto-tune pass: parameter optimisation then RL gate decision.
-    Called by the scheduler after each weekly finetune.
+    Full auto-tune pass: parameter optimization then RL gate decision.
+    Called by the scheduler after each weekly fine-tune.
     """
     _setup_autotuner_logging()
     logger.info("=" * 60)
@@ -247,8 +396,8 @@ def run_autotuner(
     logger.info("=" * 60)
 
     try:
-        from pipeline.data import load_master
         from broker.replay import _build_price_lookup
+        from pipeline.data import load_master
 
         cfg = _read_config(config_path)
         top_n = _config_int(cfg, "top_n", 500)
@@ -256,17 +405,17 @@ def run_autotuner(
         df_features = load_master(top_n=top_n)
         price_lookup = _build_price_lookup()
 
-        # Step 1: tune heuristic parameters
         tune_parameters(
-            df_features, price_lookup,
+            df_features,
+            price_lookup,
             initial_cash=initial_cash,
             replay_years=replay_years,
             config_path=config_path,
         )
 
-        # Step 2: decide RL mode
         tune_rl_mode(
-            df_features, price_lookup,
+            df_features,
+            price_lookup,
             initial_cash=initial_cash,
             replay_years=replay_years,
             save_dir=save_dir,
@@ -274,7 +423,6 @@ def run_autotuner(
         )
 
         logger.info("AutoTuner run complete.")
-
     except Exception as exc:
         logger.error("AutoTuner run failed: %s", exc, exc_info=True)
 
@@ -283,6 +431,8 @@ def _setup_autotuner_logging():
     Path("logs").mkdir(exist_ok=True)
     handler = logging.FileHandler("logs/autotuner.log")
     handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    if not any(isinstance(h, logging.FileHandler) and "autotuner" in h.baseFilename
-               for h in logger.handlers):
+    if not any(
+        isinstance(h, logging.FileHandler) and "autotuner" in h.baseFilename
+        for h in logger.handlers
+    ):
         logger.addHandler(handler)

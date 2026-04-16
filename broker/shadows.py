@@ -42,6 +42,7 @@ ELITE_FRACTION     = 0.20   # top 20% survive unchanged
 CULL_FRACTION      = 0.20   # bottom 20% replaced each generation
 EVOLUTION_DAYS     = 7      # evolve population every N days
 VALIDATION_TOP_N   = 20     # top N fast-scored genomes get full replay
+VALIDATION_METRIC_VERSION = 3
 PROMOTION_MIN_EDGE = 0.05   # must beat baseline Sharpe by this much to promote
 OPTIONS_LIVE_DAYS  = 30     # days options must beat non-options before going live
 
@@ -83,8 +84,10 @@ def _random_genome(rng: random.Random, no_options: bool = True, rl_enabled: bool
     g["no_options"] = no_options
     g["rl_enabled"] = rl_enabled
     g["rl_phase"]   = rng.choice([1, 2]) if rl_enabled else 1
+    g["fast_score"] = 0.0
     g["sharpe"]     = 0.0
     g["validated"]  = False
+    g["validation_metric_version"] = 0
     g["age"]        = 0
     return g
 
@@ -101,9 +104,11 @@ def _mutate(genome: dict, rng: random.Random, scale: float = 1.0) -> dict:
         else:
             delta = rng.gauss(0, sigma * scale)
             child[k] = round(float(np.clip(child[k] + delta, lo, hi)), 3)
-    child["sharpe"]    = 0.0
+    child["fast_score"] = 0.0
+    child["sharpe"] = 0.0
     child["validated"] = False
-    child["age"]       = 0
+    child["validation_metric_version"] = 0
+    child["age"] = 0
     return child
 
 
@@ -112,9 +117,11 @@ def _crossover(a: dict, b: dict, rng: random.Random) -> dict:
     for k in _PARAM_BOUNDS:
         if rng.random() < 0.5 and k in b:
             child[k] = b[k]
-    child["sharpe"]    = 0.0
+    child["fast_score"] = 0.0
+    child["sharpe"] = 0.0
     child["validated"] = False
-    child["age"]       = 0
+    child["validation_metric_version"] = 0
+    child["age"] = 0
     return child
 
 
@@ -132,8 +139,10 @@ def _genome_from_config(config: dict) -> dict:
         "no_options":         bool(config.get("no_options",          True)),
         "rl_enabled":         bool(config.get("rl_enabled",          False)),
         "rl_phase":           int(config.get("rl_phase",             1)),
+        "fast_score":         0.0,
         "sharpe":             0.0,
         "validated":          False,
+        "validation_metric_version": 0,
         "age":                0,
         "is_baseline":        True,
     }
@@ -157,10 +166,56 @@ def _load_state() -> dict:
         }
 
 
+def _fast_score_value(genome: dict) -> float:
+    return float(genome.get("fast_score", genome.get("sharpe", -99)))
+
+
+def _selection_score(genome: dict) -> float:
+    if _is_current_validation(genome):
+        return float(genome.get("sharpe", -99))
+    return _fast_score_value(genome)
+
+
+def _validation_upgrade_required(population: list[dict]) -> bool:
+    baseline = next((g for g in population if g.get("is_baseline")), None)
+    if baseline is not None and not _is_current_validation(baseline):
+        return True
+    return any(g.get("validated") and not _is_current_validation(g) for g in population)
+
+
 def _save_state(state: dict) -> None:
     Path(_STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
     with open(_STATE_FILE, "w") as f:
         json.dump(state, f, separators=(",", ":"))  # compact — 1000 genomes ~1MB
+
+
+def _resolve_shadow_checkpoint(checkpoint_path: str | None) -> str | None:
+    """
+    Match the live broker's checkpoint resolution so shadows handle
+    `rl_checkpoint_path=auto` the same way the live cycle does.
+    """
+    if not checkpoint_path or str(checkpoint_path).strip().lower() == "auto":
+        ckpts = sorted(Path("models").glob("best_fold*.pt"))
+        return str(ckpts[-1]) if ckpts else None
+    return checkpoint_path
+
+
+def _is_current_validation(genome: dict) -> bool:
+    version = int(genome.get("validation_metric_version", 0) or 0)
+    return bool(genome.get("validated")) and version >= VALIDATION_METRIC_VERSION
+
+
+def _invalidate_stale_validations(population: list[dict]) -> list[dict]:
+    cleared = 0
+    for genome in population:
+        if genome.get("validated") and not _is_current_validation(genome):
+            genome["validated"] = False
+            genome["sharpe"] = 0.0
+            genome["validation_metric_version"] = 0
+            cleared += 1
+    if cleared:
+        logger.info("Shadows: cleared %d stale validation result(s)", cleared)
+    return population
 
 
 # ── Population initialisation ─────────────────────────────────────────────────
@@ -236,7 +291,7 @@ def _fast_score_genome(genome: dict, snap: pd.DataFrame) -> float:
 
 
 def fast_score_population(population: list[dict], df_features: pd.DataFrame) -> list[dict]:
-    """Score all genomes using the latest feature snapshot. Updates genome['sharpe'] in-place."""
+    """Score all genomes using the latest feature snapshot."""
     try:
         dates   = sorted(df_features.index.get_level_values("date").unique())
         snap    = df_features.loc[dates[-1]].copy()
@@ -244,8 +299,8 @@ def fast_score_population(population: list[dict], df_features: pd.DataFrame) -> 
         return population
 
     for genome in population:
-        genome["sharpe"] = _fast_score_genome(genome, snap)
-        genome["age"]    = genome.get("age", 0) + 1
+        genome["fast_score"] = _fast_score_genome(genome, snap)
+        genome["age"] = genome.get("age", 0) + 1
 
     return population
 
@@ -267,16 +322,26 @@ def validate_top_genomes(
     from broker.replay import run_replay
     from pipeline.benchmark import compute_metrics
 
-    # Sort by fast score, take top_n
-    ranked = sorted(population, key=lambda g: float(g.get("sharpe", -99)), reverse=True)
+    baseline = next((g for g in population if g.get("is_baseline")), None)
+    resolved_checkpoint = _resolve_shadow_checkpoint(checkpoint_path)
+    ranked = sorted(
+        [g for g in population if not g.get("is_baseline")],
+        key=_fast_score_value,
+        reverse=True,
+    )
     to_validate = ranked[:top_n]
+    if baseline is not None:
+        to_validate = [baseline] + to_validate
 
     # Restrict to replay window
     dates  = sorted(df_features.index.get_level_values("date").unique())
     cutoff = pd.Timestamp(dates[-1]) - pd.DateOffset(years=replay_years)
     df_val = df_features[df_features.index.get_level_values("date") >= cutoff]
 
-    logger.info("Shadows: validating top %d genomes with full replay...", top_n)
+    if baseline is not None:
+        logger.info("Shadows: validating baseline + top %d genomes with full replay...", top_n)
+    else:
+        logger.info("Shadows: validating top %d genomes with full replay...", top_n)
 
     # Quick sanity check: verify price_lookup has data for the replay window
     if price_lookup is not None and not price_lookup.empty:
@@ -298,21 +363,14 @@ def validate_top_genomes(
                 genome["total_return"] = 0.0
                 genome["max_drawdown"] = 0.0
                 genome["validated"]    = True
+                genome["validation_metric_version"] = VALIDATION_METRIC_VERSION
             return population
 
     for i, genome in enumerate(to_validate):
-        # During validation, always use heuristics_only strategy.
-        # RL genomes are validated during live shadow cycles, not warm-up,
-        # because replay research() calls need live yfinance data.
-        strategy = "heuristics_only"
-        ckpt     = None
-
-        # Cap min_score at 0.55 for replay validation.
-        # df_features uses z-scored features, so composite_score in run_replay
-        # tops out around 0.62-0.65. Using the genome's own min_score (0.64+)
-        # would filter out almost everything. We're tuning stop_loss/take_profit/
-        # max_sector here — the threshold is held constant across all genomes.
-        effective_min_score = 0.55
+        use_rl = bool(genome.get("rl_enabled")) and bool(resolved_checkpoint)
+        strategy = "screener_rl" if use_rl else "heuristics_only"
+        ckpt = resolved_checkpoint if use_rl else None
+        effective_min_score = float(genome.get("min_score", 0.55))
 
         try:
             rets, _ = run_replay(
@@ -324,17 +382,25 @@ def validate_top_genomes(
                 min_score=effective_min_score,
                 stop_loss_floor=float(genome.get("stop_loss", 0.08)),
                 take_profit=float(genome.get("take_profit", 0.35)),
+                partial_profit_pct=float(genome.get("partial_profit", 0.20)),
                 max_sector_pct=float(genome.get("max_sector", 0.25)),
+                avoid_earnings_days=int(genome.get("avoid_earnings", 3)),
+                rl_phase=int(genome.get("rl_phase", 1)),
+                rl_exit_threshold=float(genome.get("rl_exit_threshold", 0.30)),
+                rl_conviction_drop=float(genome.get("rl_conviction_drop", 0.20)),
                 label=f"val_{i}",
             )
-            m = genome["sharpe"] = round(compute_metrics(rets)["sharpe"], 4)
-            genome["total_return"] = round(compute_metrics(rets)["total_return"], 4)
-            genome["max_drawdown"] = round(compute_metrics(rets)["max_drawdown"], 4)
-            genome["validated"]    = True
+            metrics = compute_metrics(rets)
+            genome["sharpe"] = round(metrics["sharpe"], 4)
+            genome["total_return"] = round(metrics["total_return"], 4)
+            genome["max_drawdown"] = round(metrics["max_drawdown"], 4)
+            genome["validated"] = True
+            genome["validation_metric_version"] = VALIDATION_METRIC_VERSION
         except Exception as exc:
             logger.warning("Validation failed for genome %d: %s", i, exc)
             genome["sharpe"]    = -1.0
             genome["validated"] = False
+            genome["validation_metric_version"] = 0
 
     return population
 
@@ -353,7 +419,7 @@ def evolve_population(population: list[dict], live_config: dict) -> list[dict]:
     rng = random.Random()
     n   = len(population)
 
-    ranked = sorted(population, key=lambda g: float(g.get("sharpe", -99)), reverse=True)
+    ranked = sorted(population, key=_selection_score, reverse=True)
 
     n_elite = int(n * ELITE_FRACTION)
     n_cull  = int(n * CULL_FRACTION)
@@ -377,9 +443,11 @@ def evolve_population(population: list[dict], live_config: dict) -> list[dict]:
 
     new_pop = elites + mutated_middle + new_bottom
 
-    # Always ensure live config is in the population
-    baseline = _genome_from_config(live_config)
-    new_pop[0] = baseline  # slot 0 is always the live baseline
+    # Keep the live baseline in slot 0, including any replay validation metrics.
+    baseline = next((deepcopy(g) for g in population if g.get("is_baseline")), None)
+    if baseline is None:
+        baseline = _genome_from_config(live_config)
+    new_pop[0] = baseline
 
     logger.info("Shadows: evolved population — elites=%d  mutated=%d  new=%d",
                 n_elite, len(mutated_middle), n_cull)
@@ -399,23 +467,30 @@ def _maybe_promote(
     promote it to live config.
 
     After promotion:
-      - Winner gets mutated into a new child (continues evolving)
-      - Old live config re-enters pool as a new genome (swap)
+      - Winner becomes the new live baseline
+      - A mutated child stays in the pool
 
     Returns (updated_population, promoted: bool).
     """
     from pipeline.autotuner import _write_config_key
 
-    validated = [g for g in population if g.get("validated") and not g.get("is_baseline")]
+    validated = [g for g in population if _is_current_validation(g) and not g.get("is_baseline")]
     if not validated:
         return population, False
 
+    resolved_checkpoint = _resolve_shadow_checkpoint(checkpoint_path)
     baseline_sharpe = float(next(
-        (g["sharpe"] for g in population if g.get("is_baseline")), 0.0
+        (g["sharpe"] for g in population if g.get("is_baseline") and _is_current_validation(g)),
+        0.0,
     ))
+    baseline_idx = next((i for i, g in enumerate(population) if g.get("is_baseline")), None)
 
-    best = max(validated, key=lambda g: float(g.get("sharpe", -99)))
-    best_sharpe = float(best.get("sharpe", -99))
+    winner = max(validated, key=lambda g: float(g.get("sharpe", -99)))
+    best_sharpe = float(winner.get("sharpe", -99))
+
+    if baseline_idx is None:
+        logger.info("Shadows: live baseline missing from population — deferring promotion")
+        return population, False
 
     if best_sharpe <= baseline_sharpe + PROMOTION_MIN_EDGE:
         logger.info(
@@ -429,34 +504,42 @@ def _maybe_promote(
         best_sharpe, baseline_sharpe,
     )
 
+    can_enable_rl = bool(winner.get("rl_enabled") and resolved_checkpoint)
+    promoted = deepcopy(winner)
+    if promoted.get("rl_enabled") and not can_enable_rl:
+        logger.info(
+            "Shadows: RL promotion requested but no checkpoint resolved — promoting as heuristics_only"
+        )
+        promoted["rl_enabled"] = False
+        promoted["rl_phase"] = 1
+
     # Write winner to config
-    _write_config_key("min_score",          f"{best['min_score']:.3f}",          config_path)
-    _write_config_key("stop_loss",          f"{best['stop_loss']:.3f}",          config_path)
-    _write_config_key("take_profit",        f"{best['take_profit']:.3f}",        config_path)
-    _write_config_key("max_sector",         f"{best['max_sector']:.3f}",         config_path)
-    _write_config_key("partial_profit",     f"{best['partial_profit']:.3f}",     config_path)
-    _write_config_key("avoid_earnings",     str(best["avoid_earnings"]),          config_path)
-    _write_config_key("rl_exit_threshold",  f"{best['rl_exit_threshold']:.3f}",  config_path)
-    _write_config_key("rl_conviction_drop", f"{best['rl_conviction_drop']:.3f}", config_path)
-    if best.get("rl_enabled"):
+    _write_config_key("min_score",          f"{promoted['min_score']:.3f}",          config_path)
+    _write_config_key("stop_loss",          f"{promoted['stop_loss']:.3f}",          config_path)
+    _write_config_key("take_profit",        f"{promoted['take_profit']:.3f}",        config_path)
+    _write_config_key("max_sector",         f"{promoted['max_sector']:.3f}",         config_path)
+    _write_config_key("partial_profit",     f"{promoted['partial_profit']:.3f}",     config_path)
+    _write_config_key("avoid_earnings",     str(promoted["avoid_earnings"]),          config_path)
+    _write_config_key("rl_exit_threshold",  f"{promoted['rl_exit_threshold']:.3f}",  config_path)
+    _write_config_key("rl_conviction_drop", f"{promoted['rl_conviction_drop']:.3f}", config_path)
+    if can_enable_rl:
         _write_config_key("rl_enabled", "true",              config_path)
-        _write_config_key("rl_phase",   str(best["rl_phase"]), config_path)
-        if checkpoint_path:
-            _write_config_key("rl_checkpoint_path", checkpoint_path, config_path)
+        _write_config_key("rl_phase",   str(promoted["rl_phase"]), config_path)
+        _write_config_key("rl_checkpoint_path", resolved_checkpoint, config_path)
     else:
         _write_config_key("rl_enabled", "false", config_path)
 
-    # Swap: winner mutates into a child, old live config re-enters pool
+    # Winner becomes the new live baseline; a mutated child stays in the pool.
     rng = random.Random()
-    child = _mutate(best, rng, scale=0.5)
-    old_baseline = _genome_from_config(live_config)
+    child = _mutate(promoted, rng, scale=0.5)
+    promoted["is_baseline"] = True
 
-    # Replace winner's slot with its child; add old baseline back
+    # Replace winner's slot with its child; slot 0 keeps the live baseline.
     for i, g in enumerate(population):
-        if g is best:
+        if g is winner:
             population[i] = child
             break
-    population[0] = old_baseline  # slot 0 always holds the current live baseline
+    population[baseline_idx] = promoted
 
     return population, True
 
@@ -469,8 +552,14 @@ def _maybe_enable_options(
     """Enable options in live config once options genomes consistently beat non-options."""
     from pipeline.autotuner import _write_config_key
 
-    options_genomes    = [g for g in population if not g.get("no_options", True) and g.get("validated")]
-    non_options_genomes = [g for g in population if g.get("no_options", True)  and g.get("validated")]
+    options_genomes = [
+        g for g in population
+        if not g.get("no_options", True) and _is_current_validation(g)
+    ]
+    non_options_genomes = [
+        g for g in population
+        if g.get("no_options", True) and _is_current_validation(g)
+    ]
 
     if not options_genomes or not non_options_genomes:
         return False
@@ -509,11 +598,12 @@ def run_shadow_cycle(
     Weekly: full replay validation of top 20, then evolve population
     """
     state = _load_state()
+    resolved_checkpoint = _resolve_shadow_checkpoint(checkpoint_path)
 
     # Initialise population on first run
     if not state["population"]:
         logger.info("Shadows: initialising population of %d genomes...", POPULATION_SIZE)
-        checkpoint_exists = bool(checkpoint_path and os.path.exists(checkpoint_path))
+        checkpoint_exists = bool(resolved_checkpoint)
         state["population"] = _init_population(live_config, checkpoint_exists)
 
     population = state["population"]
@@ -521,29 +611,39 @@ def run_shadow_cycle(
     # ── Daily: fast-score all genomes ────────────────────────────────────────
     population = fast_score_population(population, df_features)
     logger.info(
-        "Shadows: fast-scored %d genomes — top Sharpe=%.3f",
+        "Shadows: fast-scored %d genomes — top fast score=%.3f",
         len(population),
-        max(float(g.get("sharpe", -99)) for g in population),
+        max(_fast_score_value(g) for g in population),
     )
 
     # ── Weekly: full validation + evolution ──────────────────────────────────
     last_validated = state.get("last_validated")
     days_since_val = _days_since(last_validated)
+    force_revalidation = _validation_upgrade_required(population)
 
-    if days_since_val >= 7:
+    if force_revalidation:
+        logger.info("Shadows: validation metrics stale — forcing replay revalidation")
+        population = _invalidate_stale_validations(population)
+
+    if days_since_val >= 7 or force_revalidation:
         population = validate_top_genomes(
-            population, df_features, price_lookup, checkpoint_path
+            population, df_features, price_lookup, resolved_checkpoint
         )
         population, promoted = _maybe_promote(
-            population, live_config, checkpoint_path, config_path
+            population, live_config, resolved_checkpoint, config_path
         )
         population = evolve_population(population, live_config)
         state["last_validated"] = date.today().isoformat()
+        state["last_evolved"] = date.today().isoformat()
         state["generation"]     = state.get("generation", 0) + 1
         logger.info("Shadows: generation %d complete", state["generation"])
 
     # ── Options gate ─────────────────────────────────────────────────────────
     _maybe_enable_options(population, state, config_path)
+
+    baseline = next((g for g in population if g.get("is_baseline")), None)
+    if baseline is not None and _is_current_validation(baseline):
+        state["baseline_sharpe"] = float(baseline.get("sharpe", 0.0))
 
     state["population"] = population
     _save_state(state)
@@ -562,16 +662,17 @@ def _days_since(iso_date: str | None) -> int:
 
 
 def _log_summary(population: list[dict], state: dict) -> None:
-    validated = [g for g in population if g.get("validated")]
+    validated = [g for g in population if _is_current_validation(g)]
     top5 = sorted(validated, key=lambda g: float(g.get("sharpe", -99)), reverse=True)[:5]
     baseline = next((g for g in population if g.get("is_baseline")), {})
+    baseline_sharpe = float(baseline.get("sharpe", 0.0)) if _is_current_validation(baseline) else 0.0
 
     logger.info(
         "Shadows: gen=%d  pop=%d  validated=%d  baseline_sharpe=%.3f",
         state.get("generation", 0),
         len(population),
         len(validated),
-        float(baseline.get("sharpe", 0)),
+        baseline_sharpe,
     )
     for i, g in enumerate(top5):
         logger.info(
@@ -594,15 +695,16 @@ def get_shadow_summary() -> str:
     if not population:
         return "  Shadow population: not yet initialised (runs after first Broker.py cycle)"
 
-    validated = [g for g in population if g.get("validated")]
+    validated = [g for g in population if _is_current_validation(g)]
     top5 = sorted(validated, key=lambda g: float(g.get("sharpe", -99)), reverse=True)[:5]
     baseline = next((g for g in population if g.get("is_baseline")), {})
+    baseline_sharpe = float(baseline.get("sharpe", 0.0)) if _is_current_validation(baseline) else 0.0
 
     lines = [
         f"  Shadow population: {len(population)} genomes  "
         f"({len(validated)} validated)  "
         f"generation {state.get('generation', 0)}",
-        f"  Baseline Sharpe: {float(baseline.get('sharpe', 0)):+.3f}",
+        f"  Baseline Sharpe: {baseline_sharpe:+.3f}",
         "  Top 5 validated genomes:",
     ]
     for i, g in enumerate(top5):
@@ -651,7 +753,8 @@ def run_historical_warmup(
     logger.info("  generations=%d  replay_years=%d", generations, replay_years)
     logger.info("=" * 60)
 
-    checkpoint_exists = bool(checkpoint_path and os.path.exists(checkpoint_path))
+    resolved_checkpoint = _resolve_shadow_checkpoint(checkpoint_path)
+    checkpoint_exists = bool(resolved_checkpoint)
     population = _init_population(live_config, checkpoint_exists)
 
     # Restrict features to the replay window
@@ -667,11 +770,11 @@ def run_historical_warmup(
 
         # Full replay validation of top 20
         population = validate_top_genomes(
-            population, df_hist, price_lookup, checkpoint_path,
+            population, df_hist, price_lookup, resolved_checkpoint,
             top_n=validation_top_n, replay_years=replay_years,
         )
 
-        validated = [g for g in population if g.get("validated")]
+        validated = [g for g in population if _is_current_validation(g)]
         if validated:
             best = max(validated, key=lambda g: float(g.get("sharpe", -99)))
             logger.info(
@@ -690,7 +793,7 @@ def run_historical_warmup(
 
     # Promote the best genome found across all generations
     promoted = False
-    validated = [g for g in population if g.get("validated") and not g.get("is_baseline")]
+    validated = [g for g in population if _is_current_validation(g) and not g.get("is_baseline")]
     if validated:
         best = max(validated, key=lambda g: float(g.get("sharpe", -99)))
         logger.info(
@@ -708,10 +811,10 @@ def run_historical_warmup(
         _write_config_key("avoid_earnings",     str(best["avoid_earnings"]),          config_path)
         _write_config_key("rl_exit_threshold",  f"{best['rl_exit_threshold']:.3f}",  config_path)
         _write_config_key("rl_conviction_drop", f"{best['rl_conviction_drop']:.3f}", config_path)
-        if best.get("rl_enabled") and checkpoint_path:
+        if best.get("rl_enabled") and resolved_checkpoint:
             _write_config_key("rl_enabled",         "true",          config_path)
             _write_config_key("rl_phase",            str(best.get("rl_phase", 1)), config_path)
-            _write_config_key("rl_checkpoint_path",  checkpoint_path, config_path)
+            _write_config_key("rl_checkpoint_path",  resolved_checkpoint, config_path)
         else:
             _write_config_key("rl_enabled", "false", config_path)
 
@@ -728,14 +831,15 @@ def run_historical_warmup(
         "last_validated":       date.today().isoformat(),
         "options_days_beating": 0,
         "baseline_sharpe":      float(next(
-            (g["sharpe"] for g in population if g.get("is_baseline")), 0.0
+            (g["sharpe"] for g in population if g.get("is_baseline") and _is_current_validation(g)),
+            0.0,
         )),
     }
     _save_state(state)
     logger.info(
         "Warm-up population saved (%d genomes, %d validated) → %s",
         len(population),
-        len([g for g in population if g.get("validated")]),
+        len([g for g in population if _is_current_validation(g)]),
         _STATE_FILE,
     )
     return promoted

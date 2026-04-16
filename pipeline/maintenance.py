@@ -149,7 +149,10 @@ def _check_autotune(state: dict, initial_cash: float) -> bool:
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-def run_maintenance(initial_cash: float = 10_000.0, save_dir: str = "models") -> None:
+def run_maintenance(
+    initial_cash: float = 10_000.0,
+    save_dir: str = "models",
+) -> dict[str, object]:
     """
     Run all staleness checks. Called at the top of every Broker.py cycle.
     Each task only runs if it's actually needed.
@@ -179,13 +182,23 @@ def run_maintenance(initial_cash: float = 10_000.0, save_dir: str = "models") ->
         except Exception:
             pass
 
-    _check_prices(state, universe)
-    _check_sentiment(state, universe)
-    _check_model(state, save_dir)
-    _check_autotune(state, initial_cash)
+    prices_ran = _check_prices(state, universe)
+    sentiment_ran = _check_sentiment(state, universe)
+    model_ran = _check_model(state, save_dir)
+    autotune_ran = _check_autotune(state, initial_cash)
 
     _save_state(state)
     logger.info("Maintenance check complete.")
+    return {
+        "prices_updated": state.get("prices_updated"),
+        "sentiment_updated": state.get("sentiment_updated"),
+        "model_finetuned": state.get("model_finetuned"),
+        "autotuned": state.get("autotuned"),
+        "prices_ran": prices_ran,
+        "sentiment_ran": sentiment_ran,
+        "model_ran": model_ran,
+        "autotune_ran": autotune_ran,
+    }
 
 
 def _setup_logging():

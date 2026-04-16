@@ -111,6 +111,51 @@ def test_run_replay_preserves_rl_entry_metadata(monkeypatch):
     assert captured["rl_entry_scores"][0] == 0.87
 
 
+def test_run_replay_accrues_cash_yield_on_idle_cash(monkeypatch):
+    dates = pd.to_datetime(["2024-01-02", "2025-01-02"])
+    index = pd.MultiIndex.from_product(
+        [dates, ["AAA"]],
+        names=["date", "ticker"],
+    )
+    df_features = pd.DataFrame(
+        {
+            "ret_1d": [0.0, 0.0],
+            "ret_5d": [0.0, 0.0],
+            "vol_ratio": [1.0, 1.0],
+            "sent_net": [0.0, 0.0],
+            "macd_hist": [0.0, 0.0],
+        },
+        index=index,
+    )
+    price_lookup = pd.DataFrame(
+        {
+            "close": [10.0, 10.0],
+            "volume": [1_000_000.0, 1_000_000.0],
+        },
+        index=index,
+    )
+
+    import broker.brain as brain_module
+
+    monkeypatch.setattr(
+        brain_module.BrokerBrain,
+        "run_cycle",
+        lambda self, df_slice, screener_top_n=100, risk_engine=None: [],
+    )
+
+    returns, trade_log = replay_module.run_replay(
+        df_features,
+        price_lookup,
+        strategy="heuristics_only",
+        rebalance_freq=1,
+        label="cash_yield_test",
+    )
+
+    assert trade_log == []
+    assert len(returns) >= 2
+    assert float(np.max(returns)) > 0.02
+
+
 def test_historical_feature_score_handles_normalized_features():
     strong_report = {
         "ret_5d": 1.6,

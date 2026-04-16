@@ -1,0 +1,4 @@
+# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\gymnasium\__init__.py
+# hypothesis_version: 6.151.9
+
+['1.2.0', 'ActionWrapper', 'Env', 'ObservationWrapper', 'RewardWrapper', 'Space', 'VectorizeMode', 'Wrapper', 'envs', 'error', 'experimental', 'gymnasium', 'hide', 'logger', 'make', 'make_vec', 'pprint_registry', 'register', 'register_envs', 'registry', 'spaces', 'spec', 'utils', 'vector', 'wrappers']

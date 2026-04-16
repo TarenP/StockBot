@@ -24,6 +24,14 @@ import logging
 from pathlib import Path
 from datetime import date
 
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if callable(_reconfigure):
+        try:
+            _reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 # ── Logging setup (before any imports that log) ───────────────────────────────
 Path("logs").mkdir(exist_ok=True)
 Path("plots").mkdir(exist_ok=True)
@@ -122,10 +130,13 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # ── Step 1: Maintenance — update stale data / model / params ─────────────
+    maintenance_context = None
     if not args.no_maintenance:
         try:
             from pipeline.maintenance import run_maintenance
-            run_maintenance(initial_cash=float(config.get("cash", 10_000)))
+            maintenance_context = run_maintenance(
+                initial_cash=float(config.get("cash", 10_000))
+            )
             # Reload config — maintenance may have updated it
             config = _load_config()
         except Exception as exc:
@@ -134,7 +145,7 @@ if __name__ == "__main__":
     # ── Step 2: Live trading cycle ────────────────────────────────────────────
     try:
         from broker.broker import main as broker_main
-        broker_main(config)
+        broker_main(config, maintenance_context=maintenance_context)
     except FileNotFoundError as exc:
         if "stooq_panel.parquet" in str(exc) or "Price data not found" in str(exc):
             print("\n" + "="*60)

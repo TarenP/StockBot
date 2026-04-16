@@ -125,10 +125,11 @@ def load_master(
     if not Path(price_path).exists():
         raise FileNotFoundError(
             f"\n\nPrice data not found at '{price_path}'.\n"
-            "You need to train the model first:\n\n"
+            "Bootstrap fresh market data with either:\n\n"
+            "    python Agent.py --mode update --force_refresh\n"
             "    python Agent.py --mode train --folds 10\n\n"
-            "This downloads historical data and trains the RL model (~2-6 hours).\n"
-            "After that, just run: python Broker.py"
+            "A clean training run will now fetch the initial parquet automatically.\n"
+            "After training completes, just run: python Broker.py"
         )
     df_prices = pd.read_parquet(price_path)
 

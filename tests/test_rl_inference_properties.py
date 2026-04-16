@@ -11,8 +11,9 @@ Properties tested:
   1.4 z-score idempotency  — normalising twice == normalising once
 """
 
+import io
 import os
-import tempfile
+import uuid
 from unittest.mock import patch
 
 import numpy as np
@@ -36,6 +37,30 @@ from pipeline.model import PortfolioTransformer
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 N_FEATURES = len(FEATURE_COLS)
+_CHECKPOINT_REGISTRY: dict[str, bytes] = {}
+
+
+@pytest.fixture(autouse=True)
+def _memory_checkpoint_loader(monkeypatch):
+    import pipeline.rl_inference as rl_mod
+
+    orig_exists = rl_mod.os.path.exists
+    orig_load = rl_mod.torch.load
+
+    def _patched_exists(path):
+        if isinstance(path, str) and path in _CHECKPOINT_REGISTRY:
+            return True
+        return orig_exists(path)
+
+    def _patched_load(path, *args, **kwargs):
+        if isinstance(path, str) and path in _CHECKPOINT_REGISTRY:
+            return orig_load(io.BytesIO(_CHECKPOINT_REGISTRY[path]), *args, **kwargs)
+        return orig_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(rl_mod.os.path, "exists", _patched_exists)
+    monkeypatch.setattr(rl_mod.torch, "load", _patched_load)
+    yield
+    _CHECKPOINT_REGISTRY.clear()
 
 
 def _make_df_recent(
@@ -88,10 +113,10 @@ def _make_checkpoint(
         "val_sharpe": 0.5,
     }
 
-    if tmp_dir is None:
-        tmp_dir = tempfile.mkdtemp()
-    path = os.path.join(tmp_dir, "test_checkpoint.pt")
-    torch.save(ckpt, path)
+    path = f"memory://{uuid.uuid4().hex}.pt"
+    buffer = io.BytesIO()
+    torch.save(ckpt, buffer)
+    _CHECKPOINT_REGISTRY[path] = buffer.getvalue()
     return path
 
 
@@ -136,18 +161,17 @@ def test_determinism_rank_mode(asset_list, n_dates, seed):
     import pipeline.rl_inference as rl_mod
     rl_mod._MODEL_CACHE.clear()
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        ckpt_path = _make_checkpoint(asset_list, lookback=20, tmp_dir=tmp_dir)
-        df = _make_df_recent(asset_list, n_dates, seed=seed)
+    ckpt_path = _make_checkpoint(asset_list, lookback=20)
+    df = _make_df_recent(asset_list, n_dates, seed=seed)
 
-        result1 = get_rl_targets(
-            df, asset_list, ckpt_path, mode="rank",
-            device=torch.device("cpu"), lookback=20,
-        )
-        result2 = get_rl_targets(
-            df, asset_list, ckpt_path, mode="rank",
-            device=torch.device("cpu"), lookback=20,
-        )
+    result1 = get_rl_targets(
+        df, asset_list, ckpt_path, mode="rank",
+        device=torch.device("cpu"), lookback=20,
+    )
+    result2 = get_rl_targets(
+        df, asset_list, ckpt_path, mode="rank",
+        device=torch.device("cpu"), lookback=20,
+    )
 
     pd.testing.assert_series_equal(result1, result2)
 
@@ -172,18 +196,17 @@ def test_determinism_weights_mode(asset_list, n_dates, seed):
     import pipeline.rl_inference as rl_mod
     rl_mod._MODEL_CACHE.clear()
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        ckpt_path = _make_checkpoint(asset_list, lookback=20, tmp_dir=tmp_dir)
-        df = _make_df_recent(asset_list, n_dates, seed=seed)
+    ckpt_path = _make_checkpoint(asset_list, lookback=20)
+    df = _make_df_recent(asset_list, n_dates, seed=seed)
 
-        result1 = get_rl_targets(
-            df, asset_list, ckpt_path, mode="weights",
-            device=torch.device("cpu"), lookback=20,
-        )
-        result2 = get_rl_targets(
-            df, asset_list, ckpt_path, mode="weights",
-            device=torch.device("cpu"), lookback=20,
-        )
+    result1 = get_rl_targets(
+        df, asset_list, ckpt_path, mode="weights",
+        device=torch.device("cpu"), lookback=20,
+    )
+    result2 = get_rl_targets(
+        df, asset_list, ckpt_path, mode="weights",
+        device=torch.device("cpu"), lookback=20,
+    )
 
     pd.testing.assert_series_equal(result1, result2)
 
@@ -211,14 +234,13 @@ def test_weights_sum_to_one(asset_list, n_dates, seed):
     import pipeline.rl_inference as rl_mod
     rl_mod._MODEL_CACHE.clear()
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        ckpt_path = _make_checkpoint(asset_list, lookback=20, tmp_dir=tmp_dir)
-        df = _make_df_recent(asset_list, n_dates, seed=seed)
+    ckpt_path = _make_checkpoint(asset_list, lookback=20)
+    df = _make_df_recent(asset_list, n_dates, seed=seed)
 
-        result = get_rl_targets(
-            df, asset_list, ckpt_path, mode="weights",
-            device=torch.device("cpu"), lookback=20,
-        )
+    result = get_rl_targets(
+        df, asset_list, ckpt_path, mode="weights",
+        device=torch.device("cpu"), lookback=20,
+    )
 
     assert abs(result.sum() - 1.0) <= 1e-5, (
         f"Weights sum to {result.sum():.8f}, expected 1.0 ± 1e-5. "
@@ -248,14 +270,13 @@ def test_rank_scores_in_unit_interval(asset_list, n_dates, seed):
     import pipeline.rl_inference as rl_mod
     rl_mod._MODEL_CACHE.clear()
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        ckpt_path = _make_checkpoint(asset_list, lookback=20, tmp_dir=tmp_dir)
-        df = _make_df_recent(asset_list, n_dates, seed=seed)
+    ckpt_path = _make_checkpoint(asset_list, lookback=20)
+    df = _make_df_recent(asset_list, n_dates, seed=seed)
 
-        result = get_rl_targets(
-            df, asset_list, ckpt_path, mode="rank",
-            device=torch.device("cpu"), lookback=20,
-        )
+    result = get_rl_targets(
+        df, asset_list, ckpt_path, mode="rank",
+        device=torch.device("cpu"), lookback=20,
+    )
 
     assert (result >= 0.0).all(), (
         f"Some rl_scores are negative: {result[result < 0.0]}"
@@ -335,12 +356,11 @@ def test_insufficient_history_assigns_zero():
     # Only 5 dates — less than lookback=20
     df = _make_df_recent(asset_list, n_dates=5, seed=42)
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        ckpt_path = _make_checkpoint(asset_list, lookback=20, tmp_dir=tmp_dir)
-        result = get_rl_targets(
-            df, asset_list, ckpt_path, mode="rank",
-            device=torch.device("cpu"), lookback=20,
-        )
+    ckpt_path = _make_checkpoint(asset_list, lookback=20)
+    result = get_rl_targets(
+        df, asset_list, ckpt_path, mode="rank",
+        device=torch.device("cpu"), lookback=20,
+    )
 
     assert (result == 0.0).all(), (
         f"Expected all zeros for insufficient history, got: {result}"

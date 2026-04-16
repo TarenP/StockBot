@@ -131,6 +131,103 @@ def research(ticker: str, days: int = 90) -> dict | None:
     return report
 
 
+def research_from_features(
+    df_features: pd.DataFrame,
+    ticker: str,
+    as_of_date=None,
+) -> dict | None:
+    """
+    Build a research report from the latest locally cached feature snapshot.
+
+    This keeps the broker tradable when per-ticker live fetches fail after the
+    daily pipeline has already prepared a fresh local dataset for the cycle.
+    Requires `close` and `volume` raw columns to be present in df_features.
+    """
+    try:
+        ticker = ticker.upper()
+        ticker_data = df_features.xs(ticker, level="ticker")
+        if ticker_data.empty:
+            return None
+
+        if as_of_date is None:
+            as_of_date = ticker_data.index.max()
+
+        ticker_data = ticker_data[ticker_data.index <= as_of_date]
+        if ticker_data.empty:
+            return None
+
+        latest = ticker_data.iloc[-1]
+        price = float(latest.get("close", np.nan))
+        volume = float(latest.get("volume", 0.0))
+        if not np.isfinite(price) or price <= 0:
+            return None
+        if not np.isfinite(volume) or volume <= 0:
+            return None
+
+        report = {
+            "ticker": ticker,
+            "price": price,
+            "volume": volume,
+            "headlines": [],
+        }
+        for col in FEATURE_COLS:
+            val = latest.get(col, np.nan)
+            report[col] = float(val) if pd.notna(val) else 0.0
+
+        sent_net = float(report.get("sent_net", 0.0))
+        pos_score = float(np.clip(report.get("sent_pos_raw", 0.45), 0.0, 1.0))
+        neg_score = float(np.clip(pos_score - sent_net, 0.0, 1.0))
+        if sent_net > 1e-6:
+            label = "positive"
+        elif sent_net < -1e-6:
+            label = "negative"
+        else:
+            label = "neutral"
+
+        sent = {
+            "pos_score": pos_score,
+            "neg_score": neg_score,
+            "neutral_score": float(np.clip(1.0 - pos_score - neg_score, 0.0, 1.0)),
+            "sentiment": label,
+            "headlines": [],
+            "sent_net": sent_net,
+        }
+        report["sentiment"] = sent
+        report["composite_score"] = _feature_snapshot_score(report)
+        return report
+    except Exception:
+        return None
+
+
+def _feature_snapshot_score(report: dict) -> float:
+    """
+    Score a locally cached feature snapshot.
+
+    The broker's live analyst score expects raw indicator scales from fresh
+    downloads; the cycle snapshot is already cross-sectionally normalized.
+    This bounded variant mirrors replay scoring so local fallbacks stay aligned
+    with the data the broker actually screened on.
+    """
+    def _bounded(value: float, scale: float = 1.0) -> float:
+        return float(np.tanh(float(value) / max(scale, 1e-6)))
+
+    score = 0.5
+    score += 0.12 * _bounded(report.get("ret_5d", 0.0), 1.0)
+    score += 0.08 * _bounded(report.get("ret_20d", 0.0), 1.0)
+    score += 0.10 * _bounded(report.get("macd_hist", 0.0), 1.0)
+    score += 0.08 * _bounded(report.get("vol_ratio", 0.0), 1.0)
+    score += 0.06 * _bounded(report.get("vol_zscore", 0.0), 1.0)
+    score += 0.06 * _bounded(report.get("price_pos_52w", 0.0), 1.0)
+    score += 0.12 * _bounded(report.get("sent_net", 0.0), 1.0)
+    score += 0.10 * _bounded(report.get("sent_surprise", 0.0), 1.0)
+    score += 0.06 * _bounded(report.get("sent_accel", 0.0), 1.0)
+    score += 0.04 * _bounded(report.get("sent_trend", 0.0), 1.0)
+    score += 0.04 * max(0.0, 1.0 - min(abs(float(report.get("rsi", 0.0))) / 3.0, 1.0))
+    score += 0.04 * max(0.0, 1.0 - min(abs(float(report.get("bb_pct", 0.0))) / 3.0, 1.0))
+    score += 0.04 * max(0.0, 1.0 - min(max(float(report.get("atr", 0.0)), 0.0) / 3.0, 1.0))
+    return float(np.clip(score, 0.0, 1.0))
+
+
 def _composite_score(report: dict, sent: dict) -> float:
     """
     Simple weighted signal score in [0, 1].

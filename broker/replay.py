@@ -21,11 +21,14 @@ Usage:
 
 import logging
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import MethodType
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+from broker.portfolio import CASH_YIELD_ANNUAL_RATE, DAYS_PER_YEAR
 
 logger = logging.getLogger(__name__)
 _REPLAY_MIN_PRICE = 0.01
@@ -310,6 +313,7 @@ class ReplayPortfolio:
         self.cash         = initial_cash
         self.positions    = {}
         self.trade_log    = []
+        self.cash_yield_last_date = None
 
     def buy(self, ticker: str, shares: float, price: float, reason: str = "") -> bool:
         cost = shares * price
@@ -357,6 +361,25 @@ class ReplayPortfolio:
         for ticker, price in prices.items():
             if ticker in self.positions and price > 0:
                 self.positions[ticker]["last_price"] = price
+
+    def accrue_cash_yield(self, as_of_date, annual_rate: float = CASH_YIELD_ANNUAL_RATE) -> float:
+        current_date = pd.Timestamp(as_of_date).date()
+        if self.cash_yield_last_date is None:
+            self.cash_yield_last_date = current_date
+            return 0.0
+        if current_date <= self.cash_yield_last_date:
+            return 0.0
+
+        last_date = self.cash_yield_last_date
+        self.cash_yield_last_date = current_date
+        if self.cash <= 0 or annual_rate <= 0:
+            return 0.0
+
+        days_elapsed = (current_date - last_date).days
+        growth = (1.0 + annual_rate) ** (days_elapsed / DAYS_PER_YEAR)
+        starting_cash = self.cash
+        self.cash *= growth
+        return self.cash - starting_cash
 
     @property
     def equity(self) -> float:
@@ -450,6 +473,7 @@ def run_replay(
 
     for i in pbar:
         date = dates[i]
+        portfolio.accrue_cash_yield(date)
 
         # Update prices for held positions
         if portfolio.positions:
@@ -821,6 +845,7 @@ def _run_replay_v2(
         )
         for i in pbar:
             date = dates[i]
+            portfolio.accrue_cash_yield(date)
             if portfolio.positions:
                 prices = {}
                 for ticker in list(portfolio.positions.keys()):
@@ -1016,6 +1041,7 @@ def _run_replay_v2(
 
         for i in pbar:
             date = dates[i]
+            portfolio.accrue_cash_yield(date)
             if portfolio.positions:
                 prices = {}
                 for ticker in list(portfolio.positions.keys()):
@@ -1073,25 +1099,61 @@ def _run_replay_v2(
 run_replay = _run_replay_v2
 
 
+def _resolve_replay_strategy(live_config: dict | None = None) -> str:
+    import os
+    from pipeline.screener import SCREENER_CKPT
+
+    live_config = live_config or {}
+    if live_config.get("rl_enabled", False):
+        return "screener_rl"
+    if os.path.exists(SCREENER_CKPT):
+        return "screener_heuristics"
+    return "heuristics_only"
+
+
+def _replay_kwargs_from_live_config(live_config: dict | None = None) -> dict:
+    live_config = live_config or {}
+    return {
+        "max_positions": int(live_config.get("max_positions", 20)),
+        "min_score": float(live_config.get("min_score", 0.60)),
+        "stop_loss_floor": float(live_config.get("stop_loss", 0.07)),
+        "take_profit": float(live_config.get("take_profit", 0.45)),
+        "partial_profit_pct": float(live_config.get("partial_profit", 0.20)),
+        "penny_pct": float(live_config.get("penny_pct", 0.20)),
+        "max_sector_pct": float(live_config.get("max_sector", 0.40)),
+        "max_pair_correlation": float(live_config.get("max_correlation", 0.80)),
+        "avoid_earnings_days": int(live_config.get("avoid_earnings", 3)),
+        "execution_spread": float(live_config.get("execution_spread", 0.001)),
+        "rl_phase": int(live_config.get("rl_phase", 1)),
+        "rl_exit_threshold": float(live_config.get("rl_exit_threshold", 0.30)),
+        "rl_conviction_drop": float(live_config.get("rl_conviction_drop", 0.20)),
+        "rl_min_score": float(live_config.get("rl_min_score", 0.0)),
+    }
+
+
 def run_sensitivity(
     df_features: pd.DataFrame,
     price_lookup: pd.DataFrame,
     initial_cash: float = 10_000.0,
+    live_config: dict | None = None,
+    strategy: str | None = None,
+    checkpoint_path: str | None = None,
 ) -> pd.DataFrame:
     """
-    Run the replay across a grid of parameter perturbations.
-    Shows whether results are robust or knife-edge.
+    Run the replay across a grid of parameter perturbations around the
+    current live config. Shows whether results are robust or knife-edge.
     """
-    from pipeline.benchmark import compute_metrics, fetch_spy_returns
+    from pipeline.benchmark import compute_metrics
 
-    base = dict(min_score=0.60, stop_loss_floor=0.07,
-                take_profit=0.45, penny_pct=0.20, execution_spread=0.001)
+    base = _replay_kwargs_from_live_config(live_config)
+    strategy = strategy or _resolve_replay_strategy(live_config)
 
-    grid = [
-        # Vary min_score
+    scenarios = [
+        {**base, "label": "current_config (base)"},
+        # Vary min_score while keeping the rest of the live config fixed.
         {**base, "min_score": 0.50, "label": "min_score=0.50"},
         {**base, "min_score": 0.55, "label": "min_score=0.55"},
-        {**base, "min_score": 0.60, "label": "min_score=0.60 (base)"},
+        {**base, "min_score": 0.60, "label": "min_score=0.60"},
         {**base, "min_score": 0.65, "label": "min_score=0.65"},
         {**base, "min_score": 0.70, "label": "min_score=0.70"},
         # Vary stop-loss
@@ -1100,18 +1162,32 @@ def run_sensitivity(
         {**base, "stop_loss_floor": 0.15, "label": "stop=15%"},
         # Vary execution cost
         {**base, "execution_spread": 0.0005, "label": "spread=5bps"},
-        {**base, "execution_spread": 0.002,  "label": "spread=20bps"},
-        {**base, "execution_spread": 0.005,  "label": "spread=50bps"},
+        {**base, "execution_spread": 0.0020, "label": "spread=20bps"},
+        {**base, "execution_spread": 0.0050, "label": "spread=50bps"},
         # Vary take-profit
         {**base, "take_profit": 0.30, "label": "tp=30%"},
         {**base, "take_profit": 0.60, "label": "tp=60%"},
     ]
 
     rows = []
-    for params in grid:
+    seen = set()
+    for scenario in scenarios:
+        params = dict(scenario)
         label = params.pop("label")
-        rets, _ = run_replay(df_features, price_lookup,
-                             initial_cash=initial_cash, label=label, **params)
+        key = tuple(sorted(params.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        rets, _ = run_replay(
+            df_features,
+            price_lookup,
+            strategy=strategy,
+            checkpoint_path=checkpoint_path,
+            initial_cash=initial_cash,
+            label=label,
+            **params,
+        )
         m = compute_metrics(rets, label)
         rows.append({
             "params":       label,
@@ -1139,12 +1215,7 @@ def run_full_replay(
     """
     Run the full broker replay and print a side-by-side report vs SPY.
     """
-    from pipeline.benchmark import (
-        fetch_spy_returns, compute_metrics, benchmark_vs_spy,
-        print_benchmark_report, plot_benchmark,
-    )
-    import os
-    from pipeline.screener import SCREENER_CKPT
+    from pipeline.benchmark import fetch_spy_returns, print_benchmark_report, plot_benchmark
 
     # Restrict to replay window
     dates  = sorted(df_features.index.get_level_values("date").unique())
@@ -1162,12 +1233,8 @@ def run_full_replay(
     price_lookup = _build_price_lookup()
 
     live_config = live_config or {}
-    if live_config.get("rl_enabled", False):
-        strategy = "screener_rl"
-    elif os.path.exists(SCREENER_CKPT):
-        strategy = "screener_heuristics"
-    else:
-        strategy = "heuristics_only"
+    strategy = _resolve_replay_strategy(live_config)
+    replay_kwargs = _replay_kwargs_from_live_config(live_config)
 
     # Run broker replay
     logger.info("Running broker replay...")
@@ -1177,19 +1244,8 @@ def run_full_replay(
         strategy=strategy,
         checkpoint_path=checkpoint_path,
         initial_cash=initial_cash,
-        min_score=float(live_config.get("min_score", 0.60)),
-        stop_loss_floor=float(live_config.get("stop_loss", 0.07)),
-        take_profit=float(live_config.get("take_profit", 0.45)),
-        partial_profit_pct=float(live_config.get("partial_profit", 0.20)),
-        penny_pct=float(live_config.get("penny_pct", 0.20)),
-        max_sector_pct=float(live_config.get("max_sector", 0.40)),
-        max_pair_correlation=float(live_config.get("max_correlation", 0.80)),
-        avoid_earnings_days=int(live_config.get("avoid_earnings", 3)),
-        rl_phase=int(live_config.get("rl_phase", 1)),
-        rl_exit_threshold=float(live_config.get("rl_exit_threshold", 0.30)),
-        rl_conviction_drop=float(live_config.get("rl_conviction_drop", 0.20)),
-        rl_min_score=float(live_config.get("rl_min_score", 0.0)),
         label="Broker",
+        **replay_kwargs,
     )
 
     # Fetch SPY for same period
@@ -1198,6 +1254,8 @@ def run_full_replay(
         end=(replay_dates[-1] + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
     )
     spy_rets = spy_series.values[:len(broker_rets)] if not spy_series.empty else None
+    if spy_rets is None:
+        logger.warning("SPY benchmark unavailable for this replay run; skipping relative comparisons.")
 
     # Equal-weight baseline (buy-and-hold all tickers equally)
     logger.info("Computing equal-weight baseline...")
@@ -1206,7 +1264,7 @@ def run_full_replay(
     # Print report
     print_benchmark_report(
         broker_rets,
-        spy_rets if spy_rets is not None else np.zeros_like(broker_rets),
+        spy_rets,
         ew_rets=ew_rets,
         label="Broker Replay",
     )
@@ -1214,7 +1272,7 @@ def run_full_replay(
     # Plot
     plot_benchmark(
         broker_rets,
-        spy_rets if spy_rets is not None else np.zeros_like(broker_rets),
+        spy_rets,
         ew_rets=ew_rets,
         save_path=save_plot,
         label="Broker Replay",
@@ -1230,7 +1288,14 @@ def run_full_replay(
     # Sensitivity sweep
     if run_sensitivity_sweep:
         logger.info("\nRunning sensitivity sweep...")
-        sens_df = run_sensitivity(df_replay, price_lookup, initial_cash)
+        sens_df = run_sensitivity(
+            df_replay,
+            price_lookup,
+            initial_cash=initial_cash,
+            live_config=live_config,
+            strategy=strategy,
+            checkpoint_path=checkpoint_path,
+        )
         print(f"\n{'='*72}")
         print("  Sensitivity Analysis — does performance hold across parameter changes?")
         print(f"{'='*72}")
@@ -1245,6 +1310,9 @@ def run_full_replay(
             }
         ))
         print(f"{'='*72}\n")
+        sens_path = Path(save_plot).with_name(f"{Path(save_plot).stem}_sensitivity.csv")
+        sens_df.to_csv(sens_path, index=False)
+        logger.info("Sensitivity sweep saved -> %s", sens_path)
 
         # Flag if results are knife-edge
         sharpes = sens_df["sharpe"].values
@@ -1352,6 +1420,19 @@ def run_ablation(
     checkpoint_path: str | None = None,
     initial_cash: float = 10_000.0,
     replay_years: int = 3,
+    max_positions: int = 20,
+    min_score: float = 0.60,
+    stop_loss_floor: float = 0.07,
+    take_profit: float = 0.45,
+    partial_profit_pct: float = 0.20,
+    penny_pct: float = 0.20,
+    max_sector_pct: float = 0.40,
+    max_pair_correlation: float = 0.80,
+    avoid_earnings_days: int = 3,
+    rl_phase: int = 1,
+    rl_exit_threshold: float = 0.30,
+    rl_conviction_drop: float = 0.20,
+    rl_min_score: float = 0.0,
     save_report: str = "plots/ablation_report.csv",
     save_plot: str = "plots/ablation.png",
 ) -> pd.DataFrame:
@@ -1432,6 +1513,19 @@ def run_ablation(
             strategy=strategy,
             checkpoint_path=ckpt,
             initial_cash=initial_cash,
+            max_positions=max_positions,
+            min_score=min_score,
+            stop_loss_floor=stop_loss_floor,
+            take_profit=take_profit,
+            partial_profit_pct=partial_profit_pct,
+            penny_pct=penny_pct,
+            max_sector_pct=max_sector_pct,
+            max_pair_correlation=max_pair_correlation,
+            avoid_earnings_days=avoid_earnings_days,
+            rl_phase=rl_phase,
+            rl_exit_threshold=rl_exit_threshold,
+            rl_conviction_drop=rl_conviction_drop,
+            rl_min_score=rl_min_score,
             label=strategy,
         )
 

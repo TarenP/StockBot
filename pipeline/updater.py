@@ -11,6 +11,7 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timedelta
+from math import ceil
 
 import pandas as pd
 import yfinance as yf
@@ -36,6 +37,99 @@ def _suppress_stderr():
 
 PARQUET_PATH = Path("MasterDS/stooq_panel.parquet")
 CHUNK_SIZE   = 50   # tickers per yfinance batch request
+
+
+def _is_bootstrap_symbol(ticker: str) -> bool:
+    ticker = str(ticker).strip().upper()
+    if not ticker:
+        return False
+    return all(ch.isalnum() or ch in {"-", "."} for ch in ticker)
+
+
+def _bootstrap_universe(target_size: int = 1500) -> list[str]:
+    """
+    Build an initial candidate universe for a fresh install with no parquet
+    and no checkpoint yet.
+
+    The goal here is breadth, not perfection: gather a few hundred to a few
+    thousand reasonably liquid US tickers, then let the downloader silently
+    skip symbols that do not return usable history.
+    """
+    from broker.sectors import get_cached_sector_map
+
+    target_size = max(int(target_size or 0), 250)
+    candidate_target = max(target_size * 2, target_size + 250)
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(symbols) -> None:
+        for symbol in symbols:
+            ticker = str(symbol).strip().upper()
+            if not _is_bootstrap_symbol(ticker) or ticker in seen:
+                continue
+            seen.add(ticker)
+            candidates.append(ticker)
+
+    # Seed with the built-in static sector map so even partial scraping still
+    # yields a sane starter universe.
+    _add(get_cached_sector_map().keys())
+
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
+    max_pages = min(max(ceil(candidate_target / 20), 5), 250)
+    empty_pages = 0
+
+    for page in range(max_pages):
+        start_row = 1 + (page * 20)
+        url = f"https://finviz.com/screener.ashx?v=111&o=-volume&r={start_row}"
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            from bs4 import BeautifulSoup
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            page_symbols = [
+                cell.get_text(strip=True).upper()
+                for cell in soup.find_all("a", class_="screener-link-primary")
+            ]
+            before = len(candidates)
+            _add(page_symbols)
+            if len(candidates) == before:
+                empty_pages += 1
+                if empty_pages >= 3:
+                    break
+            else:
+                empty_pages = 0
+            if len(candidates) >= candidate_target:
+                break
+        except Exception as exc:
+            logger.debug("Bootstrap universe scrape failed on page %d: %s", page + 1, exc)
+            if page >= 2 and len(candidates) >= target_size:
+                break
+        time.sleep(0.15)
+
+    # Add a small set of trending names as a final supplement when scraping was
+    # thin or partially blocked.
+    if len(candidates) < target_size:
+        try:
+            response = requests.get(
+                "https://finance.yahoo.com/trending-tickers",
+                headers=headers,
+                timeout=10,
+            )
+            if response.status_code == 200:
+                from bs4 import BeautifulSoup
+
+                soup = BeautifulSoup(response.text, "html.parser")
+                _add(a["data-symbol"] for a in soup.find_all("a", {"data-symbol": True}))
+        except Exception as exc:
+            logger.debug("Bootstrap universe trending supplement failed: %s", exc)
+
+    logger.info(
+        "Bootstrapped %d candidate tickers for initial market download.",
+        len(candidates),
+    )
+    return candidates
 
 
 def _load_trained_universe(save_dir: str = "models") -> list[str] | None:
@@ -127,6 +221,7 @@ def update_parquet(
     universe: list[str] | None = None,
     force_full_refresh: bool = False,
     save_dir: str = "models",
+    bootstrap_universe_size: int | None = None,
 ) -> int:
     """
     Append new trading days to the master parquet.
@@ -139,6 +234,9 @@ def update_parquet(
         universe:           explicit list of tickers to update
         force_full_refresh: re-download the last 30 days (fixes gaps)
         save_dir:           where to look for checkpoints
+        bootstrap_universe_size:
+            first-run fallback when there is no checkpoint and no existing
+            parquet yet. Ignored once either of those exists.
 
     Returns:
         Number of new rows appended.
@@ -165,7 +263,18 @@ def update_parquet(
         )
         universe = existing["ticker"].unique().tolist()
     elif universe is None:
-        raise ValueError("No universe and no existing parquet. Run --mode train first.")
+        bootstrap_target = int(bootstrap_universe_size or 1500)
+        logger.warning(
+            "No checkpoint, no explicit universe, and no existing parquet found. "
+            "Bootstrapping an initial download universe (~%d symbols).",
+            bootstrap_target,
+        )
+        universe = _bootstrap_universe(bootstrap_target)
+        if not universe:
+            raise ValueError(
+                "Could not bootstrap an initial ticker universe. "
+                "Check network access and retry --mode update or --mode train."
+            )
 
     logger.info(f"Updating {len(universe)} tickers.")
 

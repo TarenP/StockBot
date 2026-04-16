@@ -1,0 +1,4 @@
+# file: C:\Users\taren\Documents\Github Repositories\StockBot\broker\validator.py
+# hypothesis_version: 6.151.9
+
+[0.0, 0.001, 0.3, 0.7, 200, 1000000, ' | ', ',', '5d', 'Close', 'No recent news found', 'User-Agent', 'acquisition', 'approval', 'bankruptcy', 'beat', 'buyout', 'date', 'delisted', 'dilut', 'dividend', 'downgrade', 'earnings', 'fda', 'fraud', 'guidance', 'html.parser', 'last_price', 'lawsuit', 'merger', 'miss', 'offering', 'profit', 'quote-price', 'revenue', 'sec', 'short', 'snapshot-td2', 'split', 'squeeze', 'strong', 'td', 'title', 'upgrade', 'w']

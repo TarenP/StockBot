@@ -20,7 +20,7 @@ import torch
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from broker.analyst   import research, fetch_ticker_data
+from broker.analyst   import research, fetch_ticker_data, research_from_features
 from broker.portfolio import Portfolio
 from broker.sectors   import (
     get_sectors_bulk, score_sectors, compute_target_allocations,
@@ -184,6 +184,7 @@ class BrokerBrain:
         # rl_scores must be computed first so exits use the cross-sectional pass.
         # The actual call is made after step 6 below.
         rl_exited_tickers: set[str] = set()
+        local_research_fallbacks = 0
 
         # ── 4. Heuristic exit decisions ───────────────────────────────────────
         # (RL-exited tickers are excluded once rl_exited_tickers is populated)
@@ -233,7 +234,9 @@ class BrokerBrain:
                 continue
 
             # Signal deterioration check
-            report = research(ticker)
+            report, used_local_research = self._research_with_fallback(ticker, df_features)
+            if used_local_research:
+                local_research_fallbacks += 1
             if report and report["composite_score"] < 0.35:
                 decisions.append(Decision(
                     action="SELL", ticker=ticker,
@@ -349,7 +352,9 @@ class BrokerBrain:
                     logger.debug(f"Skipping {ticker} — near earnings window")
                     continue
 
-                report = research(ticker)
+                report, used_local_research = self._research_with_fallback(ticker, df_features)
+                if used_local_research:
+                    local_research_fallbacks += 1
                 if report is None:
                     research_none_skips += 1
                     continue
@@ -435,6 +440,12 @@ class BrokerBrain:
                     earnings_skips,
                     research_none_skips,
                     threshold_skips,
+                )
+
+            if local_research_fallbacks:
+                logger.info(
+                    "Research fallback used local feature snapshots for %d ticker(s).",
+                    local_research_fallbacks,
                 )
 
             equity      = self.portfolio.equity
@@ -604,6 +615,24 @@ class BrokerBrain:
                 risk_blocked_skips,
                 tiny_alloc_skips,
             )
+            if buyable_count == 0:
+                logger.info(
+                    "Buy funnel: researched=%d slots=%d buys=%d held=%d earnings=%d "
+                    "no_research=%d threshold=%d penny_blocked=%d sector_blocked=%d "
+                    "corr_blocked=%d risk_blocked=%d tiny_alloc=%d",
+                    len(researched),
+                    n_slots,
+                    buyable_count,
+                    already_held_skips,
+                    earnings_skips,
+                    research_none_skips,
+                    threshold_skips,
+                    penny_budget_skips,
+                    sector_budget_skips,
+                    correlation_blocked_skips,
+                    risk_blocked_skips,
+                    tiny_alloc_skips,
+                )
 
         # ── 8. Options decisions (suppressed when RL enabled) ─────────────────
         if not self.rl_enabled:
@@ -616,6 +645,18 @@ class BrokerBrain:
         return decisions
 
     # ── Volatility-adjusted stop-loss ─────────────────────────────────────────
+
+    def _research_with_fallback(
+        self,
+        ticker: str,
+        df_features: pd.DataFrame,
+    ) -> tuple[dict | None, bool]:
+        report = research(ticker)
+        if report is not None:
+            return report, False
+
+        fallback = research_from_features(df_features, ticker)
+        return fallback, fallback is not None
 
     def _get_stop_loss_pct(self, ticker: str, pos: dict) -> float:
         """
