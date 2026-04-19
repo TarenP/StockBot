@@ -5,7 +5,6 @@ computes features, and returns a scored research report.
 Used by the broker brain to investigate specific stocks.
 """
 
-
 import logging
 import os
 import sys
