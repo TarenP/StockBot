@@ -868,7 +868,33 @@ def run_screener(
         )
 
     model = load_screener(device)
-    feat_cols = [c for c in FEATURE_COLS if c in df.columns]
+
+    # Use the feature columns the model was trained on, not the current FEATURE_COLS.
+    # If FEATURE_COLS has grown since training, the checkpoint's input_proj layer
+    # will have the wrong input size. Use the saved feature_cols list if present,
+    # otherwise fall back to the first n_features columns from FEATURE_COLS.
+    ckpt_feat_cols = getattr(model, "_feature_cols", None)
+    if ckpt_feat_cols:
+        feat_cols = [c for c in ckpt_feat_cols if c in df.columns]
+    else:
+        # Legacy checkpoint without saved feature_cols — infer from model size
+        ckpt_n_features = model.input_proj.in_features if hasattr(model, "input_proj") else len(FEATURE_COLS)
+        feat_cols = [c for c in FEATURE_COLS[:ckpt_n_features] if c in df.columns]
+
+    if len(feat_cols) != (len(ckpt_feat_cols) if ckpt_feat_cols else ckpt_n_features):
+        logger.warning(
+            "Screener checkpoint expects %d features but only %d are available in df. "
+            "Missing features will be zero-filled.",
+            len(ckpt_feat_cols) if ckpt_feat_cols else ckpt_n_features,
+            len(feat_cols),
+        )
+        # Pad feat_cols to expected length with zeros for missing columns
+        expected = ckpt_feat_cols if ckpt_feat_cols else FEATURE_COLS[:ckpt_n_features]
+        for col in expected:
+            if col not in df.columns:
+                df = df.copy()
+                df[col] = 0.0
+        feat_cols = [c for c in expected if c in df.columns]
     dates = sorted(df.index.get_level_values("date").unique())
     if len(dates) < LOOKBACK:
         raise ValueError(

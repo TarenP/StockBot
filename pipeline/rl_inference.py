@@ -268,9 +268,32 @@ def get_rl_targets(
         or os.path.isdir(checkpoint_path)
     )
 
+    # ── Load model(s) first to determine expected n_features ─────────────────
+    # The checkpoint was trained with a specific n_features. If FEATURE_COLS
+    # has grown (e.g. new market context / fundamental / regime features were
+    # added), we must slice the observation tensor to match the checkpoint.
+    if use_ensemble:
+        models_dir = "models" if checkpoint_path == "auto" else checkpoint_path
+        ensemble = _load_ensemble(models_dir, device)
+        # Use the first checkpoint's n_features as the canonical value
+        ckpt_n_features = ensemble[0][1].get("model_cfg", {}).get("n_features", len(FEATURE_COLS))
+    else:
+        model, ckpt = _load_model(checkpoint_path, device)
+        ckpt_n_features = ckpt.get("model_cfg", {}).get("n_features", len(FEATURE_COLS))
+
+    # Select only the features the model was trained on.
+    # New features added after training are silently dropped for inference.
+    feature_cols_for_inference = FEATURE_COLS[:ckpt_n_features]
+    if ckpt_n_features != len(FEATURE_COLS):
+        logger.info(
+            "Checkpoint trained with %d features; current FEATURE_COLS has %d. "
+            "Using first %d features for inference. Retrain to use all features.",
+            ckpt_n_features, len(FEATURE_COLS), ckpt_n_features,
+        )
+
     # ── Build observation tensor ──────────────────────────────────────────────
     obs_t, insufficient, padding_mask = _build_obs_tensor(
-        df_recent, asset_list, FEATURE_COLS, lookback, device
+        df_recent, asset_list, feature_cols_for_inference, lookback, device
     )
 
     if insufficient:
@@ -283,8 +306,6 @@ def get_rl_targets(
 
     if use_ensemble:
         # ── Ensemble inference ────────────────────────────────────────────────
-        models_dir = "models" if checkpoint_path == "auto" else checkpoint_path
-        ensemble = _load_ensemble(models_dir, device)
         logger.info("Ensemble inference using %d checkpoint(s)", len(ensemble))
 
         all_weights = []
@@ -295,7 +316,6 @@ def get_rl_targets(
         weights_np = np.stack(all_weights, axis=0).mean(axis=0)  # (n_assets + 1,)
     else:
         # ── Single checkpoint inference ───────────────────────────────────────
-        model, ckpt = _load_model(checkpoint_path, device)
         weights = model.get_weights(obs_t, padding_mask=padding_mask)
         weights_np = weights.squeeze(0).cpu().numpy()
 
