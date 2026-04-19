@@ -238,6 +238,14 @@ class Portfolio:
                     f"${pos['shares']*pos['last_price']:>9.2f}  "
                     f"{pnl:>+9.2f}"
                 )
+            all_marked_at_cost = all(
+                abs(float(pos.get("last_price", 0.0)) - float(pos.get("avg_cost", 0.0))) < 1e-6
+                for pos in self.positions.values()
+            )
+            if all_marked_at_cost:
+                lines.append(
+                    "  Note: holdings are still marked at entry prices; unrealised P&L updates after the next price refresh."
+                )
         else:
             lines.append("  No stock positions")
         lines += self.options.summary_lines()

@@ -124,10 +124,30 @@ def print_report(portfolio, show_benchmark: bool = True):
     if n < 2:
         return
 
-    from pipeline.benchmark import benchmark_vs_spy, compute_metrics
-    p_m   = compute_metrics(portfolio_rets[:n], "Broker")
-    spy_m = compute_metrics(spy_rets[:n],       "SPY")
-    rel   = benchmark_vs_spy(portfolio_rets[:n], spy_rets[:n])
+    from pipeline.benchmark import (
+        MIN_HISTORY_FOR_STABLE_METRICS,
+        benchmark_vs_spy,
+        compute_metrics,
+        format_metric_cell,
+        short_history_note,
+    )
+    p_m = compute_metrics(
+        portfolio_rets[:n],
+        "Broker",
+        min_obs_for_annualized=MIN_HISTORY_FOR_STABLE_METRICS,
+        min_obs_for_risk=MIN_HISTORY_FOR_STABLE_METRICS,
+    )
+    spy_m = compute_metrics(
+        spy_rets[:n],
+        "SPY",
+        min_obs_for_annualized=MIN_HISTORY_FOR_STABLE_METRICS,
+        min_obs_for_risk=MIN_HISTORY_FOR_STABLE_METRICS,
+    )
+    rel = benchmark_vs_spy(
+        portfolio_rets[:n],
+        spy_rets[:n],
+        min_obs_for_relative=MIN_HISTORY_FOR_STABLE_METRICS,
+    )
 
     print(f"\n  {'─'*55}")
     print(f"  {'Metric':<22} {'Broker':>12}  {'SPY':>10}")
@@ -137,19 +157,32 @@ def print_report(portfolio, show_benchmark: bool = True):
         ("sharpe", ".3f"),       ("sortino", ".3f"),
         ("max_drawdown", ".2%"), ("win_rate", ".2%"),
     ]:
-        pv = p_m[key]; sv = spy_m[key]
-        print(f"  {key:<22} {pv:>12{fmt}}  {sv:>10{fmt}}")
+        pv = p_m[key]
+        sv = spy_m[key]
+        print(
+            f"  {key:<22} "
+            f"{format_metric_cell(pv, fmt, 12)}  "
+            f"{format_metric_cell(sv, fmt, 10)}"
+        )
 
     print(f"  {'─'*55}")
-    print(f"  {'Beta':<22} {rel['beta']:>12.3f}")
-    print(f"  {'Alpha (ann)':<22} {rel['alpha_ann']:>12.2%}")
-    print(f"  {'Info Ratio':<22} {rel['information_ratio']:>12.3f}")
-    if rel['upside_capture']:
-        print(f"  {'Upside Capture':<22} {rel['upside_capture']:>12.3f}")
-    if rel['downside_capture']:
-        print(f"  {'Downside Capture':<22} {rel['downside_capture']:>12.3f}")
+    print(f"  {'Beta':<22} {format_metric_cell(rel['beta'], '.3f', 12)}")
+    print(f"  {'Alpha (ann)':<22} {format_metric_cell(rel['alpha_ann'], '.2%', 12)}")
+    print(f"  {'Info Ratio':<22} {format_metric_cell(rel['information_ratio'], '.3f', 12)}")
+    if rel["upside_capture"] is not None:
+        print(f"  {'Upside Capture':<22} {format_metric_cell(rel['upside_capture'], '.3f', 12)}")
+    if rel["downside_capture"] is not None:
+        print(f"  {'Downside Capture':<22} {format_metric_cell(rel['downside_capture'], '.3f', 12)}")
     beats = "✓ YES" if rel['beats_spy_return'] else "✗ NO"
     print(f"  {'Beats SPY':<22} {beats:>12}")
+    note = short_history_note(n, min_obs=MIN_HISTORY_FOR_STABLE_METRICS)
+    if note:
+        print("  " + "-" * 55)
+        print(note)
+        note = None
+    if note:
+        print(f"  {'â”€'*55}")
+        print(note)
     print(f"  {'─'*55}\n")
 
 

@@ -168,6 +168,31 @@ def test_portfolio_summary_always_includes_stock_holdings_section():
     assert "No stock positions" in summary
 
 
+def test_portfolio_summary_flags_positions_marked_at_entry_price():
+    class _EmptyOptions:
+        positions = {}
+
+        @staticmethod
+        def summary_lines() -> list[str]:
+            return []
+
+    portfolio = Portfolio.__new__(Portfolio)
+    portfolio.initial_cash = 10_000.0
+    portfolio.cash = 9_500.0
+    portfolio.positions = {
+        "ABC": {
+            "shares": 5.0,
+            "avg_cost": 100.0,
+            "last_price": 100.0,
+        }
+    }
+    portfolio.options = _EmptyOptions()
+
+    summary = Portfolio.summary(portfolio)
+
+    assert "marked at entry prices" in summary
+
+
 def test_portfolio_cash_auto_accrues_at_three_percent(monkeypatch):
     state_path = Path("tests/_tmp") / f"portfolio_cash_yield_{uuid4().hex}.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)

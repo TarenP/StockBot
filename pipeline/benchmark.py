@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+MIN_HISTORY_FOR_STABLE_METRICS = 20
 
 
 @contextmanager
@@ -52,6 +53,41 @@ def _console_safe(text: str) -> str:
                 .replace("•", "*")
                 .replace("…", "...")
         )
+
+
+def format_metric_cell(value: float | None, fmt: str, width: int) -> str:
+    """Format numeric table cells, falling back to n/a when hidden."""
+    if value is None:
+        return f"{'n/a':>{width}}"
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return f"{'n/a':>{width}}"
+    if not np.isfinite(numeric):
+        return f"{'n/a':>{width}}"
+    return f"{numeric:>{width}{fmt}}"
+
+
+def format_yes_no_cell(value: bool | None, width: int, yes: str = "YES", no: str = "NO") -> str:
+    """Format boolean table cells, allowing n/a for hidden metrics."""
+    if value is None:
+        return f"{'n/a':>{width}}"
+    return f"{yes if value else no:>{width}}"
+
+
+def short_history_note(
+    n_obs: int,
+    min_obs: int = MIN_HISTORY_FOR_STABLE_METRICS,
+) -> str | None:
+    """Explain why sample-sensitive metrics are hidden."""
+    if n_obs >= min_obs:
+        return None
+    noun = "observation" if n_obs == 1 else "observations"
+    return (
+        f"  Note: annualized, Sharpe-style, and benchmark-relative metrics are hidden "
+        f"until {min_obs} daily return observations are available "
+        f"(currently {n_obs} {noun})."
+    )
 
 
 def fetch_spy_returns(
@@ -127,12 +163,18 @@ def _volatility(rets, periods: int = 252) -> float:
     return float(rets.std() * np.sqrt(periods))
 
 
-def compute_metrics(rets: np.ndarray, label: str = "") -> dict:
+def compute_metrics(
+    rets: np.ndarray,
+    label: str = "",
+    min_obs_for_annualized: int = 0,
+    min_obs_for_risk: int = 0,
+) -> dict:
     """Base metrics with no benchmark dependency."""
     rets = np.asarray(rets)
     if len(rets) == 0:
         return {
             "label": label,
+            "n_obs": 0,
             "total_return": 0.0,
             "ann_return": 0.0,
             "volatility": 0.0,
@@ -144,15 +186,25 @@ def compute_metrics(rets: np.ndarray, label: str = "") -> dict:
         }
 
     eq = np.cumprod(1 + rets)
+    ann_return = _ann_return(rets) if len(rets) >= min_obs_for_annualized else None
+    volatility = _volatility(rets) if len(rets) >= min_obs_for_risk else None
+    sharpe = _sharpe(rets) if len(rets) >= min_obs_for_risk else None
+    sortino = _sortino(rets) if len(rets) >= min_obs_for_risk else None
+    calmar = (
+        _calmar(rets)
+        if len(rets) >= max(min_obs_for_annualized, min_obs_for_risk)
+        else None
+    )
     return {
         "label": label,
+        "n_obs": int(len(rets)),
         "total_return": float(eq[-1] - 1),
-        "ann_return": _ann_return(rets),
-        "volatility": _volatility(rets),
-        "sharpe": _sharpe(rets),
-        "sortino": _sortino(rets),
+        "ann_return": ann_return,
+        "volatility": volatility,
+        "sharpe": sharpe,
+        "sortino": sortino,
         "max_drawdown": _max_dd(rets),
-        "calmar": _calmar(rets),
+        "calmar": calmar,
         "win_rate": float((rets > 0).mean()),
     }
 
@@ -161,11 +213,27 @@ def benchmark_vs_spy(
     portfolio_rets: np.ndarray,
     spy_rets: np.ndarray,
     rf_daily: float = 0.05 / 252,
+    min_obs_for_relative: int = 0,
 ) -> dict:
     """Compute SPY-relative metrics for aligned return series."""
     n = min(len(portfolio_rets), len(spy_rets))
     p = np.asarray(portfolio_rets[:n])
     s = np.asarray(spy_rets[:n])
+    beats_total = float(np.prod(1 + p)) > float(np.prod(1 + s)) if n else False
+
+    if n < 2:
+        return {
+            "n_obs": int(n),
+            "beta": None,
+            "alpha_ann": None,
+            "information_ratio": None,
+            "upside_capture": None,
+            "downside_capture": None,
+            "tracking_error": None,
+            "beats_spy_return": beats_total,
+            "beats_spy_sharpe": None,
+            "active_return_ann": None,
+        }
 
     cov_matrix = np.cov(p, s)
     beta = cov_matrix[0, 1] / (cov_matrix[1, 1] + 1e-9)
@@ -181,10 +249,24 @@ def benchmark_vs_spy(
     down_cap = (p[down_mask].mean() / (s[down_mask].mean() + 1e-9)) if down_mask.any() else np.nan
 
     tracking_error = float(active_rets.std() * np.sqrt(252))
-    beats_total = float(np.prod(1 + p)) > float(np.prod(1 + s))
     beats_sharpe = _sharpe(p) > _sharpe(s)
 
+    if n < min_obs_for_relative:
+        return {
+            "n_obs": int(n),
+            "beta": None,
+            "alpha_ann": None,
+            "information_ratio": None,
+            "upside_capture": None,
+            "downside_capture": None,
+            "tracking_error": None,
+            "beats_spy_return": beats_total,
+            "beats_spy_sharpe": None,
+            "active_return_ann": None,
+        }
+
     return {
+        "n_obs": int(n),
         "beta": round(beta, 3),
         "alpha_ann": round(alpha_ann, 4),
         "information_ratio": round(ir, 3),
@@ -221,6 +303,7 @@ def print_benchmark_report(
     label: str = "Strategy",
 ):
     """Print a benchmark comparison table."""
+    min_obs = MIN_HISTORY_FOR_STABLE_METRICS
     spy_available = spy_rets is not None and len(spy_rets) >= 2
     lengths = [len(portfolio_rets)]
     if spy_available:
@@ -229,10 +312,38 @@ def print_benchmark_report(
         lengths.append(len(ew_rets))
     n = min(lengths)
 
-    p_metrics = compute_metrics(portfolio_rets[:n], label)
-    spy_metrics = compute_metrics(spy_rets[:n], "SPY") if spy_available else None
-    ew_metrics = compute_metrics(ew_rets[:n], "Equal-Weight") if ew_rets is not None else None
-    rel = benchmark_vs_spy(portfolio_rets[:n], spy_rets[:n]) if spy_available else None
+    p_metrics = compute_metrics(
+        portfolio_rets[:n],
+        label,
+        min_obs_for_annualized=min_obs,
+        min_obs_for_risk=min_obs,
+    )
+    spy_metrics = (
+        compute_metrics(
+            spy_rets[:n],
+            "SPY",
+            min_obs_for_annualized=min_obs,
+            min_obs_for_risk=min_obs,
+        )
+        if spy_available else None
+    )
+    ew_metrics = (
+        compute_metrics(
+            ew_rets[:n],
+            "Equal-Weight",
+            min_obs_for_annualized=min_obs,
+            min_obs_for_risk=min_obs,
+        )
+        if ew_rets is not None else None
+    )
+    rel = (
+        benchmark_vs_spy(
+            portfolio_rets[:n],
+            spy_rets[:n],
+            min_obs_for_relative=min_obs,
+        )
+        if spy_available else None
+    )
 
     cols = ["Policy"]
     all_metrics = [p_metrics]
@@ -259,7 +370,9 @@ def print_benchmark_report(
         row = f"  {key:<22}"
         for metrics in all_metrics:
             val = metrics.get(key, 0)
-            row += f" {val:>13.2%}" if key in pct_keys else f" {val:>14.3f}"
+            width = 13 if key in pct_keys else 14
+            fmt = ".2%" if key in pct_keys else ".3f"
+            row += f" {format_metric_cell(val, fmt, width)}"
         print(_console_safe(row))
 
     print(f"\n  {line}")
@@ -268,16 +381,20 @@ def print_benchmark_report(
     if not spy_available:
         print(_console_safe("  SPY benchmark unavailable for this run. Relative metrics skipped."))
     else:
-        print(_console_safe(f"  {'Beta':<22} {rel['beta']:>14.3f}"))
-        print(_console_safe(f"  {'Alpha (ann)':<22} {rel['alpha_ann']:>13.2%}"))
-        print(_console_safe(f"  {'Information Ratio':<22} {rel['information_ratio']:>14.3f}"))
-        print(_console_safe(f"  {'Tracking Error':<22} {rel['tracking_error']:>13.2%}"))
+        print(_console_safe(f"  {'Beta':<22} {format_metric_cell(rel['beta'], '.3f', 14)}"))
+        print(_console_safe(f"  {'Alpha (ann)':<22} {format_metric_cell(rel['alpha_ann'], '.2%', 13)}"))
+        print(_console_safe(f"  {'Information Ratio':<22} {format_metric_cell(rel['information_ratio'], '.3f', 14)}"))
+        print(_console_safe(f"  {'Tracking Error':<22} {format_metric_cell(rel['tracking_error'], '.2%', 13)}"))
         if rel["upside_capture"] is not None:
-            print(_console_safe(f"  {'Upside Capture':<22} {rel['upside_capture']:>14.3f}"))
+            print(_console_safe(f"  {'Upside Capture':<22} {format_metric_cell(rel['upside_capture'], '.3f', 14)}"))
         if rel["downside_capture"] is not None:
-            print(_console_safe(f"  {'Downside Capture':<22} {rel['downside_capture']:>14.3f}"))
-        print(_console_safe(f"  {'Beats SPY (return)':<22} {'YES' if rel['beats_spy_return'] else 'NO':>14}"))
-        print(_console_safe(f"  {'Beats SPY (Sharpe)':<22} {'YES' if rel['beats_spy_sharpe'] else 'NO':>14}"))
+            print(_console_safe(f"  {'Downside Capture':<22} {format_metric_cell(rel['downside_capture'], '.3f', 14)}"))
+        print(_console_safe(f"  {'Beats SPY (return)':<22} {format_yes_no_cell(rel['beats_spy_return'], 14)}"))
+        print(_console_safe(f"  {'Beats SPY (Sharpe)':<22} {format_yes_no_cell(rel['beats_spy_sharpe'], 14)}"))
+        note = short_history_note(n, min_obs=min_obs)
+        if note:
+            print(_console_safe(""))
+            print(_console_safe(note))
     print(_console_safe(f"{'='*72}\n"))
 
 
