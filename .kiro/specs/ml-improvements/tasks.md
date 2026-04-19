@@ -1,0 +1,264 @@
+# Implementation Plan: ML Improvements
+
+## Overview
+
+Tasks are ordered by priority: critical bug fixes first (Tasks 1–4), then architectural improvements (Tasks 5–13). Each task is self-contained and can be executed independently. Property-based tests use `hypothesis` (already installed). All code is Python.
+
+## Tasks
+
+- [x] 1. Fix RL score persistence bug
+  - [x] 1.1 Remove `_rl_score_at_entry` attribute pattern from `broker/brain.py`
+    - In `run_cycle()`, delete the lines that set `decisions[-1]._rl_score_at_entry = rl_score_val`
+    - The `Decision.score` field already holds `rl_score_val` when `rl_enabled=True` — use that instead
+    - _Requirements: 1.1, 1.2_
+  - [x] 1.2 Write `rl_score_at_entry` directly to position dict in `broker/broker.py`
+    - In the BUY execution block, after `ok = portfolio.buy(...)`, add: `if ok and brain.rl_enabled and d.ticker in portfolio.positions: portfolio.positions[d.ticker]["rl_score_at_entry"] = d.score`
+    - Remove the existing `hasattr(d, "_rl_score_at_entry")` block
+    - _Requirements: 1.1, 1.4_
+  - [ ]* 1.3 Write property test for RL score round-trip persistence
+    - **Property 1: RL Score Round-Trip Persistence**
+    - **Validates: Requirements 1.1, 1.3**
+    - Create `tests/test_rl_score_persistence.py`; use `hypothesis` to generate random (ticker, score) pairs; mock `portfolio.buy()` to return True/False; assert score is stored iff buy succeeds
+  - [ ]* 1.4 Write unit test for failed-buy guard
+    - Verify `rl_score_at_entry` is NOT written when `portfolio.buy()` returns False
+    - _Requirements: 1.4_
+
+- [x] 2. Fix cash weight floor constraint
+  - [x] 2.1 Add cash weight floor in `PortfolioTransformer.get_weights()` in `pipeline/model.py`
+    - After computing `concentration = F.softplus(logits / temperature) + 1e-6`, add `concentration[:, -1] = torch.clamp(concentration[:, -1], min=1e-6)` before the normalisation step
+    - _Requirements: 2.1, 2.2, 2.3_
+  - [ ]* 2.2 Write property test for cash weight non-negativity
+    - **Property 2: Cash Weight Non-Negativity**
+    - **Validates: Requirements 2.1, 2.2, 2.3**
+    - Create `tests/test_cash_weight_floor.py`; use `hypothesis` to generate random obs tensors; assert `weights[:, -1] >= 0` for all inputs
+  - [ ]* 2.3 Write property test for weights summing to one
+    - **Property 3: Portfolio Weights Sum to One**
+    - **Validates: Requirements 2.4**
+    - In same test file; assert `abs(weights.sum() - 1.0) < 1e-5` for all random inputs
+
+- [x] 3. Fix Sharpe reward cold-start
+  - [x] 3.1 Remove the cold-start branch in `PortfolioEnv.step()` in `pipeline/environment.py`
+    - Replace the `if len(self.return_history) >= self.sharpe_window: ... else: reward = float(port_ret)` block with a single Sharpe computation using all available returns
+    - Use `std_r = max(window.std(), 1e-4)` to floor std and prevent reward explosion on the first step
+    - Clip reward to `[-10.0, 10.0]`
+    - _Requirements: 3.1, 3.2, 3.4_
+  - [ ]* 3.2 Write property test for consistent Sharpe reward formula
+    - **Property 4: Consistent Sharpe Reward Formula**
+    - **Validates: Requirements 3.1, 3.2, 3.4**
+    - Create `tests/test_sharpe_reward.py`; use `hypothesis` to generate return sequences of length 1 to `sharpe_window`; verify reward is never equal to the raw single-step return (except when mean/std coincidentally match)
+  - [ ]* 3.3 Write unit test for single-step reward
+    - Verify reward is 0.0 (or near-zero) when only one return has been accumulated
+    - _Requirements: 3.3_
+
+- [x] 4. Fix research score consistency
+  - [x] 4.1 Calibrate `_feature_snapshot_score()` weights in `broker/analyst.py`
+    - Adjust the weight coefficients in `_feature_snapshot_score()` so that the expected output for a neutral ticker (all normalised features = 0) is 0.5 and the empirical mean absolute difference vs `_composite_score()` is < 0.05
+    - Document the calibration rationale in a comment above the function
+    - _Requirements: 4.1, 4.2, 4.3_
+  - [ ]* 4.2 Write property test for research score calibration
+    - **Property 5: Research Score Calibration**
+    - **Validates: Requirements 4.3**
+    - Create `tests/test_research_score_consistency.py`; use `hypothesis` to generate normalised feature dicts; compute both scores; assert mean absolute difference < 0.05
+  - [ ]* 4.3 Write unit tests for research path routing
+    - Verify `research()` calls `_composite_score()` and `research_from_features()` calls `_feature_snapshot_score()`
+    - Verify `_research_with_fallback()` prefers live research and only falls back when `research()` returns None
+    - _Requirements: 4.1, 4.2, 4.4_
+
+- [ ] 5. Checkpoint — Ensure all critical bug fix tests pass
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [x] 6. Add market-wide context features
+  - [x] 6.1 Add `build_market_context()` function to `pipeline/features.py`
+    - Fetch SPY 20-day return from the existing panel data (SPY should already be in the parquet)
+    - Fetch VIX level from yfinance ticker `^VIX`; normalise by dividing by 100
+    - Compute market breadth from the panel: fraction of tickers where `close > rolling_200d_mean`
+    - Return a date-indexed DataFrame with columns `spy_ret_20d`, `vix_level`, `market_breadth`
+    - _Requirements: 7.1, 7.2, 7.3_
+  - [x] 6.2 Add fill logic for missing market context values
+    - Forward-fill VIX and market breadth for up to 5 trading days; fill remaining with 0.0 (VIX) and 0.5 (breadth)
+    - _Requirements: 7.4, 7.5_
+  - [x] 6.3 Broadcast market context to all tickers and add to `FEATURE_COLS`
+    - In `build_features()`, merge market context DataFrame on the date level of the MultiIndex
+    - Add `spy_ret_20d`, `vix_level`, `market_breadth` to `FEATURE_COLS`
+    - _Requirements: 7.6_
+  - [ ]* 6.4 Write property test for VIX fill behaviour
+    - **Property 9: VIX Fill Behaviour**
+    - **Validates: Requirements 7.4**
+    - Create `tests/test_market_context_features.py`; use `hypothesis` to generate VIX series with gaps of length 1–5; verify fill behaviour matches spec
+  - [x]* 6.5 Write unit test for FEATURE_COLS completeness
+    - Assert `spy_ret_20d`, `vix_level`, `market_breadth` are in `FEATURE_COLS`
+    - _Requirements: 7.6_
+
+- [x] 7. Add fundamental features
+  - [x] 7.1 Add `fetch_fundamentals()` function to `pipeline/features.py`
+    - Fetch `trailingPE`, `revenueGrowth`, `shortPercentOfFloat` from `yf.Ticker(ticker).info` for each ticker
+    - Implement a JSON file cache at `models/fundamentals_cache.json` with 24-hour staleness check
+    - Return a ticker-indexed DataFrame with columns `pe_ratio`, `revenue_growth`, `short_interest_pct`
+    - _Requirements: 10.1, 10.2, 10.3, 10.6_
+  - [x] 7.2 Integrate fundamentals into `build_features()` and add to `FEATURE_COLS`
+    - Merge fundamentals by ticker into the feature DataFrame before cross-sectional z-scoring
+    - Forward-fill within each ticker's time series for up to 20 trading days; fill remaining with 0.0
+    - Add `pe_ratio`, `revenue_growth`, `short_interest_pct` to `FEATURE_COLS`
+    - _Requirements: 10.4, 10.5_
+  - [ ]* 7.3 Write property test for fundamental fill behaviour
+    - **Property 14: Fundamental Fill Behaviour**
+    - **Validates: Requirements 10.4**
+    - Create `tests/test_fundamental_features.py`; use `hypothesis` to generate fundamental series with gaps of length 1–20; verify fill behaviour
+  - [x]* 7.4 Write unit test for FEATURE_COLS and cache
+    - Assert `pe_ratio`, `revenue_growth`, `short_interest_pct` are in `FEATURE_COLS`
+    - Verify cache is read before fetching (mock yfinance)
+    - _Requirements: 10.5, 10.6_
+
+- [x] 8. Add regime detection features
+  - [x] 8.1 Add `compute_regimes()` function to `pipeline/features.py`
+    - Compute rolling 20-day SPY realised volatility from the panel
+    - Compute rolling 20-day cross-sectional return dispersion as a correlation proxy
+    - Assign regime labels 0–3 based on (low/high vol) × (low/high dispersion) thresholds
+    - Return a date-indexed Series of regime labels
+    - _Requirements: 11.1, 11.2_
+  - [x] 8.2 One-hot encode regime labels and broadcast to all tickers
+    - Convert regime label to 4 binary columns `regime_0`–`regime_3`
+    - Broadcast to all tickers on each date via merge on date level
+    - Add `regime_0`, `regime_1`, `regime_2`, `regime_3` to `FEATURE_COLS`
+    - Forward-fill missing regime dates using the most recent available label
+    - _Requirements: 11.3, 11.4, 11.5_
+  - [ ]* 8.3 Write property test for regime label validity
+    - **Property 10: Regime Label Validity**
+    - **Validates: Requirements 11.1**
+    - Create `tests/test_regime_classifier.py`; use `hypothesis` to generate (vol, dispersion) pairs; assert regime label in {0,1,2,3}
+  - [ ]* 8.4 Write property test for regime broadcast consistency
+    - **Property 11: Regime Broadcast Consistency**
+    - **Validates: Requirements 11.5**
+    - In same test file; generate multi-ticker DataFrames; assert all tickers on same date have identical regime column values
+
+- [ ] 9. Checkpoint — Ensure feature pipeline tests pass
+  - Ensure all tests pass, ask the user if questions arise.
+
+- [x] 10. Upgrade screener to regression labels
+  - [x] 10.1 Replace binary labels with percentile rank targets in `_build_samples()` in `pipeline/screener.py`
+    - Use `scipy.stats.rankdata` to compute forward return rank percentiles within each cross-section
+    - Store continuous rank targets in the `yo` array (rename to `y_rank` internally)
+    - Keep the binary top-10% label in a separate `y_binary` array for evaluation only
+    - _Requirements: 8.1_
+  - [x] 10.2 Replace `BCEWithLogitsLoss` with `MSELoss` in the screener training loop
+    - Change `criterion = nn.BCEWithLogitsLoss(...)` to `criterion = nn.MSELoss()`
+    - Wrap model output in `torch.sigmoid()` before computing loss so predictions stay in [0,1]
+    - Keep `_evaluate_ranked_groups()` using the binary labels for checkpoint selection
+    - _Requirements: 8.2, 8.3_
+  - [x] 10.3 Save `label_type: "regression"` in the screener checkpoint
+    - Add `"label_type": "regression"` to the `torch.save()` dict in `train_screener()`
+    - _Requirements: 8.4_
+  - [ ]* 10.4 Write property test for regression label validity
+    - **Property 7: Regression Label Validity**
+    - **Validates: Requirements 8.1**
+    - Create `tests/test_screener_regression.py`; use `hypothesis` to generate forward return vectors; assert percentile ranks are in [0,1] and monotonically ordered
+  - [ ]* 10.5 Write property test for screener output range
+    - **Property 6: Screener Output Range**
+    - **Validates: Requirements 8.5, 9.3**
+    - In same test file; generate random input arrays; assert all `run_screener()` scores in [0,1]
+
+- [x] 11. Add screener blend meta-model
+  - [x] 11.1 Add `_train_meta_model()` function to `pipeline/screener.py`
+    - After the main training loop, train a `sklearn.linear_model.LogisticRegression` on `[neural_probs, heuristic_probs]` features with binary top-10% labels from the validation set
+    - Return the fitted model
+    - _Requirements: 9.1, 9.2_
+  - [x] 11.2 Save meta-model weights in the screener checkpoint
+    - Add `"meta_model_coef"` and `"meta_model_intercept"` to the `torch.save()` dict
+    - _Requirements: 9.4_
+  - [x] 11.3 Use meta-model for blending in `run_screener()`
+    - After loading the checkpoint, reconstruct the meta-model from `meta_model_coef` and `meta_model_intercept`
+    - Replace the `_blend_scores()` call with a meta-model prediction: `X = np.stack([neural_scores, heuristic_scores], axis=1); blended = meta_model.predict_proba(X)[:, 1]`
+    - Fall back to static `blend_weight` if `meta_model_coef` is absent in the checkpoint
+    - _Requirements: 9.3, 9.5_
+  - [ ]* 11.4 Write unit tests for meta-model save/load and fallback
+    - Verify checkpoint contains meta-model weights after training
+    - Verify fallback to static blend when meta-model absent
+    - _Requirements: 9.4, 9.5_
+
+- [x] 12. Align RL training universe with screener shortlist
+  - [x] 12.1 Add `build_shortlist_universe()` function to `pipeline/train.py`
+    - Load the trained screener and run it on the training data to get per-date top-100 candidates
+    - Return the union of all per-date shortlists as the RL training universe
+    - _Requirements: 5.1, 5.2_
+  - [x] 12.2 Add `shortlist_universe` parameter to `train_fold()`
+    - When `shortlist_universe` is provided, use it as `asset_list` instead of the full top-N universe
+    - Save the shortlist-derived `asset_list` in the checkpoint
+    - _Requirements: 5.3, 5.4_
+  - [x] 12.3 Update `Agent.py` training flow to use shortlist universe
+    - After training the screener, call `build_shortlist_universe()` and pass the result to `train_fold()`
+    - _Requirements: 5.1_
+  - [ ]* 12.4 Write unit test for shortlist universe checkpoint
+    - Train a fold with a mock shortlist, load checkpoint, verify `asset_list` key matches shortlist
+    - _Requirements: 5.4_
+
+- [x] 13. Add checkpoint ensemble to RL inference
+  - [x] 13.1 Add `_load_ensemble()` function to `pipeline/rl_inference.py`
+    - Scan `models/` for all `best_fold*.pt` files using `glob`
+    - Load each with `_load_model()`; skip corrupt files with a WARNING log
+    - Return list of `(model, ckpt)` pairs
+    - _Requirements: 6.1, 6.5_
+  - [x] 13.2 Average weights across ensemble in `get_rl_targets()`
+    - Replace single-model inference with ensemble: stack weight vectors from all models, take element-wise mean
+    - Log the number of checkpoints used
+    - Maintain backward compatibility: if `checkpoint_path` is an explicit `.pt` file, use only that checkpoint
+    - _Requirements: 6.2, 6.3, 6.4_
+  - [ ]* 13.3 Write property test for ensemble averaging correctness
+    - **Property 8: Ensemble Averaging Correctness**
+    - **Validates: Requirements 6.2**
+    - Create `tests/test_checkpoint_ensemble.py`; use `hypothesis` to generate N random model weight sets; verify ensemble output equals element-wise mean within 1e-6
+  - [ ]* 13.4 Write unit tests for ensemble edge cases
+    - Single checkpoint: verify output matches direct inference
+    - Corrupt checkpoint: verify it is skipped and valid output is still produced
+    - _Requirements: 6.3, 6.5_
+
+- [x] 14. Add zero-padding mask to RL inference
+  - [x] 14.1 Update `_build_obs_tensor()` in `pipeline/rl_inference.py` to return a padding mask
+    - For tickers with insufficient history, set corresponding mask positions to `True`
+    - Return `(obs_t, insufficient, padding_mask)` where `padding_mask` is `None` when no tickers are padded
+    - Shape: `(1, n_assets, lookback)` → reshaped to `(n_assets, lookback)` for TransformerEncoder
+    - _Requirements: 12.1, 12.4_
+  - [x] 14.2 Add `src_key_padding_mask` parameter to `AssetEncoder.forward()` in `pipeline/model.py`
+    - Pass the mask to `self.transformer(x, src_key_padding_mask=src_key_padding_mask)`
+    - Default to `None` to preserve existing behaviour
+    - _Requirements: 12.2, 12.3_
+  - [x] 14.3 Pass the mask from `_build_obs_tensor()` through to `AssetEncoder` in `get_rl_targets()`
+    - Reshape mask from `(1, n_assets, lookback)` to `(n_assets, lookback)` before passing to the encoder
+    - _Requirements: 12.1_
+  - [ ]* 14.4 Write property test for padding mask shape invariant
+    - **Property 12: Padding Mask Shape Invariant**
+    - **Validates: Requirements 12.1, 12.4**
+    - Create `tests/test_padding_mask.py`; use `hypothesis` to generate (batch, n_assets, lookback) combinations with some assets having insufficient history; assert mask shape is `(batch * n_assets, lookback)`
+  - [ ]* 14.5 Write unit tests for mask correctness
+    - All tickers have full history → mask is None
+    - Some tickers have insufficient history → mask has True at correct positions
+    - _Requirements: 12.3_
+
+- [x] 15. Add extended RL training with curriculum
+  - [x] 15.1 Increase `total_steps` in `PPO_CFG` to 500,000 in `pipeline/train.py`
+    - Change `total_steps = 100_000` to `total_steps = 500_000`
+    - _Requirements: 13.1_
+  - [x] 15.2 Add `curriculum` parameter to `train_fold()` with default `False`
+    - When `curriculum=True`, initialise `train_env` with the top-20 assets from `asset_list`
+    - At `steps_done >= total_steps // 2`, reinitialise `train_env` with the full `asset_list`
+    - Log the expansion with `tqdm.write()`
+    - _Requirements: 13.2, 13.3, 13.4, 13.5_
+  - [ ]* 15.3 Write property test for curriculum universe expansion
+    - **Property 13: Curriculum Universe Expansion**
+    - **Validates: Requirements 13.2**
+    - Create `tests/test_curriculum.py`; use `hypothesis` to generate asset lists and step counts; verify universe size is 20 before midpoint and full size after
+  - [ ]* 15.4 Write unit test for curriculum disabled (backward compatibility)
+    - Verify `train_fold(curriculum=False)` uses full asset list from step 0
+    - _Requirements: 13.3_
+
+- [ ] 16. Final checkpoint — Ensure all tests pass
+  - Ensure all tests pass, ask the user if questions arise.
+
+## Notes
+
+- Tasks marked with `*` are optional and can be skipped for a faster MVP
+- Critical bug fixes (Tasks 1–4) should be completed before architectural improvements
+- Tasks 6, 7, and 8 all modify `FEATURE_COLS` — coordinate to avoid merge conflicts; complete them sequentially
+- After Tasks 6–8, the screener and RL models must be retrained since `n_features` changes from 19 to 29
+- Task 12 (universe alignment) depends on Task 10 (regression labels) being complete first, since the screener must be retrained before building the shortlist universe
+- The `hypothesis` library is already installed (`.hypothesis/` directory exists)
+- Property tests should use `@settings(max_examples=100)` for adequate coverage

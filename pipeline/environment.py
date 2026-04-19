@@ -166,13 +166,13 @@ class PortfolioEnv(Env):
         self.weights = new_weights
         self.return_history.append(port_ret)
 
-        if len(self.return_history) >= self.sharpe_window:
-            window = np.array(self.return_history[-self.sharpe_window:])
-            mean_r = window.mean()
-            std_r = window.std() + 1e-9
-            reward = float(mean_r / std_r)
-        else:
-            reward = float(port_ret)
+        # Always use rolling Sharpe from step 1 (min_periods=1).
+        # Floor std to prevent reward explosion on the first step.
+        # Clip to [-10, 10] to keep gradients stable.
+        window = np.array(self.return_history[-self.sharpe_window:])
+        mean_r = window.mean()
+        std_r  = max(window.std(), 1e-4)
+        reward = float(np.clip(mean_r / std_r, -10.0, 10.0))
 
         self.ptr += self.step_size
         terminated = self.ptr >= len(self.dates) - 1

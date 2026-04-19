@@ -193,8 +193,15 @@ def _build_samples(
     top_pct: float,
     rng: np.random.Generator,
     max_t_per_date: int | None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    Xo, yo, ro, go = [], [], [], []
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns (X, y_rank, y_binary, r, g) where:
+      y_rank   — continuous percentile rank target in [0, 1] (used for training)
+      y_binary — binary top-10% label (used for evaluation only)
+    """
+    from scipy.stats import rankdata
+
+    Xo, y_rank_o, y_binary_o, ro, go = [], [], [], [], []
 
     for t_idx in tqdm(
         date_indices,
@@ -220,8 +227,16 @@ def _build_samples(
             continue
 
         fwd_rets_vec = (future_close / base_close) - 1.0
-        threshold = np.nanpercentile(fwd_rets_vec[valid_mask], (1 - top_pct) * 100)
-        labels_vec = (fwd_rets_vec >= threshold).astype(np.float32)
+
+        # Regression target: percentile rank within the cross-section
+        valid_rets = fwd_rets_vec[valid_mask]
+        ranks = rankdata(valid_rets, method='average') / valid_mask.sum()
+        rank_vec = np.zeros(len(fwd_rets_vec), dtype=np.float32)
+        rank_vec[valid_mask] = ranks.astype(np.float32)
+
+        # Binary label kept for evaluation only
+        threshold = np.nanpercentile(valid_rets, (1 - top_pct) * 100)
+        binary_vec = (fwd_rets_vec >= threshold).astype(np.float32)
 
         valid_indices = np.where(valid_mask)[0]
         if max_t_per_date is not None and len(valid_indices) > max_t_per_date:
@@ -230,13 +245,15 @@ def _build_samples(
         hist_slice = feat_arr[t_idx - LOOKBACK:t_idx, :, :]
         for ti in valid_indices:
             Xo.append(hist_slice[:, ti, :])
-            yo.append(float(labels_vec[ti]))
+            y_rank_o.append(float(rank_vec[ti]))
+            y_binary_o.append(float(binary_vec[ti]))
             ro.append(float(fwd_rets_vec[ti]))
             go.append(int(anchor_idx))
 
     return (
         np.array(Xo, dtype=np.float32),
-        np.array(yo, dtype=np.float32),
+        np.array(y_rank_o, dtype=np.float32),
+        np.array(y_binary_o, dtype=np.float32),
         np.array(ro, dtype=np.float32),
         np.array(go, dtype=np.int32),
     )
@@ -369,6 +386,32 @@ def _blend_scores(
     ).astype(np.float32)
 
 
+def _train_meta_model(
+    neural_probs: np.ndarray,
+    heuristic_probs: np.ndarray,
+    labels: np.ndarray,
+):
+    """
+    Train a 2-feature logistic regression to blend neural and heuristic scores.
+
+    Parameters
+    ----------
+    neural_probs    : shape (N,) — sigmoid outputs from TickerScorer
+    heuristic_probs : shape (N,) — outputs from _heuristic_scores_from_windows
+    labels          : shape (N,) — binary top-10% labels (for evaluation)
+
+    Returns
+    -------
+    Fitted sklearn.linear_model.LogisticRegression
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    X = np.stack([neural_probs, heuristic_probs], axis=1)
+    meta = LogisticRegression(C=1.0, max_iter=200)
+    meta.fit(X, labels)
+    return meta
+
+
 def _score_epoch(metrics: dict[str, float]) -> float:
     """
     Score a checkpoint based on shortlist quality.
@@ -450,9 +493,9 @@ def train_screener(
     n_features = len(feat_cols)
     ck = _cache_key(df, feat_cols, forward_days, top_pct, val_frac, test_frac, eval_top_n)
 
-    X_train = y_train = r_train = g_train = None
-    X_val = y_val = r_val = g_val = None
-    X_test = y_test = r_test = g_test = None
+    X_train = y_train = y_binary_train = r_train = g_train = None
+    X_val = y_val = y_binary_val = r_val = g_val = None
+    X_test = y_test = y_binary_test = r_test = g_test = None
 
     if force_rebuild_cache:
         tqdm.write("  Force retrain enabled - rebuilding screener samples cache.")
@@ -462,14 +505,17 @@ def train_screener(
             if str(cached.get("cache_key", b"")) == ck:
                 X_train = cached["X_train"]
                 y_train = cached["y_train"]
+                y_binary_train = cached["y_binary_train"]
                 r_train = cached["r_train"]
                 g_train = cached["g_train"]
                 X_val = cached["X_val"]
                 y_val = cached["y_val"]
+                y_binary_val = cached["y_binary_val"]
                 r_val = cached["r_val"]
                 g_val = cached["g_val"]
                 X_test = cached["X_test"]
                 y_test = cached["y_test"]
+                y_binary_test = cached["y_binary_test"]
                 r_test = cached["r_test"]
                 g_test = cached["g_test"]
                 tqdm.write(
@@ -495,7 +541,7 @@ def train_screener(
             f"  Split dates: train={len(train_dates)}  val={len(val_dates)}  test={len(test_dates)}"
         )
 
-        X_train, y_train, r_train, g_train = _build_samples(
+        X_train, y_train, y_binary_train, r_train, g_train = _build_samples(
             feat_arr,
             close_arr,
             present_mask,
@@ -505,7 +551,7 @@ def train_screener(
             rng,
             MAX_T_PER_DATE,
         )
-        X_val, y_val, r_val, g_val = _build_samples(
+        X_val, y_val, y_binary_val, r_val, g_val = _build_samples(
             feat_arr,
             close_arr,
             present_mask,
@@ -515,7 +561,7 @@ def train_screener(
             rng,
             None,
         )
-        X_test, y_test, r_test, g_test = _build_samples(
+        X_test, y_test, y_binary_test, r_test, g_test = _build_samples(
             feat_arr,
             close_arr,
             present_mask,
@@ -531,14 +577,17 @@ def train_screener(
             SCREENER_SAMPLES,
             X_train=X_train,
             y_train=y_train,
+            y_binary_train=y_binary_train,
             r_train=r_train,
             g_train=g_train,
             X_val=X_val,
             y_val=y_val,
+            y_binary_val=y_binary_val,
             r_val=r_val,
             g_val=g_val,
             X_test=X_test,
             y_test=y_test,
+            y_binary_test=y_binary_test,
             r_test=r_test,
             g_test=g_test,
             cache_key=np.array(ck),
@@ -550,9 +599,9 @@ def train_screener(
         return
 
     tqdm.write(
-        f"  Train: {len(X_train):,}  pos={y_train.mean():.1%} | "
-        f"Val: {len(X_val):,}  pos={y_val.mean():.1%} | "
-        f"Test: {len(X_test):,}  pos={y_test.mean():.1%}"
+        f"  Train: {len(X_train):,}  pos={y_binary_train.mean():.1%} | "
+        f"Val: {len(X_val):,}  pos={y_binary_val.mean():.1%} | "
+        f"Test: {len(X_test):,}  pos={y_binary_test.mean():.1%}"
     )
 
     model = TickerScorer(n_features=n_features).to(device)
@@ -570,12 +619,12 @@ def train_screener(
         return 0.5 * (1 + np.cos(np.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    pos_weight = torch.tensor([(1 - top_pct) / top_pct], device=device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # Regression loss: MSE on sigmoid-squashed outputs vs percentile rank targets
+    criterion = nn.MSELoss()
 
     train_ds = torch.utils.data.TensorDataset(
         torch.tensor(X_train),
-        torch.tensor(y_train).unsqueeze(1),
+        torch.tensor(y_train).unsqueeze(1),   # y_train = percentile rank in [0,1]
     )
     loader = torch.utils.data.DataLoader(
         train_ds,
@@ -604,10 +653,10 @@ def train_screener(
         )
         for xb, yb in pbar:
             xb, yb = xb.to(device), yb.to(device)
-            yb_smooth = yb * (1 - label_smoothing) + 0.5 * label_smoothing
 
-            pred = model(xb)
-            loss = criterion(pred, yb_smooth)
+            # Wrap output in sigmoid so predictions stay in [0,1] for MSE
+            pred = torch.sigmoid(model(xb))
+            loss = criterion(pred, yb)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -641,7 +690,7 @@ def train_screener(
             try:
                 from sklearn.metrics import roc_auc_score
 
-                val_auc = roc_auc_score(y_val, probs)
+                val_auc = roc_auc_score(y_binary_val, probs)
             except Exception:
                 pass
 
@@ -653,7 +702,7 @@ def train_screener(
                 eval_probs = _blend_scores(probs, val_heuristic_probs, blend_weight)
                 metrics = _evaluate_ranked_groups(
                     probs=eval_probs,
-                    labels=y_val,
+                    labels=y_binary_val,
                     forward_returns=r_val,
                     groups=g_val,
                     shortlist_size=eval_top_n,
@@ -718,13 +767,13 @@ def train_screener(
         try:
             from sklearn.metrics import roc_auc_score
 
-            test_auc = roc_auc_score(y_test, test_probs)
+            test_auc = roc_auc_score(y_binary_test, test_probs)
         except Exception:
             pass
         test_probs = _blend_scores(test_probs, test_heuristic_probs, best_blend_weight)
         test_metrics = _evaluate_ranked_groups(
             probs=test_probs,
-            labels=y_test,
+            labels=y_binary_test,
             forward_returns=r_test,
             groups=g_test,
             shortlist_size=eval_top_n,
@@ -738,6 +787,29 @@ def train_screener(
         )
 
     os.makedirs("models", exist_ok=True)
+
+    # ── Train meta-model on validation set ───────────────────────────────────
+    meta_model_coef = None
+    meta_model_intercept = None
+    if len(X_val) > 0 and best_state is not None:
+        try:
+            model.eval()
+            val_neural_probs = _predict_in_chunks(
+                model=model,
+                X=X_val,
+                device=device,
+                desc="  Meta-model val probs",
+            )
+            meta = _train_meta_model(val_neural_probs, val_heuristic_probs, y_binary_val)
+            meta_model_coef = meta.coef_
+            meta_model_intercept = meta.intercept_
+            tqdm.write(
+                f"  Meta-model trained  "
+                f"(coef={meta_model_coef.tolist()}, intercept={meta_model_intercept.tolist()})"
+            )
+        except Exception as exc:
+            tqdm.write(f"  Meta-model training failed ({exc}) — using static blend_weight")
+
     torch.save(
         {
             "model_state": model.state_dict(),
@@ -748,8 +820,11 @@ def train_screener(
             "top_pct": top_pct,
             "eval_top_n": eval_top_n,
             "blend_weight": float(best_blend_weight),
+            "meta_model_coef": meta_model_coef,
+            "meta_model_intercept": meta_model_intercept,
             "val_metrics": best_val_metrics,
             "test_metrics": {**test_metrics, "test_auc": float(test_auc)},
+            "label_type": "regression",
         },
         SCREENER_CKPT,
     )
@@ -766,6 +841,8 @@ def load_screener(device: torch.device) -> TickerScorer:
     model.load_state_dict(ckpt["model_state"])
     model._blend_weight = float(ckpt.get("blend_weight", 1.0))
     model._feature_cols = ckpt.get("feature_cols", [])
+    model._meta_model_coef = ckpt.get("meta_model_coef", None)
+    model._meta_model_intercept = ckpt.get("meta_model_intercept", None)
     model.eval()
     return model
 
@@ -875,11 +952,32 @@ def run_screener(
 
     heuristic_scores = _heuristic_scores_from_windows(obs_arr, feat_cols)
     blend_weight = float(getattr(model, "_blend_weight", 1.0))
-    scores = _blend_scores(
-        np.array(scores, dtype=np.float32),
-        heuristic_scores,
-        blend_weight,
-    ).tolist()
+
+    # Use meta-model for blending if available, else fall back to static blend_weight
+    meta_coef = getattr(model, "_meta_model_coef", None)
+    meta_intercept = getattr(model, "_meta_model_intercept", None)
+    if meta_coef is not None and meta_intercept is not None:
+        try:
+            from sklearn.linear_model import LogisticRegression
+            meta = LogisticRegression()
+            meta.coef_ = meta_coef
+            meta.intercept_ = meta_intercept
+            meta.classes_ = np.array([0, 1])
+            X_blend = np.stack([np.array(scores, dtype=np.float32), heuristic_scores], axis=1)
+            scores = meta.predict_proba(X_blend)[:, 1].astype(np.float32).tolist()
+        except Exception as exc:
+            logger.warning("Meta-model blending failed (%s) — using static blend_weight", exc)
+            scores = _blend_scores(
+                np.array(scores, dtype=np.float32),
+                heuristic_scores,
+                blend_weight,
+            ).tolist()
+    else:
+        scores = _blend_scores(
+            np.array(scores, dtype=np.float32),
+            heuristic_scores,
+            blend_weight,
+        ).tolist()
 
     rows = []
     for ticker, score in zip(valid_tickers, scores):

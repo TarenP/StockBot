@@ -297,6 +297,8 @@ class BrokerBrain:
                 logger.info(
                     "RL scored %d tickers in shortlist.", len(candidates)
                 )
+                # Cache for broker.py to use when storing entry rank percentile
+                self._last_rl_scores = rl_scores
             except Exception as exc:
                 logger.error(
                     "RL inference failed — aborting cycle: %s", exc, exc_info=True
@@ -593,11 +595,6 @@ class BrokerBrain:
                     score=score, reason=reason,
                 ))
 
-                # Store rl_score_at_entry in position metadata after buy
-                if self.rl_enabled and rl_score_val is not None:
-                    # Tag the decision so broker.py can store it post-execution
-                    decisions[-1]._rl_score_at_entry = rl_score_val
-
                 sector_spent[sector] = sector_spent.get(sector, 0.0) + alloc_value
                 if is_penny:
                     penny_value += alloc_value
@@ -765,94 +762,112 @@ class BrokerBrain:
         rl_scores: "pd.Series",
     ) -> list[Decision]:
         """
-        Phase 2: Compare each held ticker's current RL score (from the
-        cycle-level scoring pass) against the score recorded at entry.
+        Phase 2: Compare each held ticker's current RL rank against the rank
+        recorded at entry.
 
-        Accepts the rl_scores Series already computed in run_cycle so that
-        held positions are evaluated in the same cross-sectional context as
-        buy candidates — not in isolation.  Tickers not present in rl_scores
-        (e.g. held names that fell off the shortlist) are skipped rather than
-        generating spurious exits.
+        RL scores from mode="rank" are relative — they sum to 1 across the
+        shortlist and shrink as the shortlist grows. Comparing them to a fixed
+        absolute threshold produces exits that depend on shortlist size, not
+        conviction. Instead we use rank percentile within the current shortlist:
 
-        Returns SELL or SELL_PARTIAL decisions.
+          - SELL if current rank percentile < rl_exit_threshold
+            (e.g. 0.20 means "bottom 20% of today's shortlist")
+          - SELL_PARTIAL if rank dropped by more than rl_conviction_drop
+            relative to entry rank percentile
+
+        Tickers not present in rl_scores (fell off the shortlist) are skipped
+        and deferred to heuristic exits.
         """
         exit_decisions: list[Decision] = []
+
+        if rl_scores.empty:
+            return exit_decisions
+
+        # Convert raw scores to rank percentiles within the current shortlist.
+        # Higher score → higher percentile (1.0 = top of shortlist).
+        n = len(rl_scores)
+        rank_series = rl_scores.rank(method="average", ascending=True) / n
 
         for ticker in held_tickers:
             pos = self.portfolio.positions.get(ticker)
             if pos is None:
                 continue
 
-            # Skip tickers not covered by this cycle's RL scoring pass.
-            # A held name absent from the shortlist means the screener already
-            # de-prioritised it; we let heuristic exits handle it rather than
-            # inferring a score in isolation.
-            if ticker not in rl_scores.index:
+            if ticker not in rank_series.index:
                 logger.debug(
                     "RL exit check: %s not in cycle rl_scores — deferring to heuristic exits",
                     ticker,
                 )
                 continue
 
-            current_rl_score = float(rl_scores[ticker])
+            current_rank_pct = float(rank_series[ticker])
             price = pos.get("last_price", 0.0)
             shares = pos.get("shares", 0.0)
-            entry_rl_score = pos.get("rl_score_at_entry")  # may be None
+            # Use rank-percentile at entry if available; fall back to raw score
+            # converted to a rough percentile for backward compatibility.
+            entry_rank_pct = pos.get("rl_rank_pct_at_entry")
+            if entry_rank_pct is None and pos.get("rl_score_at_entry") is not None:
+                # Legacy: approximate entry rank from raw score (rough but better than None)
+                entry_rank_pct = float(pos["rl_score_at_entry"])
 
-            # Check absolute exit threshold
-            if current_rl_score < self.rl_exit_threshold:
-                drop = (entry_rl_score - current_rl_score) if entry_rl_score is not None else None
-                drop_str = f"{drop:.4f}" if drop is not None else "N/A (no entry score)"
+            # Check absolute rank threshold
+            if current_rank_pct < self.rl_exit_threshold:
+                drop_str = (
+                    f"{entry_rank_pct - current_rank_pct:.4f}"
+                    if entry_rank_pct is not None else "N/A (no entry rank)"
+                )
                 logger.info(
-                    "RL exit (SELL) %s: entry_rl_score=%s  current_rl_score=%.4f  "
-                    "drop=%s  threshold=rl_exit_threshold(%.2f)",
+                    "RL exit (SELL) %s: entry_rank_pct=%s  current_rank_pct=%.4f  "
+                    "drop=%s  threshold=rl_exit_threshold(%.2f)  shortlist_n=%d",
                     ticker,
-                    f"{entry_rl_score:.4f}" if entry_rl_score is not None else "N/A",
-                    current_rl_score,
+                    f"{entry_rank_pct:.4f}" if entry_rank_pct is not None else "N/A",
+                    current_rank_pct,
                     drop_str,
                     self.rl_exit_threshold,
+                    n,
                 )
                 exit_decisions.append(Decision(
                     action="SELL",
                     ticker=ticker,
                     shares=shares,
                     price=price,
-                    score=current_rl_score,
+                    score=current_rank_pct,
                     reason=(
-                        f"RL exit: current_rl_score={current_rl_score:.4f} < "
+                        f"RL exit: rank_pct={current_rank_pct:.4f} < "
                         f"rl_exit_threshold={self.rl_exit_threshold:.2f} | "
-                        f"entry_rl_score={entry_rl_score} | "
-                        f"drop={drop_str} | rl_mode=true"
+                        f"entry_rank_pct={entry_rank_pct} | "
+                        f"shortlist_n={n} | rl_mode=true"
                     ),
                 ))
                 continue
 
-            # Check conviction drop threshold (only when entry score is known)
-            if entry_rl_score is not None:
-                drop = entry_rl_score - current_rl_score
+            # Check conviction drop threshold (only when entry rank is known)
+            if entry_rank_pct is not None:
+                drop = entry_rank_pct - current_rank_pct
                 if drop > self.rl_conviction_drop:
                     half_shares = shares * 0.5
                     logger.info(
-                        "RL exit (SELL_PARTIAL) %s: entry_rl_score=%.4f  "
-                        "current_rl_score=%.4f  drop=%.4f  "
-                        "threshold=rl_conviction_drop(%.2f)",
+                        "RL exit (SELL_PARTIAL) %s: entry_rank_pct=%.4f  "
+                        "current_rank_pct=%.4f  drop=%.4f  "
+                        "threshold=rl_conviction_drop(%.2f)  shortlist_n=%d",
                         ticker,
-                        entry_rl_score,
-                        current_rl_score,
+                        entry_rank_pct,
+                        current_rank_pct,
                         drop,
                         self.rl_conviction_drop,
+                        n,
                     )
                     exit_decisions.append(Decision(
                         action="SELL_PARTIAL",
                         ticker=ticker,
                         shares=half_shares,
                         price=price,
-                        score=current_rl_score,
+                        score=current_rank_pct,
                         reason=(
-                            f"RL conviction drop: entry_rl_score={entry_rl_score:.4f} | "
-                            f"current_rl_score={current_rl_score:.4f} | "
+                            f"RL conviction drop: entry_rank_pct={entry_rank_pct:.4f} | "
+                            f"current_rank_pct={current_rank_pct:.4f} | "
                             f"drop={drop:.4f} > rl_conviction_drop={self.rl_conviction_drop:.2f} | "
-                            f"rl_mode=true"
+                            f"shortlist_n={n} | rl_mode=true"
                         ),
                     ))
 

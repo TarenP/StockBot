@@ -55,11 +55,11 @@ class AssetEncoder(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.norm        = nn.LayerNorm(d_model)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, src_key_padding_mask=None) -> torch.Tensor:
         # x: (batch, lookback, n_features)
         x = self.input_proj(x)          # (batch, lookback, d_model)
         x = self.pos_enc(x)
-        x = self.transformer(x)         # (batch, lookback, d_model)
+        x = self.transformer(x, src_key_padding_mask=src_key_padding_mask)  # (batch, lookback, d_model)
         return self.norm(x[:, -1, :])   # take last timestep → (batch, d_model)
 
 
@@ -115,17 +115,24 @@ class PortfolioTransformer(nn.Module):
             nn.Linear(d_model, 1),
         )
 
-    def forward(self, obs: torch.Tensor):
+    def forward(self, obs: torch.Tensor, padding_mask=None):
         """
         obs: (batch, lookback, n_assets, n_features)
+        padding_mask: (batch, n_assets, lookback) bool tensor, True = padded, or None
         """
         batch, lookback, n_assets, n_features = obs.shape
 
         # Encode each asset independently over time
         # Reshape to (batch * n_assets, lookback, n_features)
         x = obs.permute(0, 2, 1, 3).reshape(batch * n_assets, lookback, n_features)
-        asset_emb = self.asset_encoder(x)                          # (B*A, d_model)
-        asset_emb = asset_emb.view(batch, n_assets, self.d_model)  # (B, A, d_model)
+
+        # Reshape padding mask from (batch, n_assets, lookback) to (batch * n_assets, lookback)
+        flat_mask = None
+        if padding_mask is not None:
+            flat_mask = padding_mask.reshape(batch * n_assets, lookback)
+
+        asset_emb = self.asset_encoder(x, src_key_padding_mask=flat_mask)  # (B*A, d_model)
+        asset_emb = asset_emb.view(batch, n_assets, self.d_model)          # (B, A, d_model)
 
         # Cross-asset attention
         asset_emb = self.cross_attn(asset_emb)                     # (B, A, d_model)
@@ -142,8 +149,11 @@ class PortfolioTransformer(nn.Module):
         return logits, value
 
     @torch.no_grad()
-    def get_weights(self, obs: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    def get_weights(self, obs: torch.Tensor, temperature: float = 1.0, padding_mask=None) -> torch.Tensor:
         """Inference: returns the mean portfolio weights of the Dirichlet policy."""
-        logits, _ = self.forward(obs)
+        logits, _ = self.forward(obs, padding_mask=padding_mask)
         concentration = F.softplus(logits / temperature) + 1e-6
+        # Floor the cash concentration to prevent the model from learning
+        # negative/zero cash weights (implicit leverage).
+        concentration[:, -1] = torch.clamp(concentration[:, -1], min=1e-6)
         return concentration / concentration.sum(dim=-1, keepdim=True)

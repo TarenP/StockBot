@@ -590,12 +590,17 @@ def run_shadow_cycle(
     live_config: dict,
     checkpoint_path: str | None = None,
     config_path: str = "broker.config",
+    allow_promotion: bool = False,
 ) -> bool:
     """
     One shadow cycle — called from Broker.py after the live cycle.
 
     Daily:  fast-score all 1000 genomes (~seconds)
     Weekly: full replay validation of top 20, then evolve population
+
+    allow_promotion: if False (default), winning genomes are logged as
+        advisory recommendations but NOT written to broker.config.
+        Pass --approve-promotion on the CLI to enable auto-promotion.
     """
     state = _load_state()
     resolved_checkpoint = _resolve_shadow_checkpoint(checkpoint_path)
@@ -629,9 +634,25 @@ def run_shadow_cycle(
         population = validate_top_genomes(
             population, df_features, price_lookup, resolved_checkpoint
         )
-        population, promoted = _maybe_promote(
-            population, live_config, resolved_checkpoint, config_path
-        )
+        if allow_promotion:
+            population, promoted = _maybe_promote(
+                population, live_config, resolved_checkpoint, config_path
+            )
+        else:
+            # Advisory mode: log the best genome but don't write to config
+            validated = [g for g in population if _is_current_validation(g) and not g.get("is_baseline")]
+            if validated:
+                best = max(validated, key=lambda g: float(g.get("sharpe", -99)))
+                baseline_sharpe = float(next(
+                    (g["sharpe"] for g in population if g.get("is_baseline") and _is_current_validation(g)), 0.0
+                ))
+                if float(best.get("sharpe", -99)) > baseline_sharpe + PROMOTION_MIN_EDGE:
+                    logger.info(
+                        "Shadows: advisory — genome with Sharpe=%.3f beats baseline=%.3f. "
+                        "Run with --approve-promotion to promote to live config.",
+                        float(best.get("sharpe", 0)), baseline_sharpe,
+                    )
+            promoted = False
         population = evolve_population(population, live_config)
         state["last_validated"] = date.today().isoformat()
         state["last_evolved"] = date.today().isoformat()

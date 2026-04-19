@@ -11,10 +11,14 @@ It studies the market, learns patterns from 60+ years of historical data,
 and tells you what stocks look promising. It does not manage money. It does
 not buy or sell anything. It's the brain that gets trained.
 
-**Broker (`Broker.py`) = the portfolio manager.**
-It uses what the Agent learned, plus live data and news, to actually manage
-a portfolio. It buys stocks, sells them, handles options, enforces risk
-limits, and tracks performance vs SPY. This is the thing that runs daily.
+**Broker (`Broker.py`) = your daily research assistant.**
+It uses what the Agent learned, plus live data and news, to analyze the market
+and tell you exactly what to do with your portfolio. Every morning it produces
+a **Daily Briefing** — a plain-English action list: what to buy, what to sell,
+and why. You execute those trades manually in your own brokerage account.
+
+It also maintains a **paper portfolio** that tracks exactly what it would have
+done, so you can compare your real results to its recommendations over time.
 
 In practice:
 - You train the Agent once (takes hours), then occasionally retrain it
@@ -143,24 +147,45 @@ rl_min_score          = 0.0               # Phase 1: min rl_score to enter (0 = 
 python Broker.py
 ```
 
-Every run automatically does all of this in sequence:
+Every run produces a **Daily Briefing** at the end — a plain-English action list:
 
-**1. Maintenance** — checks staleness and runs whatever is out of date:
-- Prices stale (not updated today) → fetches latest from yfinance
-- Sentiment stale (> 2 days old) → scrapes and scores fresh headlines
-- Model stale (> 7 days since finetune) → finetunes on recent data
-- Parameters stale (> 7 days since tune) → runs parameter grid search and updates config
+```
+================================================================
+  DAILY BRIEFING  —  Monday, March 29 2026
+================================================================
 
-**2. Live trading cycle** — exits, screens, buys, logs vs SPY
+  TODAY'S ACTIONS
+  --------------------------------------------------------------
+  SELL  NVDA    12.54 shares @ $167.52
+        Reason: Full take-profit (+57.3%)
+  BUY   MSFT    8.21 shares @ $412.30
+        Reason: Score=0.74 | Strong momentum + positive sentiment
 
-**3. Shadow portfolios** — 5 paper strategies advance one cycle:
-- `baseline` — mirrors live config (control group)
-- `rl_phase2` — RL ranking + conviction-drop exits
-- `aggressive` — higher conviction threshold, tighter stops
-- `conservative` — lower threshold, wider stops, more diversification
-- `options_test` — baseline + options enabled (paper only until proven)
+  CURRENT POSITIONS
+  --------------------------------------------------------------
+  Ticker   Shares    Price      Value      P&L
+  AAPL      12.54  $199.34   $2,500      +0.0%
+  LLY        2.85  $878.24   $2,500      +0.0%
+  MSFT       8.21  $412.30   $3,385      +0.0%
 
-After 30 days, the best-performing shadow's parameters automatically promote to live config. Options go live automatically once `options_test` beats the baseline for 30 consecutive days.
+  PAPER PORTFOLIO PERFORMANCE
+  --------------------------------------------------------------
+  Equity:       $12,450.00
+  Cash:          $2,065.00  (17% of portfolio)
+  Total return:     +24.5%
+  SPY return:       +16.3%  (same period)
+  Alpha vs SPY:      +8.2%  (beats SPY: YES)
+
+  PARAMETER RECOMMENDATION (advisory)
+  --------------------------------------------------------------
+  Sharpe 1.24 vs baseline 1.01 | stop_loss -> 0.12, take_profit -> 0.65
+  run with --approve-promotion to apply
+================================================================
+```
+
+You execute the BUY/SELL actions manually in your own brokerage account.
+The paper portfolio tracks what the system would have done so you can
+compare your real results to its recommendations over time.
 
 ### Check portfolio without trading
 ```bash

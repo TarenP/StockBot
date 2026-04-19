@@ -50,6 +50,12 @@ def _norm_cdf(x: float) -> float:
     return 0.5 * (1 + erf(x / sqrt(2)))
 
 
+def _norm_pdf(x: float) -> float:
+    """Standard normal probability density function."""
+    from math import exp, pi, sqrt
+    return exp(-0.5 * x * x) / sqrt(2 * pi)
+
+
 def black_scholes_greeks(
     S: float, K: float, T: float, r: float, sigma: float,
     option_type: Literal["call", "put"] = "call",
@@ -69,12 +75,20 @@ def black_scholes_greeks(
         price = K * exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
         delta = _norm_cdf(d1) - 1.0
 
-    gamma = _norm_cdf(d1) / (S * sigma * sqrt(T))
-    vega  = S * sqrt(T) * _norm_cdf(d1) * 0.01
-    theta = (
-        -(S * sigma * _norm_cdf(d1)) / (2 * sqrt(T))
-        - r * K * exp(-r * T) * (_norm_cdf(d2) if option_type == "call" else _norm_cdf(-d2))
-    ) / 365
+    # Gamma, vega, theta all require the PDF of d1, not the CDF
+    pdf_d1 = _norm_pdf(d1)
+    gamma  = pdf_d1 / (S * sigma * sqrt(T))
+    vega   = S * sqrt(T) * pdf_d1 * 0.01   # per 1% move in vol
+    if option_type == "call":
+        theta = (
+            -(S * sigma * pdf_d1) / (2 * sqrt(T))
+            - r * K * exp(-r * T) * _norm_cdf(d2)
+        ) / 365
+    else:
+        theta = (
+            -(S * sigma * pdf_d1) / (2 * sqrt(T))
+            + r * K * exp(-r * T) * _norm_cdf(-d2)
+        ) / 365
 
     return {
         "price": round(price, 4), "delta": round(delta, 4),

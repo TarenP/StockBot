@@ -25,6 +25,7 @@ from pipeline.model import PortfolioTransformer
 # ── PPO hyperparameters ──────────────────────────────────────────────────────
 
 PPO_CFG = dict(
+
     lr              = 3e-4,
     gamma           = 0.99,
     gae_lambda      = 0.95,
@@ -35,7 +36,7 @@ PPO_CFG = dict(
     ppo_epochs      = 4,
     batch_size      = 64,
     rollout_steps   = 256,
-    total_steps     = 100_000,
+    total_steps     = 500_000,
     save_every      = 5_000,    # write a resume checkpoint every N steps
 )
 
@@ -181,6 +182,8 @@ def train_fold(
     pretrained_state: dict = None,
     top_n: int = 500,
     force_restart: bool = False,
+    shortlist_universe: list[str] = None,
+    curriculum: bool = False,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -189,6 +192,11 @@ def train_fold(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     os.makedirs(save_dir, exist_ok=True)
+
+    # Use shortlist universe when provided (overrides asset_list)
+    if shortlist_universe is not None and len(shortlist_universe) > 0:
+        asset_list = shortlist_universe
+        tqdm.write(f"  Using shortlist universe: {len(asset_list)} tickers")
 
     feature_cols = [col for col in FEATURE_COLS if col in df_train.columns]
     if not feature_cols:
@@ -270,6 +278,28 @@ def train_fold(
     save_every = cfg.get("save_every", 5_000)
     steps_since_save = 0
 
+    # ── Curriculum setup ──────────────────────────────────────────────────────
+    curriculum_switch_step = cfg["total_steps"] // 2
+    using_small_universe = False
+    if curriculum and len(asset_list) > 20:
+        small_asset_list = asset_list[:20]
+        train_env = PortfolioEnv(
+            df_train,
+            small_asset_list,
+            lookback=lookback,
+            feature_cols=feature_cols,
+        )
+        using_small_universe = True
+        tqdm.write(
+            f"  Curriculum enabled: starting with {len(small_asset_list)} assets, "
+            f"expanding to {len(asset_list)} at step {curriculum_switch_step:,}"
+        )
+    elif curriculum:
+        tqdm.write(
+            f"  Curriculum enabled but asset_list has only {len(asset_list)} assets "
+            f"(<= 20) — using full list from start"
+        )
+
     pbar = tqdm(
         total=cfg["total_steps"],
         initial=steps_done,
@@ -306,6 +336,20 @@ def train_fold(
             steps_done      += cfg["rollout_steps"]
             steps_since_save += cfg["rollout_steps"]
             pbar.update(cfg["rollout_steps"])
+
+            # ── Curriculum: expand universe at midpoint ───────────────────────
+            if curriculum and using_small_universe and steps_done >= curriculum_switch_step:
+                train_env = PortfolioEnv(
+                    df_train,
+                    asset_list,
+                    lookback=lookback,
+                    feature_cols=feature_cols,
+                )
+                using_small_universe = False
+                tqdm.write(
+                    f"  Curriculum: expanded universe to {len(asset_list)} assets "
+                    f"at step {steps_done:,}"
+                )
 
             val_sharpe, val_return = evaluate(model, val_env, device)
 
@@ -396,3 +440,98 @@ def evaluate(model, env, device) -> tuple[float, float]:
     sharpe  = (rets.mean() / (rets.std() + 1e-9)) * np.sqrt(252)
     total_r = float(np.prod(1 + rets) - 1)
     return sharpe, total_r
+
+
+# ── Shortlist universe builder ────────────────────────────────────────────────
+
+def build_shortlist_universe(
+    df_features,
+    screener_model,
+    top_n: int = 100,
+    device: torch.device = None,
+) -> list[str]:
+    """
+    Run the screener on training data and return the union of top-N candidates
+    across all dates. Used to align the RL training universe with the screener.
+
+    Parameters
+    ----------
+    df_features : pd.DataFrame
+        MultiIndex [date, ticker] feature DataFrame (training split).
+    screener_model : TickerScorer
+        Trained screener model (from pipeline.screener.load_screener).
+    top_n : int
+        Number of top candidates to select per date.
+    device : torch.device | None
+        Inference device. Defaults to CPU.
+
+    Returns
+    -------
+    list[str]
+        Sorted list of unique tickers that appeared in any per-date top-N shortlist.
+    """
+    if device is None:
+        device = torch.device("cpu")
+
+    from pipeline.screener import LOOKBACK, MIN_HISTORY_COVERAGE, _heuristic_scores_from_windows
+
+    feat_cols = getattr(screener_model, "_feature_cols", [])
+    if not feat_cols:
+        from pipeline.features import FEATURE_COLS as _FC
+        feat_cols = [c for c in _FC if c in df_features.columns]
+
+    dates = sorted(df_features.index.get_level_values("date").unique())
+    tickers = sorted(df_features.index.get_level_values("ticker").unique())
+    ticker_idx = {t: i for i, t in enumerate(tickers)}
+    n_t = len(tickers)
+    n_features = len(feat_cols)
+
+    # Build aligned feature array
+    feat_arr = np.full((len(dates), n_t, n_features), np.nan, dtype=np.float32)
+    present_mask = np.zeros((len(dates), n_t), dtype=bool)
+    date_idx = {d: i for i, d in enumerate(dates)}
+
+    for (date, ticker), row in df_features[feat_cols].iterrows():
+        di = date_idx.get(date)
+        ti = ticker_idx.get(ticker)
+        if di is None or ti is None:
+            continue
+        feat_arr[di, ti, :] = row.values.astype(np.float32)
+        present_mask[di, ti] = True
+
+    feat_arr = np.nan_to_num(np.clip(feat_arr, -5.0, 5.0), nan=0.0)
+
+    universe_set: set[str] = set()
+    screener_model.eval()
+
+    for di in range(LOOKBACK, len(dates)):
+        history_coverage = present_mask[di - LOOKBACK:di].mean(axis=0)
+        valid_tickers_idx = np.where(history_coverage >= MIN_HISTORY_COVERAGE)[0]
+        if len(valid_tickers_idx) == 0:
+            continue
+
+        obs_list = []
+        for ti in valid_tickers_idx:
+            obs_list.append(feat_arr[di - LOOKBACK:di, ti, :])
+
+        obs_arr = np.array(obs_list, dtype=np.float32)
+        X = torch.tensor(obs_arr, device=device)
+
+        scores = []
+        with torch.no_grad():
+            for start in range(0, len(X), 512):
+                logits = screener_model(X[start:start + 512]).squeeze(1)
+                scores.extend(torch.sigmoid(logits).cpu().numpy().tolist())
+
+        scores_arr = np.array(scores, dtype=np.float32)
+        k = min(top_n, len(scores_arr))
+        top_local_idx = np.argsort(scores_arr)[-k:]
+        for local_i in top_local_idx:
+            universe_set.add(tickers[valid_tickers_idx[local_i]])
+
+    result = sorted(universe_set)
+    tqdm.write(
+        f"  Shortlist universe: {len(result)} unique tickers "
+        f"(union of top-{top_n} across {len(dates) - LOOKBACK} dates)"
+    )
+    return result

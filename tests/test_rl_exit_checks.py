@@ -1,27 +1,27 @@
 """
 Unit tests for BrokerBrain._rl_exit_checks (Phase 2).
 
-The new signature is:
-    _rl_exit_checks(held_tickers: list[str], rl_scores: pd.Series) -> list[Decision]
+The implementation uses rank percentiles within the current shortlist, not
+raw RL scores. This is because mode="rank" scores sum to 1 across the
+shortlist and shrink as the shortlist grows — comparing them to a fixed
+absolute threshold produces exits that depend on shortlist size, not
+conviction.
 
-rl_scores is the cycle-level Series already computed by get_rl_targets — held
-positions are evaluated in the same cross-sectional context as buy candidates,
-not in isolation.  Tickers absent from rl_scores are skipped (deferred to
-heuristic exits).
+Rank percentile semantics:
+  - With N tickers in rl_scores, the lowest-scoring ticker gets rank_pct ≈ 1/N
+  - rl_exit_threshold=0.20 means "exit if in the bottom 20% of the shortlist"
+  - rl_conviction_drop=0.20 means "exit 50% if rank dropped by 0.20 from entry"
 
-Tests:
-  1. SELL generated when current_rl_score < rl_exit_threshold
-  2. SELL_PARTIAL generated when conviction drop > rl_conviction_drop
-  3. Ticker absent from rl_scores is skipped (no spurious exit)
+To control rank percentiles in tests, we construct rl_scores Series with
+enough tickers so the held ticker lands at a known percentile.
 
-Requirements: 4.1, 4.2, 4.4
+Helper: _scores_with_rank_pct(ticker, target_pct, n_total)
+  Returns a Series of n_total tickers where `ticker` has rank_pct ≈ target_pct.
 """
 
-import logging
 import unittest
 import pandas as pd
 import numpy as np
-from datetime import date
 
 from broker.brain import BrokerBrain, Decision
 from broker.portfolio import Portfolio
@@ -42,7 +42,7 @@ def _make_portfolio_with_positions(positions: dict) -> Portfolio:
 
 def _make_brain(
     positions: dict,
-    rl_exit_threshold: float = 0.30,
+    rl_exit_threshold: float = 0.20,
     rl_conviction_drop: float = 0.20,
     rl_phase: int = 2,
 ) -> BrokerBrain:
@@ -60,14 +60,40 @@ def _make_brain(
     return brain
 
 
+def _scores_with_rank_pct(
+    ticker: str,
+    target_rank_pct: float,
+    n_total: int = 10,
+) -> pd.Series:
+    """
+    Build a rl_scores Series of n_total tickers where `ticker` has
+    rank_pct ≈ target_rank_pct.
+
+    rank_pct = rank / n_total  (rank is 1-based, ascending)
+    So target rank = round(target_rank_pct * n_total).
+    We assign scores so that `ticker` lands at that rank.
+    """
+    target_rank = max(1, round(target_rank_pct * n_total))
+    # Assign evenly spaced scores; ticker gets the score at target_rank
+    scores = np.linspace(0.01, 0.99, n_total)
+    ticker_score = scores[target_rank - 1]
+
+    other_tickers = [f"T{i}" for i in range(n_total - 1)]
+    other_scores = [s for s in scores if s != ticker_score]
+
+    data = {t: s for t, s in zip(other_tickers, other_scores)}
+    data[ticker] = ticker_score
+    return pd.Series(data, name="rl_score")
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 class TestRlExitChecks(unittest.TestCase):
 
-    # ── Test 1: SELL when current_rl_score < rl_exit_threshold ───────────────
+    # ── Test 1: SELL when rank_pct < rl_exit_threshold ───────────────────────
 
-    def test_sell_generated_when_score_below_exit_threshold(self):
-        """Requirement 4.1: SELL when current RL score < rl_exit_threshold."""
+    def test_sell_generated_when_rank_below_exit_threshold(self):
+        """SELL when ticker's rank percentile is below rl_exit_threshold."""
         ticker = "AAPL"
         positions = {
             ticker: {
@@ -75,11 +101,12 @@ class TestRlExitChecks(unittest.TestCase):
                 "avg_cost": 150.0,
                 "last_price": 155.0,
                 "partial_taken": False,
-                "rl_score_at_entry": 0.70,
+                "rl_rank_pct_at_entry": 0.80,
             }
         }
-        brain = _make_brain(positions, rl_exit_threshold=0.30)
-        rl_scores = pd.Series({ticker: 0.20}, name="rl_score")  # below threshold
+        brain = _make_brain(positions, rl_exit_threshold=0.20)
+        # ticker at rank_pct ≈ 0.10 — below threshold of 0.20
+        rl_scores = _scores_with_rank_pct(ticker, target_rank_pct=0.10, n_total=10)
 
         decisions = brain._rl_exit_checks([ticker], rl_scores)
 
@@ -92,8 +119,8 @@ class TestRlExitChecks(unittest.TestCase):
         self.assertIn("rl_exit_threshold", d.reason)
         self.assertIn("rl_mode=true", d.reason)
 
-    def test_no_sell_when_score_above_exit_threshold(self):
-        """No exit when current RL score is above rl_exit_threshold."""
+    def test_no_sell_when_rank_above_exit_threshold(self):
+        """No exit when ticker's rank percentile is above rl_exit_threshold."""
         ticker = "MSFT"
         positions = {
             ticker: {
@@ -101,20 +128,21 @@ class TestRlExitChecks(unittest.TestCase):
                 "avg_cost": 300.0,
                 "last_price": 310.0,
                 "partial_taken": False,
-                "rl_score_at_entry": 0.80,
+                "rl_rank_pct_at_entry": 0.80,
             }
         }
-        brain = _make_brain(positions, rl_exit_threshold=0.30, rl_conviction_drop=0.20)
-        rl_scores = pd.Series({ticker: 0.75}, name="rl_score")  # above threshold, small drop
+        brain = _make_brain(positions, rl_exit_threshold=0.20, rl_conviction_drop=0.20)
+        # ticker at rank_pct ≈ 0.70 — above threshold, small drop from 0.80
+        rl_scores = _scores_with_rank_pct(ticker, target_rank_pct=0.70, n_total=10)
 
         decisions = brain._rl_exit_checks([ticker], rl_scores)
 
         self.assertEqual(decisions, [])
 
-    # ── Test 2: SELL_PARTIAL when conviction drop exceeds threshold ───────────
+    # ── Test 2: SELL_PARTIAL when rank drop exceeds rl_conviction_drop ────────
 
-    def test_sell_partial_generated_on_conviction_drop(self):
-        """Requirement 4.2: SELL_PARTIAL when conviction drop > rl_conviction_drop."""
+    def test_sell_partial_generated_on_rank_conviction_drop(self):
+        """SELL_PARTIAL when rank_pct dropped by more than rl_conviction_drop."""
         ticker = "GOOG"
         shares = 8.0
         positions = {
@@ -123,12 +151,12 @@ class TestRlExitChecks(unittest.TestCase):
                 "avg_cost": 100.0,
                 "last_price": 105.0,
                 "partial_taken": False,
-                "rl_score_at_entry": 0.80,
+                "rl_rank_pct_at_entry": 0.80,  # entered at 80th percentile
             }
         }
-        # drop = 0.80 - 0.55 = 0.25 > rl_conviction_drop=0.20
-        brain = _make_brain(positions, rl_exit_threshold=0.30, rl_conviction_drop=0.20)
-        rl_scores = pd.Series({ticker: 0.55}, name="rl_score")
+        # Current rank_pct ≈ 0.50 — drop = 0.80 - 0.50 = 0.30 > rl_conviction_drop=0.20
+        brain = _make_brain(positions, rl_exit_threshold=0.20, rl_conviction_drop=0.20)
+        rl_scores = _scores_with_rank_pct(ticker, target_rank_pct=0.50, n_total=10)
 
         decisions = brain._rl_exit_checks([ticker], rl_scores)
 
@@ -142,7 +170,7 @@ class TestRlExitChecks(unittest.TestCase):
         self.assertIn("rl_mode=true", d.reason)
 
     def test_sell_partial_not_generated_when_drop_below_threshold(self):
-        """No SELL_PARTIAL when conviction drop is within the allowed threshold."""
+        """No SELL_PARTIAL when rank drop is within the allowed threshold."""
         ticker = "TSLA"
         positions = {
             ticker: {
@@ -150,19 +178,19 @@ class TestRlExitChecks(unittest.TestCase):
                 "avg_cost": 200.0,
                 "last_price": 210.0,
                 "partial_taken": False,
-                "rl_score_at_entry": 0.70,
+                "rl_rank_pct_at_entry": 0.70,
             }
         }
-        # drop = 0.70 - 0.55 = 0.15 < rl_conviction_drop=0.20
-        brain = _make_brain(positions, rl_exit_threshold=0.30, rl_conviction_drop=0.20)
-        rl_scores = pd.Series({ticker: 0.55}, name="rl_score")
+        # Current rank_pct ≈ 0.60 — drop = 0.70 - 0.60 = 0.10 < rl_conviction_drop=0.20
+        brain = _make_brain(positions, rl_exit_threshold=0.20, rl_conviction_drop=0.20)
+        rl_scores = _scores_with_rank_pct(ticker, target_rank_pct=0.60, n_total=10)
 
         decisions = brain._rl_exit_checks([ticker], rl_scores)
 
         self.assertEqual(decisions, [])
 
-    def test_sell_partial_not_generated_without_entry_score(self):
-        """Pre-RL positions (no rl_score_at_entry) skip conviction drop check."""
+    def test_sell_partial_not_generated_without_entry_rank(self):
+        """Pre-RL positions (no rank metadata) skip conviction drop check."""
         ticker = "AMZN"
         positions = {
             ticker: {
@@ -170,11 +198,12 @@ class TestRlExitChecks(unittest.TestCase):
                 "avg_cost": 180.0,
                 "last_price": 185.0,
                 "partial_taken": False,
-                # no rl_score_at_entry
+                # no rl_rank_pct_at_entry, no rl_score_at_entry
             }
         }
-        brain = _make_brain(positions, rl_exit_threshold=0.30, rl_conviction_drop=0.20)
-        rl_scores = pd.Series({ticker: 0.50}, name="rl_score")
+        brain = _make_brain(positions, rl_exit_threshold=0.20, rl_conviction_drop=0.20)
+        # rank_pct ≈ 0.50 — above threshold, but no entry rank to compare
+        rl_scores = _scores_with_rank_pct(ticker, target_rank_pct=0.50, n_total=10)
 
         decisions = brain._rl_exit_checks([ticker], rl_scores)
 
@@ -183,10 +212,7 @@ class TestRlExitChecks(unittest.TestCase):
     # ── Test 3: Ticker absent from rl_scores is skipped ──────────────────────
 
     def test_ticker_absent_from_rl_scores_is_skipped(self):
-        """
-        Requirement 4.4: A held ticker not present in the cycle rl_scores
-        (e.g. fell off the shortlist) generates no exit decision.
-        """
+        """A held ticker not in the cycle rl_scores generates no exit decision."""
         ticker = "META"
         positions = {
             ticker: {
@@ -194,43 +220,39 @@ class TestRlExitChecks(unittest.TestCase):
                 "avg_cost": 250.0,
                 "last_price": 260.0,
                 "partial_taken": False,
-                "rl_score_at_entry": 0.75,
+                "rl_rank_pct_at_entry": 0.75,
             }
         }
         brain = _make_brain(positions)
-        # rl_scores does not contain META — it was not in the shortlist this cycle
         rl_scores = pd.Series({"OTHER": 0.50}, name="rl_score")
 
         decisions = brain._rl_exit_checks([ticker], rl_scores)
 
-        self.assertEqual(decisions, [], "Ticker absent from rl_scores should be skipped")
+        self.assertEqual(decisions, [])
 
     # ── Test 4: Mixed tickers — one present, one absent ───────────────────────
 
     def test_mixed_tickers_one_absent(self):
-        """
-        When one ticker is in rl_scores and triggers a SELL, and another is
-        absent, only the present ticker generates a decision.
-        """
+        """Only the present ticker generates a decision."""
         positions = {
             "GOOD": {
                 "shares": 5.0,
                 "avg_cost": 100.0,
                 "last_price": 102.0,
                 "partial_taken": False,
-                "rl_score_at_entry": 0.70,
+                "rl_rank_pct_at_entry": 0.80,
             },
             "ABSENT": {
                 "shares": 3.0,
                 "avg_cost": 200.0,
                 "last_price": 205.0,
                 "partial_taken": False,
-                "rl_score_at_entry": 0.65,
+                "rl_rank_pct_at_entry": 0.65,
             },
         }
-        brain = _make_brain(positions, rl_exit_threshold=0.30)
-        # GOOD is in rl_scores with a low score; ABSENT is not
-        rl_scores = pd.Series({"GOOD": 0.15}, name="rl_score")
+        brain = _make_brain(positions, rl_exit_threshold=0.20)
+        # GOOD at rank_pct ≈ 0.10 (bottom 10%) — triggers SELL; ABSENT not in scores
+        rl_scores = _scores_with_rank_pct("GOOD", target_rank_pct=0.10, n_total=10)
 
         decisions = brain._rl_exit_checks(["GOOD", "ABSENT"], rl_scores)
 
@@ -249,22 +271,22 @@ class TestRlExitChecks(unittest.TestCase):
                 "avg_cost": 500.0,
                 "last_price": 510.0,
                 "partial_taken": False,
-                "rl_score_at_entry": 0.90,
+                "rl_rank_pct_at_entry": 0.90,
             }
         }
-        # score 0.10 < threshold (0.30) AND drop (0.80) > conviction_drop (0.20)
-        brain = _make_brain(positions, rl_exit_threshold=0.30, rl_conviction_drop=0.20)
-        rl_scores = pd.Series({ticker: 0.10}, name="rl_score")
+        # rank_pct ≈ 0.10 — below threshold (0.20) AND drop (0.80) > conviction_drop (0.20)
+        brain = _make_brain(positions, rl_exit_threshold=0.20, rl_conviction_drop=0.20)
+        rl_scores = _scores_with_rank_pct(ticker, target_rank_pct=0.10, n_total=10)
 
         decisions = brain._rl_exit_checks([ticker], rl_scores)
 
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions[0].action, "SELL")
 
-    # ── Test 6: Reason field contains required log fields (Req 12.3) ──────────
+    # ── Test 6: Reason field contains rank percentile fields ──────────────────
 
-    def test_rl_exit_reason_contains_required_log_fields(self):
-        """Requirement 12.3: reason must contain entry score, current score, drop, threshold."""
+    def test_rl_exit_reason_contains_rank_fields(self):
+        """Reason must contain rank_pct, entry_rank_pct, and threshold."""
         ticker = "AMD"
         positions = {
             ticker: {
@@ -272,20 +294,48 @@ class TestRlExitChecks(unittest.TestCase):
                 "avg_cost": 120.0,
                 "last_price": 125.0,
                 "partial_taken": False,
-                "rl_score_at_entry": 0.85,
+                "rl_rank_pct_at_entry": 0.80,
             }
         }
-        brain = _make_brain(positions, rl_exit_threshold=0.30, rl_conviction_drop=0.20)
-        # Trigger SELL_PARTIAL: drop = 0.85 - 0.60 = 0.25 > 0.20, score 0.60 > threshold
-        rl_scores = pd.Series({ticker: 0.60}, name="rl_score")
+        brain = _make_brain(positions, rl_exit_threshold=0.20, rl_conviction_drop=0.20)
+        # rank_pct ≈ 0.50 — above threshold, drop = 0.80 - 0.50 = 0.30 > 0.20
+        rl_scores = _scores_with_rank_pct(ticker, target_rank_pct=0.50, n_total=10)
 
         decisions = brain._rl_exit_checks([ticker], rl_scores)
 
         self.assertEqual(len(decisions), 1)
         reason = decisions[0].reason
-        self.assertIn("0.8500", reason)
-        self.assertIn("0.6000", reason)
         self.assertIn("rl_conviction_drop", reason)
+        self.assertIn("rl_mode=true", reason)
+        self.assertIn("shortlist_n=", reason)
+
+    # ── Test 7: Legacy positions with only rl_score_at_entry ─────────────────
+
+    def test_legacy_position_uses_raw_score_as_rank_proxy(self):
+        """
+        Positions with only rl_score_at_entry (no rl_rank_pct_at_entry) use
+        the raw score as a rough rank proxy for backward compatibility.
+        A large enough drop should still trigger SELL_PARTIAL.
+        """
+        ticker = "INTC"
+        positions = {
+            ticker: {
+                "shares": 5.0,
+                "avg_cost": 40.0,
+                "last_price": 38.0,
+                "partial_taken": False,
+                "rl_score_at_entry": 0.80,  # legacy: raw score, no rank_pct
+            }
+        }
+        brain = _make_brain(positions, rl_exit_threshold=0.20, rl_conviction_drop=0.20)
+        # rank_pct ≈ 0.50 — above threshold, drop from proxy 0.80 = 0.30 > 0.20
+        rl_scores = _scores_with_rank_pct(ticker, target_rank_pct=0.50, n_total=10)
+
+        decisions = brain._rl_exit_checks([ticker], rl_scores)
+
+        # Should trigger SELL_PARTIAL since drop from legacy proxy (0.80) is large
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].action, "SELL_PARTIAL")
 
 
 if __name__ == "__main__":

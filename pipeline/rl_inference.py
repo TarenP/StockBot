@@ -111,7 +111,7 @@ def _build_obs_tensor(
     feature_cols: list[str],
     lookback: int,
     device: torch.device,
-) -> tuple[torch.Tensor, list[str]]:
+) -> tuple[torch.Tensor, list[str], "torch.Tensor | None"]:
     """
     Build observation tensor (1, lookback, n_assets, n_features).
 
@@ -120,7 +120,9 @@ def _build_obs_tensor(
     - Clips to [-5.0, 5.0].
     - Pads with zeros for tickers with insufficient history.
 
-    Returns (obs_tensor, tickers_with_insufficient_history).
+    Returns (obs_tensor, tickers_with_insufficient_history, padding_mask).
+    padding_mask is a bool tensor of shape (1, n_assets, lookback) with True
+    for padded positions, or None if no tickers are padded.
     """
     n_assets = len(asset_list)
     n_features = len(feature_cols)
@@ -173,10 +175,49 @@ def _build_obs_tensor(
                 obs[obs_t_idx, asset_map[ticker], :] = row.values.astype(np.float32)
 
     obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-    return obs_t, insufficient
+
+    # ── Build padding mask ────────────────────────────────────────────────────
+    # Shape: (1, n_assets, lookback) — True means "ignore this position"
+    padding_mask = None
+    if insufficient:
+        mask_np = np.zeros((1, n_assets, lookback), dtype=bool)
+        for ticker in insufficient:
+            ai = asset_map.get(ticker)
+            if ai is not None:
+                mask_np[0, ai, :] = True
+        padding_mask = torch.tensor(mask_np, dtype=torch.bool, device=device)
+
+    return obs_t, insufficient, padding_mask
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
+def _load_ensemble(
+    models_dir: str,
+    device: torch.device,
+) -> list[tuple]:
+    """
+    Load all best_fold*.pt checkpoints from models_dir.
+
+    Returns a list of (model, ckpt) pairs. Corrupt checkpoints are skipped
+    with a WARNING log. Raises ModelNotAvailableError if no valid checkpoints
+    are found.
+    """
+    import glob as _glob
+    paths = sorted(_glob.glob(os.path.join(models_dir, "best_fold*.pt")))
+    ensemble = []
+    for path in paths:
+        try:
+            model, ckpt = _load_model(path, device)
+            ensemble.append((model, ckpt))
+        except ModelNotAvailableError as exc:
+            logger.warning("Skipping checkpoint %s: %s", path, exc)
+    if not ensemble:
+        raise ModelNotAvailableError(
+            f"No valid checkpoints found in '{models_dir}'."
+        )
+    return ensemble
+
 
 def get_rl_targets(
     df_recent: pd.DataFrame,
@@ -196,7 +237,10 @@ def get_rl_targets(
     asset_list : list[str]
         Ordered list of tickers to score.
     checkpoint_path : str
-        Path to a .pt checkpoint file.
+        Path to a .pt checkpoint file, a directory containing best_fold*.pt
+        files, or "auto" to load all checkpoints from the "models/" directory.
+        When a directory or "auto" is given, all valid checkpoints are loaded
+        and their weights are averaged (ensemble inference).
     mode : str
         "rank"    → pd.Series[ticker → rl_score ∈ [0, 1]]
         "weights" → pd.Series[ticker | "CASH" → weight], sum = 1.0
@@ -218,11 +262,14 @@ def get_rl_targets(
     if device is None:
         device = torch.device("cpu")
 
-    # ── Load model ────────────────────────────────────────────────────────────
-    model, ckpt = _load_model(checkpoint_path, device)
+    # ── Determine whether to use ensemble or single checkpoint ───────────────
+    use_ensemble = (
+        checkpoint_path == "auto"
+        or os.path.isdir(checkpoint_path)
+    )
 
     # ── Build observation tensor ──────────────────────────────────────────────
-    obs_t, insufficient = _build_obs_tensor(
+    obs_t, insufficient, padding_mask = _build_obs_tensor(
         df_recent, asset_list, FEATURE_COLS, lookback, device
     )
 
@@ -234,9 +281,23 @@ def get_rl_targets(
             insufficient[:10],
         )
 
-    # ── Forward pass ─────────────────────────────────────────────────────────
-    weights = model.get_weights(obs_t)  # (1, n_assets + 1)
-    weights_np = weights.squeeze(0).cpu().numpy()  # (n_assets + 1,)
+    if use_ensemble:
+        # ── Ensemble inference ────────────────────────────────────────────────
+        models_dir = "models" if checkpoint_path == "auto" else checkpoint_path
+        ensemble = _load_ensemble(models_dir, device)
+        logger.info("Ensemble inference using %d checkpoint(s)", len(ensemble))
+
+        all_weights = []
+        for model, _ckpt in ensemble:
+            w = model.get_weights(obs_t, padding_mask=padding_mask)
+            all_weights.append(w.squeeze(0).cpu().numpy())
+
+        weights_np = np.stack(all_weights, axis=0).mean(axis=0)  # (n_assets + 1,)
+    else:
+        # ── Single checkpoint inference ───────────────────────────────────────
+        model, ckpt = _load_model(checkpoint_path, device)
+        weights = model.get_weights(obs_t, padding_mask=padding_mask)
+        weights_np = weights.squeeze(0).cpu().numpy()
 
     asset_weights = weights_np[:-1]   # (n_assets,)
     cash_weight = float(weights_np[-1])

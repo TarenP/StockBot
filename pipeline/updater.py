@@ -8,6 +8,7 @@ import time
 import logging
 import os
 import sys
+import requests
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timedelta

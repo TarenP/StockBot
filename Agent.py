@@ -263,6 +263,45 @@ def run_train(args):
     best_ckpts = []
     selected_folds = folds[:debug_settings["folds"]]
 
+    # ── Train screener first (needed to build shortlist universe) ─────────────
+    if not debug_settings["skip_screener_train"]:
+        logger.info("\nTraining screener on full universe...")
+        logger.info("The screener narrows 11,500+ tickers to a shortlist for the RL agent.")
+        try:
+            from pipeline.data import load_master as _load_all
+            from pipeline.screener import train_screener
+
+            df_all = _load_all(top_n=99_999, include_raw_cols=True)
+            train_screener(
+                df_all,
+                device=DEVICE,
+                epochs=debug_settings["screener_epochs"],
+                force_rebuild_cache=args.force_retrain,
+            )
+            logger.info("Screener training complete.")
+        except Exception as exc:
+            logger.warning(f"Screener training failed (continuing): {exc}")
+
+    # ── Build shortlist universe from screener (if screener is trained) ───────
+    shortlist_universe = None
+    if not debug_settings["skip_screener_train"]:
+        try:
+            from pipeline.screener import SCREENER_CKPT, load_screener
+            from pipeline.train import build_shortlist_universe
+            import os as _os
+            if _os.path.exists(SCREENER_CKPT):
+                logger.info("Building shortlist universe from trained screener...")
+                screener_model = load_screener(DEVICE)
+                shortlist_universe = build_shortlist_universe(
+                    df_features=df,
+                    screener_model=screener_model,
+                    top_n=100,
+                    device=DEVICE,
+                )
+                logger.info(f"Shortlist universe: {len(shortlist_universe)} tickers")
+        except Exception as exc:
+            logger.warning(f"Could not build shortlist universe ({exc}) — using full asset_list")
+
     with tqdm(
         total=len(selected_folds),
         desc="Training folds",
@@ -296,6 +335,7 @@ def run_train(args):
                     seed=args.seed,
                     top_n=top_n,
                     force_restart=args.force_retrain,
+                    shortlist_universe=shortlist_universe,
                 )
                 best_ckpts.append((ckpt_path, val_sharpe))
                 folds_pbar.update(1)
@@ -313,23 +353,6 @@ def run_train(args):
 
         if debug_settings["skip_screener_train"]:
             logger.info("\nSkipping screener retraining for this run.")
-        else:
-            logger.info("\nTraining screener on full universe...")
-            logger.info("The screener narrows 11,500+ tickers to a shortlist for the RL agent.")
-            try:
-                from pipeline.data import load_master as _load_all
-                from pipeline.screener import train_screener
-
-                df_all = _load_all(top_n=99_999, include_raw_cols=True)
-                train_screener(
-                    df_all,
-                    device=DEVICE,
-                    epochs=debug_settings["screener_epochs"],
-                    force_rebuild_cache=args.force_retrain,
-                )
-                logger.info("Screener training complete.")
-            except Exception as exc:
-                logger.warning(f"Screener training failed (continuing): {exc}")
 
         logger.info("\nRunning shadow warm-up on historical data...")
         logger.info("This finds the best broker parameters from history so you")

@@ -209,9 +209,22 @@ def run_cycle(
             adj_value = risk.apply_execution_cost(d.shares * d.price, d.price, is_penny)
             adj_shares = adj_value / d.price if d.price > 0 else 0
             ok = portfolio.buy(d.ticker, adj_shares, d.price, d.reason)
-            # Store rl_score_at_entry in position metadata when RL is enabled
-            if ok and hasattr(d, "_rl_score_at_entry") and d.ticker in portfolio.positions:
-                portfolio.positions[d.ticker]["rl_score_at_entry"] = d._rl_score_at_entry
+            # Store rl_score_at_entry and rl_rank_pct_at_entry in position metadata.
+            # rank_pct is the rank percentile within the shortlist at entry time —
+            # used by _rl_exit_checks() for stable threshold comparisons.
+            if ok and brain.rl_enabled and d.ticker in portfolio.positions:
+                portfolio.positions[d.ticker]["rl_score_at_entry"] = d.score
+                # Compute rank percentile from the brain's last rl_scores if available
+                # (stored as a cycle-level attribute set during run_cycle)
+                last_rl_scores = getattr(brain, "_last_rl_scores", None)
+                if last_rl_scores is not None and not last_rl_scores.empty:
+                    n = len(last_rl_scores)
+                    rank_pct = float(
+                        last_rl_scores.rank(method="average", ascending=True).get(d.ticker, 0) / n
+                    )
+                else:
+                    rank_pct = float(d.score)  # fallback: use raw score as proxy
+                portfolio.positions[d.ticker]["rl_rank_pct_at_entry"] = rank_pct
 
         elif d.action == "SELL":
             ok = portfolio.sell_all(d.ticker, d.price, d.reason)
@@ -251,7 +264,7 @@ def run_cycle(
     # ── Summary ───────────────────────────────────────────────────────────────
     report = daily_integrity_check(portfolio)
     if "beating_spy" in report:
-        status = "✓ beating SPY" if report["beating_spy"] else "✗ trailing SPY"
+        status = "beating SPY" if report["beating_spy"] else "trailing SPY"
         logger.info(
             f"Done | Equity: ${portfolio.equity:,.2f} | "
             f"Return: {portfolio.total_return:+.2%} | {status} "
@@ -264,32 +277,16 @@ def run_cycle(
             f"{len(portfolio.options.positions)} options"
         )
 
+    # Update live performance chart (silent)
+    try:
+        from broker.journal import plot_live_performance
+        plot_live_performance("plots/live_performance.png")
+    except Exception:
+        pass
 
-    # ── Auto-show full status + cycle summary ─────────────────────────────────
-    print_report(portfolio, show_benchmark=True)
-
-    # Update live performance chart
-    from broker.journal import plot_live_performance
-    plot_live_performance("plots/live_performance.png")
-
-    # Show only what changed this cycle
-    if executed:
-        print(f"\n  {'─'*55}")
-        print(f"  This cycle — {len(executed)} trade(s):")
-        print(f"  {'─'*55}")
-        for d in executed:
-            if d.action == "BUY":
-                print(f"  BOUGHT  {d.ticker:<8} {d.shares:.2f} shares @ ${d.price:.2f}")
-            elif d.action in ("SELL", "SELL_PARTIAL"):
-                label = "SOLD   " if d.action == "SELL" else "SOLD 50%"
-                print(f"  {label} {d.ticker:<8} {d.shares:.2f} shares @ ${d.price:.2f}  ({d.reason.split('|')[0].strip()})")
-            elif d.action == "OPEN_OPTION":
-                print(f"  OPTION  {d.ticker:<8} {d.reason[:60]}")
-            elif d.action == "CLOSE_OPTION":
-                print(f"  CLOSED  {d.ticker:<8} option — {d.reason[:50]}")
-        print(f"  {'─'*55}\n")
-    else:
-        print(f"\n  No trades this cycle.\n")
+    # ── Daily briefing — the primary human-facing output ──────────────────────
+    from broker.briefing import print_daily_briefing
+    print_daily_briefing(decisions, portfolio, executed)
 
     brain.min_score = brain._base_min_score
 

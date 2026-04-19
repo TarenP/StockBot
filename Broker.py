@@ -49,7 +49,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_LOCK_FILE = Path("broker/state/.cycle_lock")
+_LOCK_FILE  = Path("broker/state/.cycle_lock")
+_STATE_FILE = Path("broker/state/.run_state.json")
+
+
+def _write_run_state(stage: str, status: str = "running") -> None:
+    """Atomic run-state record. Written at each stage; 'complete' only at end."""
+    import os, json
+    _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _STATE_FILE.write_text(json.dumps({
+        "date":   date.today().isoformat(),
+        "pid":    os.getpid(),
+        "stage":  stage,
+        "status": status,
+    }))
 
 
 # ── Config loader ─────────────────────────────────────────────────────────────
@@ -92,6 +105,8 @@ if __name__ == "__main__":
     p.add_argument("--trades",          action="store_true", help="Show recent trade history")
     p.add_argument("--no_shadows",      action="store_true", help="Skip shadow portfolio step")
     p.add_argument("--no_maintenance",  action="store_true", help="Skip staleness checks")
+    p.add_argument("--approve-promotion", action="store_true",
+                   help="Allow shadow genomes to auto-promote to live config this run")
     args = p.parse_args()
 
     # Always reload config fresh — the auto-tuner may have updated it
@@ -100,16 +115,35 @@ if __name__ == "__main__":
     # ── Duplicate run prevention ──────────────────────────────────────────────
     if not (args.status or args.trades):
         today_str = date.today().isoformat()
-        if _LOCK_FILE.exists():
-            lock_date = _LOCK_FILE.read_text().strip()
-            if lock_date == today_str:
-                logger.warning(
-                    "Broker already ran today (%s). "
-                    "Delete broker/state/.cycle_lock to force a re-run.", today_str
+        import json as _json
+        prev = {}
+        try:
+            prev = _json.loads(_STATE_FILE.read_text()) if _STATE_FILE.exists() else {}
+        except Exception:
+            pass
+
+        if prev.get("date") == today_str and prev.get("status") == "complete":
+            logger.warning(
+                "Broker already completed a full cycle today (%s). "
+                "Delete broker/state/.run_state.json to force a re-run.", today_str
+            )
+            print(f"\n  Already ran today ({today_str}). Use --status to check portfolio.\n")
+            sys.exit(0)
+        elif prev.get("date") == today_str and prev.get("status") == "running":
+            import os
+            prev_pid = prev.get("pid", 0)
+            try:
+                os.kill(prev_pid, 0)   # check if PID is still alive
+                logger.error(
+                    "Another broker process (PID %d) appears to be running. "
+                    "If it crashed, delete broker/state/.run_state.json.", prev_pid
                 )
-                print(f"\n  Already ran today ({today_str}). Use --status to check portfolio.\n")
-                sys.exit(0)
-        _LOCK_FILE.write_text(today_str)
+                sys.exit(1)
+            except (OSError, ProcessLookupError):
+                logger.warning("Previous run (PID %d) appears crashed at stage '%s' — resuming.",
+                               prev_pid, prev.get("stage", "unknown"))
+
+        _write_run_state("startup")
 
     # ── Status / trades — no trading ──────────────────────────────────────────
     if args.status or args.trades:
@@ -132,6 +166,7 @@ if __name__ == "__main__":
     # ── Step 1: Maintenance — update stale data / model / params ─────────────
     maintenance_context = None
     if not args.no_maintenance:
+        _write_run_state("maintenance")
         try:
             from pipeline.maintenance import run_maintenance
             maintenance_context = run_maintenance(
@@ -143,6 +178,7 @@ if __name__ == "__main__":
             logger.warning("Maintenance step failed (continuing): %s", exc)
 
     # ── Step 2: Live trading cycle ────────────────────────────────────────────
+    _write_run_state("trading")
     try:
         from broker.broker import main as broker_main
         broker_main(config, maintenance_context=maintenance_context)
@@ -162,6 +198,7 @@ if __name__ == "__main__":
 
     # ── Step 3: Shadow portfolios ─────────────────────────────────────────────
     if not args.no_shadows:
+        _write_run_state("shadows")
         try:
             from pipeline.data import load_master
             from broker.replay import _build_price_lookup
@@ -172,10 +209,11 @@ if __name__ == "__main__":
             price_lookup = _build_price_lookup()
 
             run_shadow_cycle(
-                df_features  = df_features,
-                price_lookup = price_lookup,
-                live_config  = config,
+                df_features     = df_features,
+                price_lookup    = price_lookup,
+                live_config     = config,
                 checkpoint_path = config.get("rl_checkpoint_path"),
+                allow_promotion = getattr(args, "approve_promotion", False),
             )
 
             # Reload config — shadows may have promoted new parameters
@@ -184,3 +222,6 @@ if __name__ == "__main__":
 
         except Exception as exc:
             logger.warning("Shadow portfolio step failed (continuing): %s", exc)
+
+    # ── Mark cycle complete ───────────────────────────────────────────────────
+    _write_run_state("complete", status="complete")

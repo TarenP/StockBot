@@ -54,6 +54,26 @@ class Portfolio:
                     logger.warning("Removing invalid position: %s", t)
                     del self.positions[t]
 
+                # Migrate legacy positions: if rl_score_at_entry exists but
+                # rl_rank_pct_at_entry does not, use the raw score as a proxy.
+                # This ensures conviction-drop exits work for existing positions
+                # without requiring them to be closed and reopened.
+                migrated = 0
+                for pos in self.positions.values():
+                    if (
+                        "rl_score_at_entry" in pos
+                        and "rl_rank_pct_at_entry" not in pos
+                    ):
+                        pos["rl_rank_pct_at_entry"] = float(pos["rl_score_at_entry"])
+                        migrated += 1
+                if migrated:
+                    logger.info(
+                        "Migrated %d position(s): set rl_rank_pct_at_entry from "
+                        "legacy rl_score_at_entry (approximate — will be accurate "
+                        "on next buy).",
+                        migrated,
+                    )
+
                 logger.info(f"Portfolio loaded. Cash: ${self.cash:,.2f} | "
                             f"Positions: {len(self.positions)}")
             except Exception as e:
