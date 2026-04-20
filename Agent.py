@@ -460,13 +460,14 @@ def run_backtest_mode(args):
         logger.error("No checkpoint found. Run --mode train first.")
         return
 
-    model = load_model(ckpt_path, DEVICE)
+    model, ckpt_n_features = load_model(ckpt_path, DEVICE)
     run_backtest(
-        model      = model,
-        df_test    = df_test,
-        asset_list = asset_list,
-        device     = DEVICE,
-        save_plot  = "plots/backtest.png",
+        model           = model,
+        df_test         = df_test,
+        asset_list      = asset_list,
+        device          = DEVICE,
+        save_plot       = "plots/backtest.png",
+        ckpt_n_features = ckpt_n_features,
     )
 
 
@@ -496,7 +497,7 @@ def run_predict(args):
         logger.error("No checkpoint found. Run --mode train first.")
         return
 
-    model = load_model(ckpt_path, DEVICE)
+    model, ckpt_n_features = load_model(ckpt_path, DEVICE)
 
     lookback = 20
     dates    = sorted(df.index.get_level_values("date").unique())
@@ -523,14 +524,18 @@ def run_predict(args):
     except Exception:
         pass
 
-    n_features = df.shape[1]
+    # Slice feature columns to match what the checkpoint was trained on
+    feature_cols_pred = FEATURE_COLS[:ckpt_n_features]
+    # Only keep columns that exist in df
+    feature_cols_pred = [c for c in feature_cols_pred if c in df.columns]
+    n_features = len(feature_cols_pred)
     n_assets   = len(asset_list)
     asset_map  = {a: i for i, a in enumerate(asset_list)}
     obs        = np.zeros((lookback, n_assets, n_features), dtype=np.float32)
 
     for t_idx, date in enumerate(recent_dates):
         try:
-            slice_df = df_recent.loc[date]
+            slice_df = df_recent[feature_cols_pred].loc[date]
             for ticker, row in slice_df.iterrows():
                 if ticker in asset_map:
                     obs[t_idx, asset_map[ticker], :] = row.values.astype(np.float32)
@@ -546,7 +551,7 @@ def run_predict(args):
     # ── Build ranked output table ────────────────────────────────────────────
     # Grab the most recent feature snapshot per ticker for signal context
     last_date    = recent_dates[-1]
-    feature_cols = [c for c in FEATURE_COLS if c in df.columns]
+    feature_cols = feature_cols_pred
 
     rows = []
     for idx, ticker in enumerate(asset_list):
