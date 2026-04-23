@@ -34,19 +34,25 @@ _STATIC_SECTOR_MAP = {
     "META":"Technology","AVGO":"Technology","ORCL":"Technology","CRM":"Technology",
     "AMD":"Technology","INTC":"Technology","QCOM":"Technology","TXN":"Technology",
     "AMAT":"Technology","MU":"Technology","KLAC":"Technology","LRCX":"Technology",
+    "PLTR":"Technology","SMCI":"Technology","ADBE":"Technology","PANW":"Technology",
+    "CRWD":"Technology","SNPS":"Technology","CDNS":"Technology","NOW":"Technology",
+    "ANET":"Technology",
     # Healthcare
     "LLY":"Healthcare","UNH":"Healthcare","JNJ":"Healthcare","ABBV":"Healthcare",
     "MRK":"Healthcare","TMO":"Healthcare","ABT":"Healthcare","DHR":"Healthcare",
     "PFE":"Healthcare","AMGN":"Healthcare","ISRG":"Healthcare","GILD":"Healthcare",
+    "HUM":"Healthcare","BIIB":"Healthcare","BEAM":"Healthcare","MRNA":"Healthcare",
     # Financials
     "BRK-B":"Financials","JPM":"Financials","V":"Financials","MA":"Financials",
     "BAC":"Financials","WFC":"Financials","GS":"Financials","MS":"Financials",
     "BLK":"Financials","SCHW":"Financials","AXP":"Financials","C":"Financials",
+    "COIN":"Financials","AFRM":"Financials","PYPL":"Financials","SOFI":"Financials",
     # Consumer Discretionary
     "AMZN":"Consumer Discretionary","TSLA":"Consumer Discretionary",
     "HD":"Consumer Discretionary","MCD":"Consumer Discretionary",
     "NKE":"Consumer Discretionary","SBUX":"Consumer Discretionary",
     "TJX":"Consumer Discretionary","LOW":"Consumer Discretionary",
+    "CCL":"Consumer Discretionary","BKNG":"Consumer Discretionary",
     # Consumer Staples
     "WMT":"Consumer Staples","PG":"Consumer Staples","KO":"Consumer Staples",
     "PEP":"Consumer Staples","COST":"Consumer Staples","PM":"Consumer Staples",
@@ -54,6 +60,7 @@ _STATIC_SECTOR_MAP = {
     # Energy
     "XOM":"Energy","CVX":"Energy","COP":"Energy","EOG":"Energy",
     "SLB":"Energy","MPC":"Energy","PSX":"Energy","VLO":"Energy",
+    "PUMP":"Energy",
     # Industrials
     "GE":"Industrials","CAT":"Industrials","RTX":"Industrials","HON":"Industrials",
     "UPS":"Industrials","BA":"Industrials","LMT":"Industrials","DE":"Industrials",
@@ -61,12 +68,14 @@ _STATIC_SECTOR_MAP = {
     "NFLX":"Communication Services","DIS":"Communication Services",
     "CMCSA":"Communication Services","T":"Communication Services",
     "VZ":"Communication Services","TMUS":"Communication Services",
+    "WBD":"Communication Services","SPOT":"Communication Services",
     # Utilities
     "NEE":"Utilities","DUK":"Utilities","SO":"Utilities","D":"Utilities",
     # Real Estate
     "PLD":"Real Estate","AMT":"Real Estate","EQIX":"Real Estate",
     # Materials
     "LIN":"Materials","APD":"Materials","SHW":"Materials","FCX":"Materials",
+    "AGI":"Materials","NEM":"Materials",
 }
 
 ALL_SECTORS = [

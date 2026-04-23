@@ -415,333 +415,68 @@ def run_replay(
     strategy: str = "heuristics_only",
     checkpoint_path: str | None = None,
     initial_cash: float = 10_000.0,
-    rebalance_freq: int = 5,          # run broker logic every N trading days
+    rebalance_freq: int = 5,
     max_positions: int = 20,
+    max_position_pct: float = 0.10,
     min_score: float = 0.60,
     stop_loss_floor: float = 0.07,
     take_profit: float = 0.45,
+    max_daily_loss: float = 0.03,
+    max_drawdown: float = 0.15,
+    max_gross_exposure: float = 0.95,
+    cash_floor: float = 0.05,
+    target_volatility: float = 0.15,
+    vol_lookback: int = 20,
+    partial_profit_pct: float = 0.20,
     penny_pct: float = 0.20,
     max_sector_pct: float = 0.40,
     max_pair_correlation: float = 0.80,
     correlation_lookback_days: int = 60,
-    execution_spread: float = 0.001,  # 10 bps flat for replay simplicity
+    avoid_earnings_days: int = 3,
+    execution_spread: float = 0.001,
+    rl_phase: int = 1,
+    rl_exit_threshold: float = 0.30,
+    rl_conviction_drop: float = 0.20,
+    rl_min_score: float = 0.0,
     label: str | None = None,
 ) -> tuple[np.ndarray, list]:
     """
     Run the broker decision logic over historical data.
-
-    Parameters
-    ----------
-    strategy : str
-        One of "heuristics_only", "screener_heuristics", "screener_rl", "rl_weights".
-    checkpoint_path : str | None
-        Path to a PortfolioTransformer .pt checkpoint. Required for
-        "screener_rl" and "rl_weights" strategies.
-    label : str | None
-        Display label for the progress bar. Defaults to the strategy name.
-
-    Returns
-    -------
-    (daily_returns, trade_log)
+    Delegates to _run_replay_v2 which uses the full BrokerBrain pipeline.
     """
-    if label is None:
-        label = strategy
-
-    import broker.brain as brain_module
-    from broker.brain import BrokerBrain, Decision
-    from broker.sectors import score_sectors, compute_target_allocations, get_portfolio_sector_weights
-    from broker.risk import PortfolioRiskEngine
-
-    dates = sorted(df_features.index.get_level_values("date").unique())
-    portfolio = ReplayPortfolio(initial_cash)
-    risk      = PortfolioRiskEngine(max_daily_loss=0.05, max_drawdown=0.20)
-
-    equity_curve = [initial_cash]
-    trade_log    = []
-
-    # Patch research() to use historical data
-    original_research = brain_module.research if hasattr(brain_module, "research") else None
-
-    # Build a simple sector map from the static map in sectors.py
-    from broker.sectors import get_cached_sector_map
-    sector_map = get_cached_sector_map(
-        df_features.index.get_level_values("ticker").unique().tolist()
+    # _run_replay_v2 is the full implementation with BrokerBrain, RL, sector
+    # logic, earnings avoidance, etc. run_replay is kept as the public API.
+    return _run_replay_v2(
+        df_features=df_features,
+        price_lookup=price_lookup,
+        strategy=strategy,
+        checkpoint_path=checkpoint_path,
+        initial_cash=initial_cash,
+        rebalance_freq=rebalance_freq,
+        max_positions=max_positions,
+        max_position_pct=max_position_pct,
+        min_score=min_score,
+        stop_loss_floor=stop_loss_floor,
+        take_profit=take_profit,
+        max_daily_loss=max_daily_loss,
+        max_drawdown=max_drawdown,
+        max_gross_exposure=max_gross_exposure,
+        cash_floor=cash_floor,
+        target_volatility=target_volatility,
+        vol_lookback=vol_lookback,
+        partial_profit_pct=partial_profit_pct,
+        penny_pct=penny_pct,
+        max_sector_pct=max_sector_pct,
+        max_pair_correlation=max_pair_correlation,
+        correlation_lookback_days=correlation_lookback_days,
+        avoid_earnings_days=avoid_earnings_days,
+        execution_spread=execution_spread,
+        rl_phase=rl_phase,
+        rl_exit_threshold=rl_exit_threshold,
+        rl_conviction_drop=rl_conviction_drop,
+        rl_min_score=rl_min_score,
+        label=label,
     )
-
-    pbar = tqdm(range(len(dates)), desc=f"Replay: {label}", unit="day",
-                colour="blue", dynamic_ncols=True)
-
-    for i in pbar:
-        date = dates[i]
-        portfolio.accrue_cash_yield(date)
-
-        # Update prices for held positions
-        if portfolio.positions:
-            prices = {}
-            for ticker in list(portfolio.positions.keys()):
-                try:
-                    p = float(price_lookup.loc[(date, ticker), "close"])
-                    if p > 0:
-                        prices[ticker] = p
-                except (KeyError, Exception):
-                    pass
-            portfolio.update_prices(prices)
-
-        # Record daily equity
-        equity_curve.append(portfolio.equity)
-
-        # Run broker logic every rebalance_freq days
-        if i % rebalance_freq != 0:
-            continue
-
-        # Slice features up to this date (no lookahead)
-        df_slice = df_features[df_features.index.get_level_values("date") <= date]
-        if df_slice.empty:
-            continue
-
-        # ── Exit checks ───────────────────────────────────────────────────────
-        for ticker in list(portfolio.positions.keys()):
-            pos     = portfolio.positions[ticker]
-            price   = pos["last_price"]
-            cost    = pos["avg_cost"]
-            if cost <= 0:
-                continue
-            pnl_pct = (price - cost) / cost
-
-            # ATR-based stop: use ret_1d std as vol proxy
-            try:
-                hist = df_slice.xs(ticker, level="ticker")["ret_1d"].dropna().values[-14:]
-                atr_pct = float(np.std(hist)) * 2.5 if len(hist) >= 5 else stop_loss_floor
-                stop = np.clip(atr_pct, stop_loss_floor, 0.25)
-            except Exception:
-                stop = stop_loss_floor
-
-            if pnl_pct <= -stop:
-                portfolio.sell_all(ticker, price, "stop-loss")
-                trade_log.append({"date": str(date), "action": "SELL", "ticker": ticker,
-                                   "reason": f"stop-loss {pnl_pct:.1%}"})
-                continue
-
-            if pnl_pct >= take_profit:
-                portfolio.sell_all(ticker, price, "take-profit")
-                trade_log.append({"date": str(date), "action": "SELL", "ticker": ticker,
-                                   "reason": f"take-profit {pnl_pct:.1%}"})
-                continue
-
-            if pnl_pct >= 0.20 and not pos.get("partial_taken"):
-                portfolio.sell(ticker, pos["shares"] * 0.5, price, "partial take-profit")
-                pos["partial_taken"] = True
-                trade_log.append({"date": str(date), "action": "SELL_PARTIAL",
-                                   "ticker": ticker, "reason": "partial +20%"})
-
-        # ── Screen candidates ─────────────────────────────────────────────────
-        try:
-            snap = df_slice.loc[date].copy()
-        except KeyError:
-            continue
-
-        # ── Strategy: build candidate shortlist ───────────────────────────────
-        if strategy == "heuristics_only":
-            # Rule-based _score for shortlisting
-            snap["_score"] = (
-                snap.get("ret_5d",    0) * 0.3 +
-                snap.get("vol_ratio", 0) * 0.2 +
-                snap.get("sent_net",  0) * 0.3 +
-                snap.get("macd_hist", 0) * 0.2
-            )
-            candidates = snap.nlargest(50, "_score").index.tolist()
-            rl_scores  = None
-            rl_weights = None
-        else:
-            # screener_heuristics / screener_rl / rl_weights — use TickerScorer
-            screener_candidates = None
-            try:
-                from pipeline.screener import run_screener
-                import torch
-                screener_df = run_screener(
-                    df_slice,
-                    device=torch.device("cpu"),
-                    top_n=50,
-                )
-                if not screener_df.empty and "ticker" in screener_df.columns:
-                    screener_candidates = screener_df["ticker"].tolist()
-            except Exception as exc:
-                logger.warning(
-                    "Screener unavailable on %s (%s) — falling back to rule-based shortlist",
-                    date, exc,
-                )
-
-            if screener_candidates is None:
-                # Fallback to rule-based
-                snap["_score"] = (
-                    snap.get("ret_5d",    0) * 0.3 +
-                    snap.get("vol_ratio", 0) * 0.2 +
-                    snap.get("sent_net",  0) * 0.3 +
-                    snap.get("macd_hist", 0) * 0.2
-                )
-                screener_candidates = snap.nlargest(50, "_score").index.tolist()
-
-            candidates = screener_candidates
-            rl_scores  = None
-            rl_weights = None
-
-            # ── RL scoring for screener_rl / rl_weights ───────────────────────
-            if strategy in ("screener_rl", "rl_weights") and checkpoint_path is not None:
-                try:
-                    from pipeline.rl_inference import get_rl_targets
-                    rl_mode = "rank" if strategy == "screener_rl" else "weights"
-                    rl_result = get_rl_targets(
-                        df_slice, candidates, checkpoint_path, mode=rl_mode
-                    )
-                    if strategy == "screener_rl":
-                        rl_scores = rl_result   # pd.Series[ticker → rl_score]
-                    else:
-                        rl_weights = rl_result  # pd.Series[ticker|CASH → rl_weight]
-                except Exception as exc:
-                    logger.warning(
-                        "RL inference failed on %s (%s) — falling back to heuristic ranking",
-                        date, exc,
-                    )
-
-            # Sort candidates by rl_score when screener_rl
-            if strategy == "screener_rl" and rl_scores is not None:
-                candidates = sorted(
-                    candidates,
-                    key=lambda t: float(rl_scores.get(t, 0.0)),
-                    reverse=True,
-                )
-
-        # ── Sector scoring ────────────────────────────────────────────────────
-        sector_scores_map = score_sectors(df_slice, sector_map)
-        current_sw = get_portfolio_sector_weights(portfolio.positions, sector_map)
-        target_allocs = compute_target_allocations(
-            sector_scores_map, current_sw, max_single_sector=max_sector_pct
-        )
-
-        # ── Buy decisions ─────────────────────────────────────────────────────
-        n_slots = max_positions - len(portfolio.positions)
-        equity  = portfolio.equity
-        penny_value = sum(
-            v for t, v in portfolio.position_values.items()
-            if portfolio.positions[t]["last_price"] < 5.0
-        )
-        sector_spent: dict[str, float] = {}
-
-        for ticker in candidates:
-            if n_slots <= 0:
-                break
-            if ticker in portfolio.positions:
-                continue
-            if ticker == "CASH":
-                continue
-
-            # Get price
-            try:
-                price = float(price_lookup.loc[(date, ticker), "close"])
-                if price <= 0:
-                    continue
-            except (KeyError, Exception):
-                continue
-
-            # ── Compute composite_score (used for heuristics_only and screener_heuristics) ──
-            try:
-                feats = df_slice.loc[date, ticker]
-                sent_net = float(feats.get("sent_net", 0.0))
-                mom5     = float(feats.get("ret_5d",   0.0))
-                rsi      = float(feats.get("rsi",      50.0))
-                macd     = float(feats.get("macd_hist",0.0))
-                vol      = float(feats.get("vol_ratio",1.0))
-                surprise = float(feats.get("sent_surprise", 0.0))
-
-                composite_score = (
-                    np.clip(0.5 + mom5 * 5, 0, 1) * 0.15 +
-                    np.clip(0.5 + mom5 * 2, 0, 1) * 0.10 +
-                    np.clip(1.0 - abs(rsi - 52.5) / 52.5, 0, 1) * 0.10 +
-                    np.clip(0.5 + macd * 10, 0, 1) * 0.10 +
-                    np.clip(vol / 3.0, 0, 1) * 0.10 +
-                    np.clip(0.5 + sent_net, 0, 1) * 0.20 +
-                    np.clip(0.5 + surprise * 2, 0, 1) * 0.20 +
-                    0.05   # bb_pct neutral
-                )
-            except (KeyError, Exception):
-                composite_score = 0.0
-
-            # ── Determine effective score and alloc_value per strategy ─────────
-            is_penny = price < 5.0
-            sector   = sector_map.get(ticker, "Unknown")
-
-            if is_penny:
-                penny_budget = equity * penny_pct - penny_value
-                if penny_budget <= 0:
-                    continue
-
-            target_alloc = target_allocs.get(sector, 0.05)
-            current_sv   = sum(
-                v for t, v in portfolio.position_values.items()
-                if sector_map.get(t, "Unknown") == sector
-            ) + sector_spent.get(sector, 0.0)
-            sector_budget = equity * target_alloc - current_sv
-            if sector_budget <= equity * 0.01:
-                continue
-
-            if strategy == "rl_weights" and rl_weights is not None:
-                # Size directly from rl_weight × equity
-                weight = float(rl_weights.get(ticker, 0.0))
-                if weight <= 0.0:
-                    continue
-                alloc_value = weight * equity
-                alloc_value = min(alloc_value, sector_budget, portfolio.cash * 0.95)
-                if is_penny:
-                    alloc_value = min(alloc_value, equity * penny_pct - penny_value)
-                score = weight  # for logging
-            elif strategy == "screener_rl" and rl_scores is not None:
-                # Rank by rl_score, apply min_score threshold to rl_score
-                score = float(rl_scores.get(ticker, 0.0))
-                if score < min_score:
-                    continue
-                conviction  = (score - min_score) / (1.0 - min_score)
-                alloc_pct   = np.clip(0.10 * conviction, 0.01, 0.10)
-                alloc_value = min(equity * alloc_pct, sector_budget,
-                                  portfolio.cash * 0.95)
-                if is_penny:
-                    alloc_value = min(alloc_value, equity * penny_pct - penny_value)
-            else:
-                # heuristics_only or screener_heuristics — rank by composite_score
-                score = composite_score
-                if score < min_score:
-                    continue
-                conviction  = (score - min_score) / (1.0 - min_score)
-                alloc_pct   = np.clip(0.10 * conviction, 0.01, 0.10)
-                alloc_value = min(equity * alloc_pct, sector_budget,
-                                  portfolio.cash * 0.95)
-                if is_penny:
-                    alloc_value = min(alloc_value, equity * penny_pct - penny_value)
-
-            # Apply execution cost (same across all strategies)
-            alloc_value *= (1.0 - execution_spread)
-            shares = alloc_value / price
-            if shares < 0.001 or alloc_value < 1.0:
-                continue
-
-            portfolio.buy(ticker, shares, price, f"score={score:.4f}")
-            trade_log.append({"date": str(date), "action": "BUY", "ticker": ticker,
-                               "price": price, "score": score, "sector": sector,
-                               "strategy": strategy})
-            sector_spent[sector] = sector_spent.get(sector, 0.0) + alloc_value
-            if is_penny:
-                penny_value += alloc_value
-            n_slots -= 1
-
-        pbar.set_postfix(
-            equity=f"${portfolio.equity:,.0f}",
-            ret=f"{portfolio.total_return:+.1%}",
-            pos=len(portfolio.positions),
-        )
-
-    # Final equity
-    equity_curve.append(portfolio.equity)
-    daily_returns = np.diff(equity_curve) / (np.array(equity_curve[:-1]) + 1e-9)
-    return daily_returns, trade_log
 
 
 # ── Sensitivity sweep ─────────────────────────────────────────────────────────
@@ -754,9 +489,16 @@ def _run_replay_v2(
     initial_cash: float = 10_000.0,
     rebalance_freq: int = 5,
     max_positions: int = 20,
+    max_position_pct: float = 0.10,
     min_score: float = 0.60,
     stop_loss_floor: float = 0.07,
     take_profit: float = 0.45,
+    max_daily_loss: float = 0.03,
+    max_drawdown: float = 0.15,
+    max_gross_exposure: float = 0.95,
+    cash_floor: float = 0.05,
+    target_volatility: float = 0.15,
+    vol_lookback: int = 20,
     partial_profit_pct: float = 0.20,
     penny_pct: float = 0.20,
     max_sector_pct: float = 0.40,
@@ -788,12 +530,32 @@ def _run_replay_v2(
 
     dates = sorted(df_features.index.get_level_values("date").unique())
     portfolio = ReplayPortfolio(initial_cash)
-    risk = PortfolioRiskEngine(max_daily_loss=0.05, max_drawdown=0.20)
     sector_map = get_cached_sector_map(
         df_features.index.get_level_values("ticker").unique().tolist()
     )
 
+    # ── Pre-sort df_features by date for fast O(1) slicing ───────────────────
+    # Instead of filtering the full DataFrame on every rebalance day
+    # (O(N) per day × 150 days = very slow), we sort once and use
+    # searchsorted to get the cutoff index in O(log N).
+    df_sorted = df_features.sort_index(level="date")
+    date_index_values = df_sorted.index.get_level_values("date")
+
+    def _slice_up_to(date):
+        """Return df_sorted rows with date <= date, using fast binary search."""
+        pos = date_index_values.searchsorted(date, side="right")
+        return df_sorted.iloc[:pos]
+
     equity_curve = [initial_cash]
+    risk = PortfolioRiskEngine(
+        max_daily_loss=max_daily_loss,
+        max_drawdown=max_drawdown,
+        max_gross_exposure=max_gross_exposure,
+        cash_floor=cash_floor,
+        target_volatility=target_volatility,
+        vol_lookback=vol_lookback,
+        equity_history_getter=lambda: equity_curve,
+    )
     trade_log = []
 
     original_research = getattr(brain_module, "research", None)
@@ -857,132 +619,130 @@ def _run_replay_v2(
                         continue
                 portfolio.update_prices(prices)
 
+            if i % rebalance_freq == 0:
+                df_slice = _slice_up_to(date)
+                if not df_slice.empty:
+                    brain_module.research = _make_historical_research(df_slice, price_lookup, date)
+                    try:
+                        snap = df_slice.loc[date].copy()
+                    except KeyError:
+                        snap = None
+
+                    if snap is not None:
+                        screener_candidates = None
+                        try:
+                            from pipeline.screener import run_screener
+                            import torch
+
+                            screener_df = run_screener(df_slice, device=torch.device("cpu"), top_n=50)
+                            if not screener_df.empty and "ticker" in screener_df.columns:
+                                screener_candidates = screener_df["ticker"].tolist()
+                        except Exception as exc:
+                            logger.warning(
+                                "Screener unavailable on %s (%s) - falling back to rule-based shortlist",
+                                date,
+                                exc,
+                            )
+
+                        if screener_candidates is None:
+                            snap["_score"] = (
+                                snap.get("ret_5d", 0) * 0.3
+                                + snap.get("vol_ratio", 0) * 0.2
+                                + snap.get("sent_net", 0) * 0.3
+                                + snap.get("macd_hist", 0) * 0.2
+                            )
+                            screener_candidates = snap.nlargest(50, "_score").index.tolist()
+
+                        rl_weights = None
+                        if checkpoint_path is not None:
+                            try:
+                                from pipeline.rl_inference import get_rl_targets
+
+                                rl_weights = get_rl_targets(
+                                    df_slice,
+                                    screener_candidates,
+                                    checkpoint_path,
+                                    mode="weights",
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "RL weight inference failed on %s (%s) - falling back to no trades",
+                                    date,
+                                    exc,
+                                )
+
+                        sector_scores_map = score_sectors(df_slice, sector_map)
+                        current_sw = get_portfolio_sector_weights(portfolio.positions, sector_map)
+                        target_allocs = compute_target_allocations(
+                            sector_scores_map,
+                            current_sw,
+                            max_single_sector=max_sector_pct,
+                        )
+
+                        n_slots = max_positions - len(portfolio.positions)
+                        equity = portfolio.equity
+                        penny_value = sum(
+                            value
+                            for ticker, value in portfolio.position_values.items()
+                            if portfolio.positions[ticker]["last_price"] < 5.0
+                        )
+                        sector_spent: dict[str, float] = {}
+
+                        for ticker in screener_candidates:
+                            if n_slots <= 0 or ticker in portfolio.positions or ticker == "CASH":
+                                continue
+
+                            try:
+                                price = float(price_lookup.loc[(date, ticker), "close"])
+                                if price <= 0:
+                                    continue
+                            except Exception:
+                                continue
+
+                            weight = float(rl_weights.get(ticker, 0.0)) if rl_weights is not None else 0.0
+                            if weight <= 0.0:
+                                continue
+
+                            is_penny = price < 5.0
+                            sector = sector_map.get(ticker, "Unknown")
+                            target_alloc = target_allocs.get(sector, 0.05)
+                            current_sv = sum(
+                                value
+                                for held, value in portfolio.position_values.items()
+                                if sector_map.get(held, "Unknown") == sector
+                            ) + sector_spent.get(sector, 0.0)
+                            sector_budget = equity * target_alloc - current_sv
+                            if sector_budget <= equity * 0.01:
+                                continue
+
+                            alloc_value = min(weight * equity, sector_budget, portfolio.cash * 0.95)
+                            if is_penny:
+                                alloc_value = min(alloc_value, equity * penny_pct - penny_value)
+                            if alloc_value < 1.0:
+                                continue
+
+                            shares = alloc_value / price
+                            if shares < 0.001:
+                                continue
+
+                            portfolio.buy(ticker, shares, price, f"weight={weight:.4f}")
+                            trade_log.append(
+                                {
+                                    "date": str(date),
+                                    "action": "BUY",
+                                    "ticker": ticker,
+                                    "price": price,
+                                    "score": weight,
+                                    "sector": sector,
+                                    "strategy": strategy,
+                                }
+                            )
+                            sector_spent[sector] = sector_spent.get(sector, 0.0) + alloc_value
+                            if is_penny:
+                                penny_value += alloc_value
+                            n_slots -= 1
+
             equity_curve.append(portfolio.equity)
-            if i % rebalance_freq != 0:
-                continue
-
-            df_slice = df_features[df_features.index.get_level_values("date") <= date]
-            if df_slice.empty:
-                continue
-
-            brain_module.research = _make_historical_research(df_slice, price_lookup, date)
-            try:
-                snap = df_slice.loc[date].copy()
-            except KeyError:
-                continue
-
-            screener_candidates = None
-            try:
-                from pipeline.screener import run_screener
-                import torch
-
-                screener_df = run_screener(df_slice, device=torch.device("cpu"), top_n=50)
-                if not screener_df.empty and "ticker" in screener_df.columns:
-                    screener_candidates = screener_df["ticker"].tolist()
-            except Exception as exc:
-                logger.warning(
-                    "Screener unavailable on %s (%s) - falling back to rule-based shortlist",
-                    date,
-                    exc,
-                )
-
-            if screener_candidates is None:
-                snap["_score"] = (
-                    snap.get("ret_5d", 0) * 0.3
-                    + snap.get("vol_ratio", 0) * 0.2
-                    + snap.get("sent_net", 0) * 0.3
-                    + snap.get("macd_hist", 0) * 0.2
-                )
-                screener_candidates = snap.nlargest(50, "_score").index.tolist()
-
-            rl_weights = None
-            if checkpoint_path is not None:
-                try:
-                    from pipeline.rl_inference import get_rl_targets
-
-                    rl_weights = get_rl_targets(
-                        df_slice,
-                        screener_candidates,
-                        checkpoint_path,
-                        mode="weights",
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "RL weight inference failed on %s (%s) - falling back to no trades",
-                        date,
-                        exc,
-                    )
-
-            sector_scores_map = score_sectors(df_slice, sector_map)
-            current_sw = get_portfolio_sector_weights(portfolio.positions, sector_map)
-            target_allocs = compute_target_allocations(
-                sector_scores_map,
-                current_sw,
-                max_single_sector=max_sector_pct,
-            )
-
-            n_slots = max_positions - len(portfolio.positions)
-            equity = portfolio.equity
-            penny_value = sum(
-                value
-                for ticker, value in portfolio.position_values.items()
-                if portfolio.positions[ticker]["last_price"] < 5.0
-            )
-            sector_spent: dict[str, float] = {}
-
-            for ticker in screener_candidates:
-                if n_slots <= 0 or ticker in portfolio.positions or ticker == "CASH":
-                    continue
-
-                try:
-                    price = float(price_lookup.loc[(date, ticker), "close"])
-                    if price <= 0:
-                        continue
-                except Exception:
-                    continue
-
-                weight = float(rl_weights.get(ticker, 0.0)) if rl_weights is not None else 0.0
-                if weight <= 0.0:
-                    continue
-
-                is_penny = price < 5.0
-                sector = sector_map.get(ticker, "Unknown")
-                target_alloc = target_allocs.get(sector, 0.05)
-                current_sv = sum(
-                    value
-                    for held, value in portfolio.position_values.items()
-                    if sector_map.get(held, "Unknown") == sector
-                ) + sector_spent.get(sector, 0.0)
-                sector_budget = equity * target_alloc - current_sv
-                if sector_budget <= equity * 0.01:
-                    continue
-
-                alloc_value = min(weight * equity, sector_budget, portfolio.cash * 0.95)
-                if is_penny:
-                    alloc_value = min(alloc_value, equity * penny_pct - penny_value)
-                if alloc_value < 1.0:
-                    continue
-
-                shares = alloc_value / price
-                if shares < 0.001:
-                    continue
-
-                portfolio.buy(ticker, shares, price, f"weight={weight:.4f}")
-                trade_log.append(
-                    {
-                        "date": str(date),
-                        "action": "BUY",
-                        "ticker": ticker,
-                        "price": price,
-                        "score": weight,
-                        "sector": sector,
-                        "strategy": strategy,
-                    }
-                )
-                sector_spent[sector] = sector_spent.get(sector, 0.0) + alloc_value
-                if is_penny:
-                    penny_value += alloc_value
-                n_slots -= 1
 
             pbar.set_postfix(
                 equity=f"${portfolio.equity:,.0f}",
@@ -990,7 +750,6 @@ def _run_replay_v2(
                 pos=len(portfolio.positions),
             )
 
-        equity_curve.append(portfolio.equity)
         returns = np.diff(equity_curve) / (np.array(equity_curve[:-1]) + 1e-9)
         return returns, trade_log
 
@@ -1004,6 +763,7 @@ def _run_replay_v2(
     brain = BrokerBrain(
         portfolio=portfolio,
         max_positions=max_positions,
+        max_position_pct=max_position_pct,
         stop_loss_pct_floor=stop_loss_floor,
         partial_profit_pct=partial_profit_pct,
         full_profit_pct=take_profit,
@@ -1053,32 +813,29 @@ def _run_replay_v2(
                         continue
                 portfolio.update_prices(prices)
 
+            if i % rebalance_freq == 0:
+                df_slice = _slice_up_to(date)
+                if not df_slice.empty:
+                    brain_module.research = _make_historical_research(df_slice, price_lookup, date)
+                    brain._get_current_prices = MethodType(_make_historical_price_fetcher(price_lookup, date), brain)
+                    brain._get_stop_loss_pct = MethodType(_make_historical_stop_loss(df_slice), brain)
+                    brain.min_score = brain._base_min_score
+
+                    risk.start_session(portfolio.equity)
+                    health_status, _health_reason = risk.check_portfolio_health(portfolio)
+                    if health_status == "halt":
+                        brain.min_score = 999.0
+
+                    decisions = brain.run_cycle(df_slice, screener_top_n=50, risk_engine=risk)
+                    _execute_replay_decisions(
+                        portfolio=portfolio,
+                        decisions=decisions,
+                        execution_spread=execution_spread,
+                        trade_log=trade_log,
+                        date=date,
+                    )
+
             equity_curve.append(portfolio.equity)
-            if i % rebalance_freq != 0:
-                continue
-
-            df_slice = df_features[df_features.index.get_level_values("date") <= date]
-            if df_slice.empty:
-                continue
-
-            brain_module.research = _make_historical_research(df_slice, price_lookup, date)
-            brain._get_current_prices = MethodType(_make_historical_price_fetcher(price_lookup, date), brain)
-            brain._get_stop_loss_pct = MethodType(_make_historical_stop_loss(df_slice), brain)
-            brain.min_score = brain._base_min_score
-
-            risk.start_session(portfolio.equity)
-            health_status, _health_reason = risk.check_portfolio_health(portfolio)
-            if health_status == "halt":
-                brain.min_score = 999.0
-
-            decisions = brain.run_cycle(df_slice, screener_top_n=50, risk_engine=risk)
-            _execute_replay_decisions(
-                portfolio=portfolio,
-                decisions=decisions,
-                execution_spread=execution_spread,
-                trade_log=trade_log,
-                date=date,
-            )
 
             pbar.set_postfix(
                 equity=f"${portfolio.equity:,.0f}",
@@ -1091,7 +848,6 @@ def _run_replay_v2(
         if original_get_next_earnings is not None:
             brain_module._get_next_earnings_date = original_get_next_earnings
 
-    equity_curve.append(portfolio.equity)
     daily_returns = np.diff(equity_curve) / (np.array(equity_curve[:-1]) + 1e-9)
     return daily_returns, trade_log
 
@@ -1115,9 +871,16 @@ def _replay_kwargs_from_live_config(live_config: dict | None = None) -> dict:
     live_config = live_config or {}
     return {
         "max_positions": int(live_config.get("max_positions", 20)),
+        "max_position_pct": float(live_config.get("max_position_pct", 0.10)),
         "min_score": float(live_config.get("min_score", 0.60)),
         "stop_loss_floor": float(live_config.get("stop_loss", 0.07)),
         "take_profit": float(live_config.get("take_profit", 0.45)),
+        "max_daily_loss": float(live_config.get("max_daily_loss", 0.03)),
+        "max_drawdown": float(live_config.get("max_drawdown", 0.15)),
+        "max_gross_exposure": float(live_config.get("max_gross_exposure", 0.95)),
+        "cash_floor": float(live_config.get("cash_floor", 0.05)),
+        "target_volatility": float(live_config.get("target_volatility", 0.15)),
+        "vol_lookback": int(live_config.get("vol_lookback", 20)),
         "partial_profit_pct": float(live_config.get("partial_profit", 0.20)),
         "penny_pct": float(live_config.get("penny_pct", 0.20)),
         "max_sector_pct": float(live_config.get("max_sector", 0.40)),
@@ -1148,26 +911,33 @@ def run_sensitivity(
     base = _replay_kwargs_from_live_config(live_config)
     strategy = strategy or _resolve_replay_strategy(live_config)
 
-    scenarios = [
-        {**base, "label": "current_config (base)"},
-        # Vary min_score while keeping the rest of the live config fixed.
-        {**base, "min_score": 0.50, "label": "min_score=0.50"},
-        {**base, "min_score": 0.55, "label": "min_score=0.55"},
-        {**base, "min_score": 0.60, "label": "min_score=0.60"},
-        {**base, "min_score": 0.65, "label": "min_score=0.65"},
-        {**base, "min_score": 0.70, "label": "min_score=0.70"},
-        # Vary stop-loss
-        {**base, "stop_loss_floor": 0.05, "label": "stop=5%"},
-        {**base, "stop_loss_floor": 0.10, "label": "stop=10%"},
-        {**base, "stop_loss_floor": 0.15, "label": "stop=15%"},
-        # Vary execution cost
-        {**base, "execution_spread": 0.0005, "label": "spread=5bps"},
-        {**base, "execution_spread": 0.0020, "label": "spread=20bps"},
-        {**base, "execution_spread": 0.0050, "label": "spread=50bps"},
-        # Vary take-profit
-        {**base, "take_profit": 0.30, "label": "tp=30%"},
-        {**base, "take_profit": 0.60, "label": "tp=60%"},
-    ]
+    scenarios = [{**base, "label": "current_config (base)"}]
+
+    def add(label: str, **overrides) -> None:
+        scenarios.append({**base, **overrides, "label": label})
+
+    add("min_score=0.55", min_score=0.55)
+    add("min_score=0.65", min_score=0.65)
+    add("stop=7%", stop_loss_floor=0.07)
+    add("stop=10%", stop_loss_floor=0.10)
+    add("tp=50%", take_profit=0.50)
+    add("tp=65%", take_profit=0.65)
+    add("max_pos=15%", max_position_pct=0.15)
+    add("max_pos=20%", max_position_pct=0.20)
+    add("cash_floor=1%", cash_floor=0.01)
+    add("cash_floor=3%", cash_floor=0.03)
+    add("gross=99%", max_gross_exposure=0.99)
+    add("target_vol=22%", target_volatility=0.22)
+    add("target_vol=30%", target_volatility=0.30)
+    add("sector=45%", max_sector_pct=0.45)
+    add("earnings=4d", avoid_earnings_days=4)
+    add("spread=5bps", execution_spread=0.0005)
+    add("spread=20bps", execution_spread=0.0020)
+
+    if strategy == "screener_rl":
+        add("rl_phase=1", rl_phase=1)
+        add("rl_exit=15%", rl_exit_threshold=0.15)
+        add("rl_drop=25%", rl_conviction_drop=0.25)
 
     rows = []
     seen = set()
@@ -1215,7 +985,12 @@ def run_full_replay(
     """
     Run the full broker replay and print a side-by-side report vs SPY.
     """
-    from pipeline.benchmark import fetch_spy_returns, print_benchmark_report, plot_benchmark
+    from pipeline.benchmark import (
+        align_return_series,
+        fetch_spy_returns,
+        print_benchmark_report,
+        plot_benchmark,
+    )
 
     # Restrict to replay window
     dates  = sorted(df_features.index.get_level_values("date").unique())
@@ -1250,30 +1025,44 @@ def run_full_replay(
 
     # Fetch SPY for same period
     spy_series = fetch_spy_returns(
-        start=replay_dates[0].strftime("%Y-%m-%d"),
+        start=(replay_dates[0] - pd.Timedelta(days=5)).strftime("%Y-%m-%d"),
         end=(replay_dates[-1] + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
     )
-    spy_rets = spy_series.values[:len(broker_rets)] if not spy_series.empty else None
-    if spy_rets is None:
-        logger.warning("SPY benchmark unavailable for this replay run; skipping relative comparisons.")
 
     # Equal-weight baseline (buy-and-hold all tickers equally)
     logger.info("Computing equal-weight baseline...")
     ew_rets = _equal_weight_returns(df_replay, price_lookup, replay_dates)
+    aligned = align_return_series(
+        broker_rets,
+        replay_dates,
+        benchmark_rets=spy_series,
+        extra_series={"equal_weight": ew_rets},
+    )
+    broker_aligned = aligned["portfolio"].to_numpy(dtype=float)
+    ew_aligned = (
+        aligned["equal_weight"].to_numpy(dtype=float)
+        if "equal_weight" in aligned.columns else None
+    )
+    spy_rets = (
+        aligned["benchmark"].to_numpy(dtype=float)
+        if "benchmark" in aligned.columns else None
+    )
+    if spy_rets is None:
+        logger.warning("SPY benchmark unavailable for this replay run; skipping relative comparisons.")
 
     # Print report
     print_benchmark_report(
-        broker_rets,
+        broker_aligned,
         spy_rets,
-        ew_rets=ew_rets,
+        ew_rets=ew_aligned,
         label="Broker Replay",
     )
 
     # Plot
     plot_benchmark(
-        broker_rets,
+        broker_aligned,
         spy_rets,
-        ew_rets=ew_rets,
+        ew_rets=ew_aligned,
         save_path=save_plot,
         label="Broker Replay",
     )
@@ -1373,7 +1162,7 @@ def _equal_weight_returns(
 ) -> np.ndarray:
     """Buy-and-hold equal weight across all tickers in the universe."""
     tickers = df_features.index.get_level_values("ticker").unique().tolist()
-    rets    = []
+    rets    = [0.0]
     for i in range(1, len(dates)):
         d0, d1 = dates[i - 1], dates[i]
         day_rets = []
@@ -1386,7 +1175,7 @@ def _equal_weight_returns(
             except (KeyError, Exception):
                 pass
         rets.append(float(np.mean(day_rets)) if day_rets else 0.0)
-    return np.array(rets)
+    return np.array(rets, dtype=float)
 
 
 def _print_trade_log_report(trade_log: list[dict]) -> None:
@@ -1421,9 +1210,14 @@ def run_ablation(
     initial_cash: float = 10_000.0,
     replay_years: int = 3,
     max_positions: int = 20,
+    max_position_pct: float = 0.10,
     min_score: float = 0.60,
     stop_loss_floor: float = 0.07,
     take_profit: float = 0.45,
+    max_gross_exposure: float = 0.95,
+    cash_floor: float = 0.05,
+    target_volatility: float = 0.15,
+    vol_lookback: int = 20,
     partial_profit_pct: float = 0.20,
     penny_pct: float = 0.20,
     max_sector_pct: float = 0.40,
@@ -1485,7 +1279,7 @@ def run_ablation(
 
     # ── Fetch SPY returns for the same window ─────────────────────────────────
     spy_series = fetch_spy_returns(
-        start=replay_dates[0].strftime("%Y-%m-%d"),
+        start=(replay_dates[0] - pd.Timedelta(days=5)).strftime("%Y-%m-%d"),
         end=(replay_dates[-1] + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
     )
     if not spy_series.empty:
@@ -1514,9 +1308,14 @@ def run_ablation(
             checkpoint_path=ckpt,
             initial_cash=initial_cash,
             max_positions=max_positions,
+            max_position_pct=max_position_pct,
             min_score=min_score,
             stop_loss_floor=stop_loss_floor,
             take_profit=take_profit,
+            max_gross_exposure=max_gross_exposure,
+            cash_floor=cash_floor,
+            target_volatility=target_volatility,
+            vol_lookback=vol_lookback,
             partial_profit_pct=partial_profit_pct,
             penny_pct=penny_pct,
             max_sector_pct=max_sector_pct,

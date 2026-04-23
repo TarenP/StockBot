@@ -1,4 +1,0 @@
-# file: C:\Users\taren\Documents\Github Repositories\StockBot\pipeline\features.py
-# hypothesis_version: 6.151.9
-
-[0.0, 1e-09, 0.015, 0.45, 0.5, 1.0, 100.0, 200, 252, 3600, '%Y-%m-%d', '.', 'Building features', 'Close', 'SPY', '^VIX', '_timestamp', 'atr', 'bb_pct', 'close', 'data', 'date', 'high', 'index', 'left', 'low', 'macd_hist', 'magenta', 'market_breadth', 'mean', 'neg_score', 'pe_ratio', 'pos_score', 'price_pos_52w', 'regime_0', 'regime_1', 'regime_2', 'regime_3', 'ret_1d', 'ret_20d', 'ret_5d', 'revenueGrowth', 'revenue_growth', 'rsi', 'sent_accel', 'sent_ma14', 'sent_ma3', 'sent_ma7', 'sent_neg_spike', 'sent_net', 'sent_pos_raw', 'sent_surprise', 'sent_trend', 'shortPercentOfFloat', 'short_interest_pct', 'spy_ret_20d', 'std', 'ticker', 'trailingPE', 'vix_level', 'vol_ratio', 'vol_zscore', 'volume', 'w']

@@ -518,6 +518,10 @@ def train_screener(
                 y_binary_test = cached["y_binary_test"]
                 r_test = cached["r_test"]
                 g_test = cached["g_test"]
+                # Restore feat_cols from cache so we use exactly what was built
+                if "feat_cols" in cached:
+                    feat_cols = cached["feat_cols"].tolist()
+                    n_features = len(feat_cols)
                 tqdm.write(
                     f"  Loaded cached samples: {len(X_train):,} train  "
                     f"{len(X_val):,} val  {len(X_test):,} test  (key={ck})"
@@ -591,6 +595,7 @@ def train_screener(
             r_test=r_test,
             g_test=g_test,
             cache_key=np.array(ck),
+            feat_cols=np.array(feat_cols),   # store so cache hit uses exact same columns
         )
         tqdm.write(f"  Samples cached -> {SCREENER_SAMPLES}")
 

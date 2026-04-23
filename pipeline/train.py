@@ -449,10 +449,16 @@ def build_shortlist_universe(
     screener_model,
     top_n: int = 100,
     device: torch.device = None,
+    max_universe: int = 150,
 ) -> list[str]:
     """
-    Run the screener on training data and return the union of top-N candidates
-    across all dates. Used to align the RL training universe with the screener.
+    Run the screener on training data and return the tickers that most
+    consistently appear in the top-N shortlist across all dates.
+
+    Rather than taking the union (which grows to nearly the full universe over
+    many years), we rank tickers by appearance frequency and return the top
+    `max_universe` most consistently high-scoring names. This keeps the RL
+    training universe focused and tractable.
 
     Parameters
     ----------
@@ -464,11 +470,13 @@ def build_shortlist_universe(
         Number of top candidates to select per date.
     device : torch.device | None
         Inference device. Defaults to CPU.
+    max_universe : int
+        Maximum number of tickers to return (ranked by appearance frequency).
 
     Returns
     -------
     list[str]
-        Sorted list of unique tickers that appeared in any per-date top-N shortlist.
+        Sorted list of up to max_universe tickers most consistently shortlisted.
     """
     if device is None:
         device = torch.device("cpu")
@@ -501,7 +509,8 @@ def build_shortlist_universe(
 
     feat_arr = np.nan_to_num(np.clip(feat_arr, -5.0, 5.0), nan=0.0)
 
-    universe_set: set[str] = set()
+    # Count how many times each ticker appears in the top-N across all dates
+    appearance_counts = np.zeros(n_t, dtype=np.int32)
     screener_model.eval()
 
     for di in range(LOOKBACK, len(dates)):
@@ -510,11 +519,10 @@ def build_shortlist_universe(
         if len(valid_tickers_idx) == 0:
             continue
 
-        obs_list = []
-        for ti in valid_tickers_idx:
-            obs_list.append(feat_arr[di - LOOKBACK:di, ti, :])
-
-        obs_arr = np.array(obs_list, dtype=np.float32)
+        obs_arr = np.array(
+            [feat_arr[di - LOOKBACK:di, ti, :] for ti in valid_tickers_idx],
+            dtype=np.float32,
+        )
         X = torch.tensor(obs_arr, device=device)
 
         scores = []
@@ -527,11 +535,15 @@ def build_shortlist_universe(
         k = min(top_n, len(scores_arr))
         top_local_idx = np.argsort(scores_arr)[-k:]
         for local_i in top_local_idx:
-            universe_set.add(tickers[valid_tickers_idx[local_i]])
+            appearance_counts[valid_tickers_idx[local_i]] += 1
 
-    result = sorted(universe_set)
+    # Rank by frequency, take top max_universe
+    ranked_idx = np.argsort(appearance_counts)[::-1][:max_universe]
+    result = sorted([tickers[i] for i in ranked_idx if appearance_counts[i] > 0])
+
+    total_dates = len(dates) - LOOKBACK
     tqdm.write(
-        f"  Shortlist universe: {len(result)} unique tickers "
-        f"(union of top-{top_n} across {len(dates) - LOOKBACK} dates)"
+        f"  Shortlist universe: {len(result)} tickers "
+        f"(top-{max_universe} by frequency in top-{top_n} across {total_dates} dates)"
     )
     return result

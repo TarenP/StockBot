@@ -18,11 +18,24 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 _PARAM_GRID = [
-    {"min_score": ms, "stop_loss_floor": sl, "take_profit": tp, "max_sector_pct": mx}
-    for ms in [0.50, 0.55, 0.60, 0.65]
-    for sl in [0.06, 0.08, 0.10]
-    for tp in [0.30, 0.40, 0.50]
-    for mx in [0.20, 0.30, 0.40]
+    {
+        "min_score": ms,
+        "stop_loss_floor": sl,
+        "take_profit": tp,
+        "max_sector_pct": mx,
+        "max_position_pct": mpp,
+        "cash_floor": cf,
+        "max_gross_exposure": mge,
+        "target_volatility": tv,
+    }
+    for ms in [0.52, 0.58, 0.64]
+    for sl in [0.07, 0.10]
+    for tp in [0.45, 0.60]
+    for mx in [0.30, 0.40]
+    for mpp in [0.12, 0.18, 0.22]
+    for cf in [0.01, 0.03]
+    for mge in [0.95, 0.99]
+    for tv in [0.15, 0.22]
 ]
 
 _HOLDOUT_FRACTION = 0.25
@@ -55,6 +68,19 @@ def _config_float(cfg: dict, key: str, default: float) -> float:
         return float(cfg.get(key, default))
     except (TypeError, ValueError):
         return default
+
+
+def _base_replay_kwargs(cfg: dict, initial_cash: float) -> dict:
+    return {
+        "strategy": "heuristics_only",
+        "initial_cash": initial_cash,
+        "max_positions": _config_int(cfg, "max_positions", 20),
+        "partial_profit_pct": _config_float(cfg, "partial_profit", 0.20),
+        "penny_pct": _config_float(cfg, "penny_pct", 0.20),
+        "max_pair_correlation": _config_float(cfg, "max_correlation", 0.80),
+        "avoid_earnings_days": _config_int(cfg, "avoid_earnings", 3),
+        "vol_lookback": _config_int(cfg, "vol_lookback", 20),
+    }
 
 
 def _write_config_key(key: str, value: str, path: str = "broker.config") -> None:
@@ -94,8 +120,21 @@ def _write_config_key(key: str, value: str, path: str = "broker.config") -> None
 
 
 def _best_checkpoint(save_dir: str = "models") -> str | None:
+    import torch as _torch
     ckpts = sorted(glob.glob(f"{save_dir}/best_fold*.pt"))
-    return ckpts[-1] if ckpts else None
+    if not ckpts:
+        return None
+    best, best_sharpe = None, float("-inf")
+    for p in ckpts:
+        try:
+            meta = _torch.load(p, map_location="cpu", weights_only=False)
+            s = float(meta.get("val_sharpe", float("-inf")))
+            if s > best_sharpe:
+                best_sharpe = s
+                best = p
+        except Exception:
+            pass
+    return best or ckpts[-1]
 
 
 def _split_replay_holdout(
@@ -173,6 +212,7 @@ def tune_parameters(
     )
 
     cfg = _read_config(config_path)
+    shared_kwargs = _base_replay_kwargs(cfg, initial_cash)
     df_search, df_holdout, has_holdout = _split_replay_holdout(
         df_features,
         replay_years=replay_years,
@@ -184,17 +224,8 @@ def tune_parameters(
             rets, _ = run_replay(
                 df_search,
                 price_lookup,
-                strategy="heuristics_only",
-                initial_cash=initial_cash,
-                max_positions=_config_int(cfg, "max_positions", 20),
-                min_score=params["min_score"],
-                stop_loss_floor=params["stop_loss_floor"],
-                take_profit=params["take_profit"],
-                partial_profit_pct=_config_float(cfg, "partial_profit", 0.20),
-                penny_pct=_config_float(cfg, "penny_pct", 0.20),
-                max_sector_pct=params["max_sector_pct"],
-                max_pair_correlation=_config_float(cfg, "max_correlation", 0.80),
-                avoid_earnings_days=_config_int(cfg, "avoid_earnings", 3),
+                **shared_kwargs,
+                **params,
                 label=f"search_{i}",
             )
             m = compute_metrics(rets, label=str(params))
@@ -230,23 +261,25 @@ def tune_parameters(
             rets, _ = run_replay(
                 df_holdout,
                 price_lookup,
-                strategy="heuristics_only",
-                initial_cash=initial_cash,
-                max_positions=_config_int(cfg, "max_positions", 20),
+                **shared_kwargs,
                 min_score=finalist["min_score"],
                 stop_loss_floor=finalist["stop_loss_floor"],
                 take_profit=finalist["take_profit"],
-                partial_profit_pct=_config_float(cfg, "partial_profit", 0.20),
-                penny_pct=_config_float(cfg, "penny_pct", 0.20),
                 max_sector_pct=finalist["max_sector_pct"],
-                max_pair_correlation=_config_float(cfg, "max_correlation", 0.80),
-                avoid_earnings_days=_config_int(cfg, "avoid_earnings", 3),
+                max_position_pct=finalist["max_position_pct"],
+                cash_floor=finalist["cash_floor"],
+                max_gross_exposure=finalist["max_gross_exposure"],
+                target_volatility=finalist["target_volatility"],
                 label=(
                     "holdout_"
                     f"{finalist['min_score']:.2f}_"
                     f"{finalist['stop_loss_floor']:.2f}_"
                     f"{finalist['take_profit']:.2f}_"
-                    f"{finalist['max_sector_pct']:.2f}"
+                    f"{finalist['max_sector_pct']:.2f}_"
+                    f"{finalist['max_position_pct']:.2f}_"
+                    f"{finalist['cash_floor']:.2f}_"
+                    f"{finalist['max_gross_exposure']:.2f}_"
+                    f"{finalist['target_volatility']:.2f}"
                 ),
             )
             m = compute_metrics(rets, label=str(finalist))
@@ -280,15 +313,24 @@ def tune_parameters(
         "stop_loss_floor": best_row["stop_loss_floor"],
         "take_profit": best_row["take_profit"],
         "max_sector_pct": best_row["max_sector_pct"],
+        "max_position_pct": best_row["max_position_pct"],
+        "cash_floor": best_row["cash_floor"],
+        "max_gross_exposure": best_row["max_gross_exposure"],
+        "target_volatility": best_row["target_volatility"],
     }
     best_metric = float(best_row[best_metric_name])
 
     logger.info(
-        "AutoTuner: best params - min_score=%.2f  stop=%.2f  tp=%.2f  max_sector=%.2f  %s=%.3f",
+        "AutoTuner: best params - min_score=%.2f  stop=%.2f  tp=%.2f  max_sector=%.2f  "
+        "max_pos=%.2f  cash_floor=%.2f  gross=%.2f  target_vol=%.2f  %s=%.3f",
         best_params["min_score"],
         best_params["stop_loss_floor"],
         best_params["take_profit"],
         best_params["max_sector_pct"],
+        best_params["max_position_pct"],
+        best_params["cash_floor"],
+        best_params["max_gross_exposure"],
+        best_params["target_volatility"],
         best_metric_name,
         best_metric,
     )
@@ -297,6 +339,10 @@ def tune_parameters(
     _write_config_key("stop_loss", f"{best_params['stop_loss_floor']:.2f}", config_path)
     _write_config_key("take_profit", f"{best_params['take_profit']:.2f}", config_path)
     _write_config_key("max_sector", f"{best_params['max_sector_pct']:.2f}", config_path)
+    _write_config_key("max_position_pct", f"{best_params['max_position_pct']:.2f}", config_path)
+    _write_config_key("cash_floor", f"{best_params['cash_floor']:.2f}", config_path)
+    _write_config_key("max_gross_exposure", f"{best_params['max_gross_exposure']:.2f}", config_path)
+    _write_config_key("target_volatility", f"{best_params['target_volatility']:.2f}", config_path)
 
     Path("plots").mkdir(exist_ok=True)
     sort_col = "holdout_sharpe" if has_holdout else "search_sharpe"
@@ -358,6 +404,11 @@ def tune_rl_mode(
             max_sector_pct=_config_float(cfg, "max_sector", 0.40),
             max_pair_correlation=_config_float(cfg, "max_correlation", 0.80),
             avoid_earnings_days=_config_int(cfg, "avoid_earnings", 3),
+            max_position_pct=_config_float(cfg, "max_position_pct", 0.10),
+            max_gross_exposure=_config_float(cfg, "max_gross_exposure", 0.95),
+            cash_floor=_config_float(cfg, "cash_floor", 0.05),
+            target_volatility=_config_float(cfg, "target_volatility", 0.15),
+            vol_lookback=_config_int(cfg, "vol_lookback", 20),
             rl_phase=_config_int(cfg, "rl_phase", 1),
             rl_exit_threshold=_config_float(cfg, "rl_exit_threshold", 0.30),
             rl_conviction_drop=_config_float(cfg, "rl_conviction_drop", 0.20),

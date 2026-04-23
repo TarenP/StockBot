@@ -114,6 +114,10 @@ def test_validate_top_genomes_uses_genome_specific_replay_params(monkeypatch):
             "fast_score": 10.0,
             "min_score": 0.69,
             "partial_profit": 0.31,
+            "max_position_pct": 0.19,
+            "cash_floor": 0.02,
+            "max_gross_exposure": 0.98,
+            "target_volatility": 0.23,
             "avoid_earnings": 6,
             "rl_enabled": True,
             "rl_phase": 2,
@@ -152,6 +156,10 @@ def test_validate_top_genomes_uses_genome_specific_replay_params(monkeypatch):
     assert captured["checkpoint_path"] == "models/best_fold9.pt"
     assert captured["min_score"] == challenger["min_score"]
     assert captured["partial_profit_pct"] == challenger["partial_profit"]
+    assert captured["max_position_pct"] == challenger["max_position_pct"]
+    assert captured["cash_floor"] == challenger["cash_floor"]
+    assert captured["max_gross_exposure"] == challenger["max_gross_exposure"]
+    assert captured["target_volatility"] == challenger["target_volatility"]
     assert captured["avoid_earnings_days"] == challenger["avoid_earnings"]
     assert captured["rl_phase"] == challenger["rl_phase"]
     assert captured["rl_exit_threshold"] == challenger["rl_exit_threshold"]
@@ -180,6 +188,46 @@ def test_maybe_promote_ignores_stale_validations(monkeypatch):
 
     assert promoted is False
     assert updated[0]["is_baseline"] is True
+
+
+def test_maybe_promote_persists_exposure_knobs(monkeypatch):
+    baseline = shadows_module._genome_from_config({})
+    baseline["validated"] = True
+    baseline["sharpe"] = 1.0
+    baseline["validation_metric_version"] = shadows_module.VALIDATION_METRIC_VERSION
+
+    challenger = shadows_module._genome_from_config({})
+    challenger.pop("is_baseline", None)
+    challenger.update(
+        {
+            "validated": True,
+            "sharpe": 1.3,
+            "validation_metric_version": shadows_module.VALIDATION_METRIC_VERSION,
+            "max_position_pct": 0.21,
+            "cash_floor": 0.01,
+            "max_gross_exposure": 0.99,
+            "target_volatility": 0.24,
+        }
+    )
+
+    writes = {}
+
+    def _capture_write(key, value, path="broker.config"):
+        writes[key] = value
+
+    monkeypatch.setattr("pipeline.autotuner._write_config_key", _capture_write)
+
+    _updated, promoted = shadows_module._maybe_promote(
+        [baseline, challenger],
+        live_config={},
+        checkpoint_path=None,
+    )
+
+    assert promoted is True
+    assert writes["max_position_pct"] == "0.210"
+    assert writes["cash_floor"] == "0.010"
+    assert writes["max_gross_exposure"] == "0.990"
+    assert writes["target_volatility"] == "0.240"
 
 
 def test_run_shadow_cycle_forces_revalidation_on_metric_upgrade(monkeypatch):

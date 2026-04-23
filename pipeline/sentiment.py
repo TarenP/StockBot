@@ -204,6 +204,38 @@ def _fetch_yahoo_rss(ticker: str) -> list[dict]:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _normalize_tickers(tickers: list[str] | None) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for ticker in tickers or []:
+        symbol = str(ticker).strip().upper().replace(".", "-")
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        cleaned.append(symbol)
+    return cleaned
+
+
+def _resolve_sentiment_tickers(
+    tickers: list[str] | None,
+    save_dir: str,
+    live_target_size: int | None,
+    expand_live_universe: bool,
+) -> list[str]:
+    seed_tickers = _normalize_tickers(tickers)
+    if not expand_live_universe:
+        return seed_tickers
+
+    from pipeline.updater import get_live_universe
+
+    resolved = get_live_universe(
+        preferred=seed_tickers or None,
+        save_dir=save_dir,
+        target_size=live_target_size,
+    )
+    return resolved or seed_tickers
+
+
 def fetch_and_score(
     tickers: list[str],
     lookback_days: int = 7,
@@ -213,6 +245,10 @@ def fetch_and_score(
     Collects all headlines first, then scores in one batched pass for speed.
     Returns a DataFrame in the same schema as the existing sentiment CSV.
     """
+    tickers = _normalize_tickers(tickers)
+    if not tickers:
+        return pd.DataFrame()
+
     from_date = (datetime.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     to_date   = datetime.today().strftime("%Y-%m-%d")
 
@@ -260,13 +296,29 @@ def fetch_and_score(
     return pd.DataFrame(all_rows)
 
 
-def update_sentiment(tickers: list[str], lookback_days: int = 7) -> int:
+def update_sentiment(
+    tickers: list[str] | None = None,
+    lookback_days: int = 7,
+    save_dir: str = "models",
+    live_target_size: int | None = None,
+    expand_live_universe: bool = True,
+) -> int:
     """
     Fetch + score new headlines and append to the sentiment CSV.
     Deduplicates on (title, date, stock).
     Returns number of new rows added.
     """
     SENTIMENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    tickers = _resolve_sentiment_tickers(
+        tickers=tickers,
+        save_dir=save_dir,
+        live_target_size=live_target_size,
+        expand_live_universe=expand_live_universe,
+    )
+    if not tickers:
+        logger.info("No tickers resolved for sentiment update.")
+        return 0
 
     logger.info(f"Fetching news for {len(tickers)} tickers (last {lookback_days} days)...")
     new_df = fetch_and_score(tickers, lookback_days=lookback_days)

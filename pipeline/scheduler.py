@@ -59,10 +59,8 @@ def daily_update(universe: list[str] | None = None):
     # Sentiment update
     try:
         from pipeline.sentiment import update_sentiment
-        tickers = universe or []
-        if tickers:
-            n_sent = update_sentiment(tickers, lookback_days=3)
-            logger.info(f"Sentiment update complete. {n_sent} new headlines scored.")
+        n_sent = update_sentiment(universe or None, lookback_days=3)
+        logger.info(f"Sentiment update complete. {n_sent} new headlines scored.")
     except Exception as e:
         logger.error(f"Sentiment update failed: {e}", exc_info=True)
 

@@ -70,6 +70,8 @@ def parse_args():
     p.add_argument("--force_retrain", action="store_true",         help="Retrain folds even if completion markers already exist")
     p.add_argument("--force_refresh", action="store_true",
                    help="Re-download last 30 days (--mode update)")
+    p.add_argument("--expand_universe", action="store_true",
+                   help="Ignore checkpoint universe and re-bootstrap from ~1500 tickers (--mode update)")
     # Screener filters
     p.add_argument("--penny",        action="store_true",
                    help="Screen penny stocks only (price < $5)")
@@ -93,7 +95,20 @@ def parse_args():
 
 def _best_checkpoint(save_dir: str) -> str | None:
     ckpts = sorted(glob.glob(f"{save_dir}/best_fold*.pt"))
-    return ckpts[-1] if ckpts else None
+    if not ckpts:
+        return None
+    # Pick by best val_sharpe, not alphabetically
+    best, best_sharpe = None, float("-inf")
+    for p in ckpts:
+        try:
+            meta = torch.load(p, map_location="cpu", weights_only=False)
+            s = float(meta.get("val_sharpe", float("-inf")))
+            if s > best_sharpe:
+                best_sharpe = s
+                best = p
+        except Exception:
+            pass
+    return best or ckpts[-1]
 
 
 def _load_broker_config(path: str = "broker.config") -> dict:
@@ -221,9 +236,20 @@ def run_update(args):
     from pipeline.sentiment import update_sentiment
 
     logger.info("Fetching latest market data...")
+
+    # --expand_universe: use parquet + bootstrap to get the broadest possible universe
+    explicit_universe = None
+    if getattr(args, "expand_universe", False):
+        from pipeline.updater import get_live_universe
+        bootstrap_size = _bootstrap_universe_size(_resolve_top_n(args))
+        logger.info("Expanding universe: reading parquet + bootstrapping up to %d tickers...", bootstrap_size)
+        explicit_universe = get_live_universe(save_dir=args.save_dir, target_size=bootstrap_size)
+        logger.info("Expanded universe: %d tickers", len(explicit_universe))
+
     n_price = update_parquet(
+        universe=explicit_universe,
         save_dir=args.save_dir,
-        force_full_refresh=args.force_refresh,
+        force_full_refresh=args.force_refresh or getattr(args, "expand_universe", False),
         bootstrap_universe_size=_bootstrap_universe_size(_resolve_top_n(args)),
     )
     if n_price:
@@ -231,14 +257,21 @@ def run_update(args):
     else:
         logger.info("Price data already up to date.")
 
-    # Sentiment update — use universe from checkpoint
+    # Sentiment update — use expanded universe if requested, else checkpoint
     try:
         from pipeline.updater import _load_trained_universe
-        universe = _load_trained_universe(args.save_dir)
+        if explicit_universe is not None:
+            universe = explicit_universe
+        else:
+            universe = _load_trained_universe(args.save_dir)
         if universe is None:
             df, universe = _load_data_and_universe(_resolve_top_n(args))
         logger.info(f"Fetching news sentiment for {len(universe)} tickers...")
-        n_sent = update_sentiment(universe, lookback_days=7 if args.force_refresh else 3)
+        n_sent = update_sentiment(
+            universe,
+            lookback_days=7 if args.force_refresh else 3,
+            save_dir=args.save_dir,
+        )
         logger.info(f"Sentiment: {n_sent} new headlines scored.")
     except Exception as e:
         logger.warning(f"Sentiment update skipped: {e}")
@@ -436,8 +469,8 @@ def run_finetune(args):
 # ── Mode: backtest ────────────────────────────────────────────────────────────
 
 def run_backtest_mode(args):
-    from pipeline.data     import walk_forward_split
-    from pipeline.backtest import run_backtest, load_model
+    from pipeline.data import walk_forward_split
+    from pipeline.backtest import load_model, run_backtest
 
     ckpt_path = args.checkpoint or _best_checkpoint(args.save_dir)
     if not ckpt_path:
@@ -449,25 +482,44 @@ def run_backtest_mode(args):
     top_n = meta.get("top_n", _resolve_top_n(args))
 
     df, asset_list = _load_data_and_universe(top_n, include_raw_cols=True)
+
+    # Use checkpoint's asset_list if available (may be a focused shortlist)
+    ckpt_asset_list = meta.get("asset_list")
+    if ckpt_asset_list:
+        # Filter to tickers that exist in current df
+        available = set(df.index.get_level_values("ticker").unique())
+        ckpt_asset_list = [t for t in ckpt_asset_list if t in available]
+        if len(ckpt_asset_list) >= 10:
+            asset_list = ckpt_asset_list
+            logger.info("Backtest: using %d tickers from checkpoint asset_list.", len(asset_list))
+
     folds = walk_forward_split(df, train_years=8, val_years=1, test_years=1)
     if not folds:
         logger.error("Not enough data for a full fold.")
         return
 
-    df_test   = folds[-1]["test"]
-    ckpt_path = args.checkpoint or _best_checkpoint(args.save_dir)
-    if not ckpt_path:
-        logger.error("No checkpoint found. Run --mode train first.")
-        return
+    # Use the test fold that matches the checkpoint's fold index
+    ckpt_fold = meta.get("fold", len(folds) - 1)
+    if ckpt_fold < len(folds):
+        df_test = folds[ckpt_fold]["test"]
+        test_dates = sorted(df_test.index.get_level_values("date").unique())
+        logger.info(
+            "Backtest: fold %d test set (%s → %s)",
+            ckpt_fold, test_dates[0].date(), test_dates[-1].date(),
+        )
+    else:
+        df_test = folds[-1]["test"]
+        logger.warning("Checkpoint fold %d out of range — using last fold.", ckpt_fold)
 
     model, ckpt_n_features = load_model(ckpt_path, DEVICE)
+    logger.info("Backtest: evaluating raw RL policy on held-out test fold.")
     run_backtest(
-        model           = model,
-        df_test         = df_test,
-        asset_list      = asset_list,
-        device          = DEVICE,
-        save_plot       = "plots/backtest.png",
-        ckpt_n_features = ckpt_n_features,
+        model=model,
+        df_test=df_test,
+        asset_list=asset_list,
+        device=DEVICE,
+        save_plot="plots/backtest.png",
+        ckpt_n_features=ckpt_n_features,
     )
 
 
@@ -482,7 +534,6 @@ def run_predict(args):
         logger.error("No checkpoint found. Run --mode train first.")
         return
 
-    # Read top_n from checkpoint so universe always matches training
     import torch
     meta   = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     configured_top_n = _resolve_top_n(args)
@@ -492,10 +543,14 @@ def run_predict(args):
 
     df, asset_list = _load_data_and_universe(top_n)
 
-    ckpt_path = args.checkpoint or _best_checkpoint(args.save_dir)
-    if not ckpt_path:
-        logger.error("No checkpoint found. Run --mode train first.")
-        return
+    # Use checkpoint's asset_list if available (may be a focused shortlist)
+    ckpt_asset_list = meta.get("asset_list")
+    if ckpt_asset_list:
+        available = set(df.index.get_level_values("ticker").unique())
+        ckpt_asset_list = [t for t in ckpt_asset_list if t in available]
+        if len(ckpt_asset_list) >= 10:
+            asset_list = ckpt_asset_list
+            logger.info("Predict: using %d tickers from checkpoint asset_list.", len(asset_list))
 
     model, ckpt_n_features = load_model(ckpt_path, DEVICE)
 

@@ -1,4 +1,0 @@
-# file: C:\Users\taren\AppData\Roaming\Python\Python312\site-packages\gymnasium\wrappers\vector\rendering.py
-# hypothesis_version: 6.151.9
-
-['_last', 'depth_array', 'depth_array_list', 'human', 'render_fps', 'render_modes', 'rgb_array', 'rgb_array_list']

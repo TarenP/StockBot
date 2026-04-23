@@ -15,6 +15,7 @@ Called by BrokerBrain before every trade and at the start of every cycle.
 import logging
 from datetime import datetime, date
 from pathlib import Path
+from typing import Callable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -33,6 +34,8 @@ class PortfolioRiskEngine:
         cash_floor:          float = 0.05,   # always keep 5% cash
         target_volatility:   float = 0.15,   # annualised vol target for scaling
         vol_lookback:        int   = 20,     # days for realized vol calculation
+        equity_curve_path:   Path | str | None = EQUITY_PATH,
+        equity_history_getter: Callable[[], Sequence[float]] | None = None,
     ):
         self.max_daily_loss     = max_daily_loss
         self.max_drawdown       = max_drawdown
@@ -40,6 +43,10 @@ class PortfolioRiskEngine:
         self.cash_floor         = cash_floor
         self.target_volatility  = target_volatility
         self.vol_lookback       = vol_lookback
+        self.equity_curve_path = (
+            Path(equity_curve_path) if equity_curve_path is not None else None
+        )
+        self.equity_history_getter = equity_history_getter
 
         self._session_start_equity: float | None = None
         self._peak_equity:          float | None = None
@@ -147,10 +154,18 @@ class PortfolioRiskEngine:
 
     def _get_realized_vol(self) -> float:
         """Compute annualised realized vol from equity curve."""
-        if not EQUITY_PATH.exists():
-            return 0.0
         try:
-            eq = pd.read_csv(EQUITY_PATH, parse_dates=["time"])
+            if self.equity_history_getter is not None:
+                history = np.asarray(list(self.equity_history_getter()), dtype=float)
+                if len(history) < self.vol_lookback + 1:
+                    return 0.0
+                rets = pd.Series(history).pct_change().dropna().values[-self.vol_lookback:]
+                return float(np.std(rets) * np.sqrt(252))
+
+            if self.equity_curve_path is None or not self.equity_curve_path.exists():
+                return 0.0
+
+            eq = pd.read_csv(self.equity_curve_path, parse_dates=["time"])
             if len(eq) < self.vol_lookback + 1:
                 return 0.0
             rets = eq["equity"].pct_change().dropna().values[-self.vol_lookback:]

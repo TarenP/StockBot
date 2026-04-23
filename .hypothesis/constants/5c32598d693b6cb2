@@ -1,4 +1,0 @@
-# file: C:\Users\taren\Documents\Github Repositories\StockBot\pipeline\autotuner.py
-# hypothesis_version: 6.151.9
-
-[0.0, 0.06, 0.07, 0.08, 0.1, 0.2, 0.25, 0.3, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.8, 10000.0, 126, 500, '#', '%Y-%m-%d %H:%M', '=', 'PASSED', 'ann_return', 'autotuner', 'avoid_earnings', 'broker.config', 'date', 'false', 'heuristics_only', 'holdout_ann_return', 'holdout_max_drawdown', 'holdout_sharpe', 'holdout_total_return', 'last', 'logs', 'logs/autotuner.log', 'max_correlation', 'max_drawdown', 'max_positions', 'max_sector', 'max_sector_pct', 'min_score', 'models', 'partial_profit', 'penny_pct', 'plots', 'rl_checkpoint_path', 'rl_conviction_drop', 'rl_enabled', 'rl_exit_threshold', 'rl_min_score', 'rl_phase', 'search_ann_return', 'search_max_drawdown', 'search_sharpe', 'search_total_return', 'sharpe', 'stop_loss', 'stop_loss_floor', 'take_profit', 'top_n', 'total_return', 'true', 'utf-8', 'w']

@@ -72,18 +72,25 @@ def _today_et():
 
 def _resolve_checkpoint(path: str | None) -> str | None:
     """
-    Resolve 'auto' to the best available checkpoint in models/.
+    Resolve 'auto' to the best available checkpoint in models/ by val_sharpe.
     Returns the path as-is for any other value.
     """
-    import glob
+    import glob, torch
     if not path or str(path).strip().lower() == "auto":
         ckpts = sorted(glob.glob("models/best_fold*.pt"))
-        resolved = ckpts[-1] if ckpts else None
-        if resolved:
-            logger.info("Checkpoint resolved: %s", resolved)
-        else:
-            logger.warning("No checkpoint found in models/ — RL will be unavailable")
-        return resolved
+        if not ckpts:
+            return None
+        best, best_sharpe = None, float("-inf")
+        for p in ckpts:
+            try:
+                meta = torch.load(p, map_location="cpu", weights_only=False)
+                s = float(meta.get("val_sharpe", float("-inf")))
+                if s > best_sharpe:
+                    best_sharpe = s
+                    best = p
+            except Exception:
+                pass
+        return best or ckpts[-1]
     return path
 
 
@@ -150,7 +157,7 @@ def run_cycle(
             # No checkpoint yet — sentiment update will happen after first train
             logger.info("  Sentiment: skipping (no checkpoint yet — run --mode train first)")
         elif not sentiment_fresh_from_maintenance:
-            n_sent = update_sentiment(universe, lookback_days=3)
+            n_sent = update_sentiment(universe, lookback_days=3, save_dir="models")
             if n_sent:
                 logger.info(f"  Sentiment: {n_sent} new headlines scored")
             else:
@@ -301,6 +308,7 @@ def parse_args(config: dict = None):
     cfg = config or {}
     p.add_argument("--cash",           type=float, default=cfg.get("cash",           10_000))
     p.add_argument("--max_positions",  type=int,   default=cfg.get("max_positions",  10))
+    p.add_argument("--max_position_pct", type=float, default=cfg.get("max_position_pct", 0.10))
     p.add_argument("--stop_loss",      type=float, default=cfg.get("stop_loss",      0.08))
     p.add_argument("--take_profit",    type=float, default=cfg.get("take_profit",    0.35))
     p.add_argument("--partial_profit", type=float, default=cfg.get("partial_profit", 0.15))
@@ -312,6 +320,10 @@ def parse_args(config: dict = None):
     p.add_argument("--top_n",          type=int,   default=cfg.get("top_n",          500))
     p.add_argument("--max_daily_loss", type=float, default=cfg.get("max_daily_loss", 0.025))
     p.add_argument("--max_drawdown",   type=float, default=cfg.get("max_drawdown",   0.12))
+    p.add_argument("--max_gross_exposure", type=float, default=cfg.get("max_gross_exposure", 0.95))
+    p.add_argument("--cash_floor",     type=float, default=cfg.get("cash_floor",     0.05))
+    p.add_argument("--target_volatility", type=float, default=cfg.get("target_volatility", 0.15))
+    p.add_argument("--vol_lookback",   type=int,   default=cfg.get("vol_lookback",   20))
     p.add_argument("--no_options",        action="store_true", default=cfg.get("no_options", True))
     p.add_argument("--no_market_hours",   action="store_true", default=False)
     p.add_argument("--status",            action="store_true")
@@ -360,6 +372,7 @@ def main(config: dict = None, maintenance_context: dict | None = None):
     brain = BrokerBrain(
         portfolio           = portfolio,
         max_positions       = args.max_positions,
+        max_position_pct    = args.max_position_pct,
         stop_loss_pct_floor = args.stop_loss,
         partial_profit_pct  = args.partial_profit,
         full_profit_pct     = args.take_profit,
@@ -379,8 +392,12 @@ def main(config: dict = None, maintenance_context: dict | None = None):
     brain._base_min_score = args.min_score
 
     risk = PortfolioRiskEngine(
-        max_daily_loss = args.max_daily_loss,
-        max_drawdown   = args.max_drawdown,
+        max_daily_loss     = args.max_daily_loss,
+        max_drawdown       = args.max_drawdown,
+        max_gross_exposure = args.max_gross_exposure,
+        cash_floor         = args.cash_floor,
+        target_volatility  = args.target_volatility,
+        vol_lookback       = args.vol_lookback,
     )
 
     run_cycle(

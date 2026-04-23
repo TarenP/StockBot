@@ -66,6 +66,31 @@ def test_run_replay_uses_broker_brain_historical_prices(monkeypatch):
     assert captured["prices"] == [10.0, 11.0]
 
 
+def test_run_replay_returns_one_value_per_replay_date(monkeypatch):
+    df_features = _feature_frame()
+    price_lookup = _price_lookup()
+
+    import broker.brain as brain_module
+
+    monkeypatch.setattr(
+        brain_module.BrokerBrain,
+        "run_cycle",
+        lambda self, df_slice, screener_top_n=100, risk_engine=None: [],
+    )
+
+    returns, trade_log = replay_module.run_replay(
+        df_features,
+        price_lookup,
+        strategy="heuristics_only",
+        rebalance_freq=1,
+        label="length_test",
+    )
+
+    expected_len = df_features.index.get_level_values("date").nunique()
+    assert len(returns) == expected_len
+    assert trade_log == []
+
+
 def test_run_replay_preserves_rl_entry_metadata(monkeypatch):
     df_features = _feature_frame()
     price_lookup = _price_lookup()
@@ -390,6 +415,11 @@ def test_run_full_replay_uses_live_config_parameters(monkeypatch):
             "stop_loss": 0.09,
             "take_profit": 0.41,
             "partial_profit": 0.24,
+            "max_position_pct": 0.18,
+            "cash_floor": 0.02,
+            "max_gross_exposure": 0.98,
+            "target_volatility": 0.21,
+            "vol_lookback": 30,
             "penny_pct": 0.03,
             "max_sector": 0.33,
             "max_correlation": 0.72,
@@ -405,6 +435,11 @@ def test_run_full_replay_uses_live_config_parameters(monkeypatch):
     assert captured["strategy"] == "screener_rl"
     assert captured["checkpoint_path"] == "models/best_fold0.pt"
     assert captured["partial_profit_pct"] == 0.24
+    assert captured["max_position_pct"] == 0.18
+    assert captured["cash_floor"] == 0.02
+    assert captured["max_gross_exposure"] == 0.98
+    assert captured["target_volatility"] == 0.21
+    assert captured["vol_lookback"] == 30
     assert captured["max_pair_correlation"] == 0.72
     assert captured["avoid_earnings_days"] == 4
     assert captured["rl_phase"] == 2
@@ -444,3 +479,74 @@ def test_run_full_replay_prefers_screener_when_rl_disabled(monkeypatch):
     )
 
     assert captured["strategy"] == "screener_heuristics"
+
+
+def test_run_full_replay_aligns_spy_by_replay_dates(monkeypatch):
+    dates = pd.to_datetime(["2024-01-02", "2024-01-04"])
+    index = pd.MultiIndex.from_product([dates, ["AAA"]], names=["date", "ticker"])
+    df_features = pd.DataFrame(
+        {
+            "ret_1d": [0.0, 0.0],
+            "ret_5d": [0.0, 0.0],
+            "vol_ratio": [1.0, 1.0],
+            "sent_net": [0.0, 0.0],
+            "macd_hist": [0.0, 0.0],
+        },
+        index=index,
+    )
+    captured = {}
+    price_lookup = pd.DataFrame(
+        {
+            "close": [10.0, 10.5],
+            "volume": [1_000_000.0, 1_000_000.0],
+        },
+        index=index,
+    )
+
+    monkeypatch.setattr(replay_module, "_build_price_lookup", lambda: price_lookup)
+    monkeypatch.setattr(
+        replay_module,
+        "run_replay",
+        lambda *args, **kwargs: (np.array([0.01, 0.02], dtype=float), []),
+    )
+    monkeypatch.setattr(
+        replay_module,
+        "_equal_weight_returns",
+        lambda *args, **kwargs: np.array([0.0, 0.03], dtype=float),
+    )
+
+    import pipeline.benchmark as benchmark_module
+
+    monkeypatch.setattr(
+        benchmark_module,
+        "fetch_spy_returns",
+        lambda start, end: pd.Series(
+            [0.11, 0.22, 0.33],
+            index=pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_module,
+        "print_benchmark_report",
+        lambda portfolio_rets, spy_rets, ew_rets=None, label=None: captured.update(
+            {
+                "portfolio": np.asarray(portfolio_rets, dtype=float),
+                "spy": None if spy_rets is None else np.asarray(spy_rets, dtype=float),
+                "ew": None if ew_rets is None else np.asarray(ew_rets, dtype=float),
+                "label": label,
+            }
+        ),
+    )
+    monkeypatch.setattr(benchmark_module, "plot_benchmark", lambda *args, **kwargs: None)
+
+    replay_module.run_full_replay(
+        df_features=df_features,
+        replay_years=1,
+        live_config={},
+        checkpoint_path=None,
+    )
+
+    assert captured["portfolio"].tolist() == [0.01, 0.02]
+    assert captured["spy"].tolist() == [0.11, 0.33]
+    assert captured["ew"].tolist() == [0.0, 0.03]
+    assert captured["label"] == "Broker Replay"

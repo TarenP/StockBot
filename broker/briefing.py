@@ -80,6 +80,11 @@ def _load_shadow_recommendation() -> str | None:
         return None
 
 
+def _format_briefing_date(ts: datetime) -> str:
+    """Cross-platform date label without platform-specific strftime flags."""
+    return f"{ts.strftime('%A, %B')} {ts.day} {ts.year}"
+
+
 # ── Main briefing ─────────────────────────────────────────────────────────────
 
 def print_daily_briefing(
@@ -99,7 +104,7 @@ def print_daily_briefing(
     executed : list[Decision]
         Decisions that were actually executed this cycle.
     """
-    now = datetime.now().strftime("%A, %B %-d %Y")
+    now = _format_briefing_date(datetime.now())
     width = 62
 
     print(f"\n{'='*width}")

@@ -17,6 +17,7 @@ genome for OPTIONS_LIVE_DAYS consecutive days.
 
 Parameters that evolve:
   min_score, stop_loss, take_profit, max_sector, partial_profit,
+  max_position_pct, cash_floor, max_gross_exposure, target_volatility,
   avoid_earnings, rl_enabled, rl_phase, rl_exit_threshold, rl_conviction_drop
 
 State is persisted in broker/state/shadows.json (~2MB for 1000 genomes).
@@ -55,6 +56,10 @@ _PARAM_BOUNDS = {
     "take_profit":       (0.20, 0.70),
     "max_sector":        (0.15, 0.55),
     "partial_profit":    (0.10, 0.40),
+    "max_position_pct":  (0.08, 0.25),
+    "cash_floor":        (0.00, 0.08),
+    "max_gross_exposure":(0.90, 1.00),
+    "target_volatility": (0.12, 0.30),
     "avoid_earnings":    (0,    10),
     "rl_exit_threshold": (0.10, 0.50),
     "rl_conviction_drop":(0.10, 0.40),
@@ -66,6 +71,10 @@ _MUTATION_SCALE = {
     "take_profit":       0.05,
     "max_sector":        0.05,
     "partial_profit":    0.03,
+    "max_position_pct":  0.03,
+    "cash_floor":        0.015,
+    "max_gross_exposure":0.02,
+    "target_volatility": 0.03,
     "avoid_earnings":    1,
     "rl_exit_threshold": 0.03,
     "rl_conviction_drop":0.03,
@@ -133,6 +142,10 @@ def _genome_from_config(config: dict) -> dict:
         "take_profit":        float(config.get("take_profit",        0.35)),
         "max_sector":         float(config.get("max_sector",         0.25)),
         "partial_profit":     float(config.get("partial_profit",     0.15)),
+        "max_position_pct":   float(config.get("max_position_pct",   0.10)),
+        "cash_floor":         float(config.get("cash_floor",         0.05)),
+        "max_gross_exposure": float(config.get("max_gross_exposure", 0.95)),
+        "target_volatility":  float(config.get("target_volatility",  0.15)),
         "avoid_earnings":     int(config.get("avoid_earnings",       5)),
         "rl_exit_threshold":  float(config.get("rl_exit_threshold",  0.30)),
         "rl_conviction_drop": float(config.get("rl_conviction_drop", 0.20)),
@@ -147,6 +160,34 @@ def _genome_from_config(config: dict) -> dict:
         "is_baseline":        True,
     }
     return g
+
+
+def _write_genome_to_config(
+    genome: dict,
+    config_path: str,
+    checkpoint_path: str | None = None,
+) -> None:
+    from pipeline.autotuner import _write_config_key
+
+    _write_config_key("min_score", f"{genome['min_score']:.3f}", config_path)
+    _write_config_key("stop_loss", f"{genome['stop_loss']:.3f}", config_path)
+    _write_config_key("take_profit", f"{genome['take_profit']:.3f}", config_path)
+    _write_config_key("max_sector", f"{genome['max_sector']:.3f}", config_path)
+    _write_config_key("partial_profit", f"{genome['partial_profit']:.3f}", config_path)
+    _write_config_key("max_position_pct", f"{genome['max_position_pct']:.3f}", config_path)
+    _write_config_key("cash_floor", f"{genome['cash_floor']:.3f}", config_path)
+    _write_config_key("max_gross_exposure", f"{genome['max_gross_exposure']:.3f}", config_path)
+    _write_config_key("target_volatility", f"{genome['target_volatility']:.3f}", config_path)
+    _write_config_key("avoid_earnings", str(genome["avoid_earnings"]), config_path)
+    _write_config_key("rl_exit_threshold", f"{genome['rl_exit_threshold']:.3f}", config_path)
+    _write_config_key("rl_conviction_drop", f"{genome['rl_conviction_drop']:.3f}", config_path)
+
+    if genome.get("rl_enabled") and checkpoint_path:
+        _write_config_key("rl_enabled", "true", config_path)
+        _write_config_key("rl_phase", str(genome.get("rl_phase", 1)), config_path)
+        _write_config_key("rl_checkpoint_path", checkpoint_path, config_path)
+    else:
+        _write_config_key("rl_enabled", "false", config_path)
 
 
 # ── State I/O ─────────────────────────────────────────────────────────────────
@@ -193,10 +234,24 @@ def _resolve_shadow_checkpoint(checkpoint_path: str | None) -> str | None:
     """
     Match the live broker's checkpoint resolution so shadows handle
     `rl_checkpoint_path=auto` the same way the live cycle does.
+    Picks best by val_sharpe, not alphabetically.
     """
     if not checkpoint_path or str(checkpoint_path).strip().lower() == "auto":
         ckpts = sorted(Path("models").glob("best_fold*.pt"))
-        return str(ckpts[-1]) if ckpts else None
+        if not ckpts:
+            return None
+        import torch as _torch
+        best, best_sharpe = None, float("-inf")
+        for p in ckpts:
+            try:
+                meta = _torch.load(str(p), map_location="cpu", weights_only=False)
+                s = float(meta.get("val_sharpe", float("-inf")))
+                if s > best_sharpe:
+                    best_sharpe = s
+                    best = str(p)
+            except Exception:
+                pass
+        return best or str(ckpts[-1])
     return checkpoint_path
 
 
@@ -284,7 +339,14 @@ def _fast_score_genome(genome: dict, snap: pd.DataFrame) -> float:
         if len(selected) < 5:
             penalty += 0.15
 
-        return round(proxy_sharpe - penalty, 4)
+        deployment_bonus = 0.0
+        deployment_bonus += 1.0 * np.clip(float(genome.get("max_position_pct", 0.10)) - 0.10, -0.04, 0.12)
+        deployment_bonus += 1.5 * np.clip(0.05 - float(genome.get("cash_floor", 0.05)), -0.03, 0.05)
+        deployment_bonus += 2.0 * np.clip(float(genome.get("max_gross_exposure", 0.95)) - 0.95, -0.05, 0.05)
+        deployment_bonus += 0.5 * np.clip(float(genome.get("target_volatility", 0.15)) - 0.15, -0.05, 0.10)
+        deployment_bonus = float(np.clip(deployment_bonus, -0.10, 0.25))
+
+        return round((proxy_sharpe - penalty) * (1.0 + deployment_bonus), 4)
 
     except Exception:
         return -1.0
@@ -383,6 +445,10 @@ def validate_top_genomes(
                 stop_loss_floor=float(genome.get("stop_loss", 0.08)),
                 take_profit=float(genome.get("take_profit", 0.35)),
                 partial_profit_pct=float(genome.get("partial_profit", 0.20)),
+                max_position_pct=float(genome.get("max_position_pct", 0.10)),
+                cash_floor=float(genome.get("cash_floor", 0.05)),
+                max_gross_exposure=float(genome.get("max_gross_exposure", 0.95)),
+                target_volatility=float(genome.get("target_volatility", 0.15)),
                 max_sector_pct=float(genome.get("max_sector", 0.25)),
                 avoid_earnings_days=int(genome.get("avoid_earnings", 3)),
                 rl_phase=int(genome.get("rl_phase", 1)),
@@ -472,8 +538,6 @@ def _maybe_promote(
 
     Returns (updated_population, promoted: bool).
     """
-    from pipeline.autotuner import _write_config_key
-
     validated = [g for g in population if _is_current_validation(g) and not g.get("is_baseline")]
     if not validated:
         return population, False
@@ -513,21 +577,11 @@ def _maybe_promote(
         promoted["rl_enabled"] = False
         promoted["rl_phase"] = 1
 
-    # Write winner to config
-    _write_config_key("min_score",          f"{promoted['min_score']:.3f}",          config_path)
-    _write_config_key("stop_loss",          f"{promoted['stop_loss']:.3f}",          config_path)
-    _write_config_key("take_profit",        f"{promoted['take_profit']:.3f}",        config_path)
-    _write_config_key("max_sector",         f"{promoted['max_sector']:.3f}",         config_path)
-    _write_config_key("partial_profit",     f"{promoted['partial_profit']:.3f}",     config_path)
-    _write_config_key("avoid_earnings",     str(promoted["avoid_earnings"]),          config_path)
-    _write_config_key("rl_exit_threshold",  f"{promoted['rl_exit_threshold']:.3f}",  config_path)
-    _write_config_key("rl_conviction_drop", f"{promoted['rl_conviction_drop']:.3f}", config_path)
-    if can_enable_rl:
-        _write_config_key("rl_enabled", "true",              config_path)
-        _write_config_key("rl_phase",   str(promoted["rl_phase"]), config_path)
-        _write_config_key("rl_checkpoint_path", resolved_checkpoint, config_path)
-    else:
-        _write_config_key("rl_enabled", "false", config_path)
+    _write_genome_to_config(
+        promoted,
+        config_path=config_path,
+        checkpoint_path=resolved_checkpoint if can_enable_rl else None,
+    )
 
     # Winner becomes the new live baseline; a mutated child stays in the pool.
     rng = random.Random()
@@ -822,22 +876,11 @@ def run_historical_warmup(
             float(best.get("sharpe", 0)),
         )
 
-        # Always promote after warm-up — this is the best we found on history
-        from pipeline.autotuner import _write_config_key
-        _write_config_key("min_score",          f"{best['min_score']:.3f}",          config_path)
-        _write_config_key("stop_loss",          f"{best['stop_loss']:.3f}",          config_path)
-        _write_config_key("take_profit",        f"{best['take_profit']:.3f}",        config_path)
-        _write_config_key("max_sector",         f"{best['max_sector']:.3f}",         config_path)
-        _write_config_key("partial_profit",     f"{best['partial_profit']:.3f}",     config_path)
-        _write_config_key("avoid_earnings",     str(best["avoid_earnings"]),          config_path)
-        _write_config_key("rl_exit_threshold",  f"{best['rl_exit_threshold']:.3f}",  config_path)
-        _write_config_key("rl_conviction_drop", f"{best['rl_conviction_drop']:.3f}", config_path)
-        if best.get("rl_enabled") and resolved_checkpoint:
-            _write_config_key("rl_enabled",         "true",          config_path)
-            _write_config_key("rl_phase",            str(best.get("rl_phase", 1)), config_path)
-            _write_config_key("rl_checkpoint_path",  resolved_checkpoint, config_path)
-        else:
-            _write_config_key("rl_enabled", "false", config_path)
+        _write_genome_to_config(
+            best,
+            config_path=config_path,
+            checkpoint_path=resolved_checkpoint if best.get("rl_enabled") else None,
+        )
 
         logger.info("broker.config updated with warm-up winner.")
         promoted = True

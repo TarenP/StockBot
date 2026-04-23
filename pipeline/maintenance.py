@@ -94,7 +94,7 @@ def _check_sentiment(state: dict, universe: list[str] | None) -> bool:
     logger.info("Maintenance: sentiment stale (last: %s) — updating...", last or "never")
     try:
         from pipeline.sentiment import update_sentiment
-        n = update_sentiment(universe, lookback_days=3)
+        n = update_sentiment(universe, lookback_days=3, save_dir="models")
         logger.info("Maintenance: sentiment updated — %d new headlines", n)
         state["sentiment_updated"] = _today()
         return True

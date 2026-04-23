@@ -27,3 +27,15 @@ plots/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test / hypothesis cache
+.hypothesis/
+.pytest_cache/
+tests/_tmp/
+
+# Fold completion markers
+models/*.done
+
+# IDE
+.vscode/
+.idea/

@@ -1,4 +1,0 @@
-# file: C:\Users\taren\Documents\Github Repositories\StockBot\pipeline\updater.py
-# hypothesis_version: 6.151.9
-
-[0.15, 0.3, 200, 250, 1500, '%Y-%m-%d', '-', '.', '2010-01-01', 'Close', 'Fetching prices', 'High', 'Low', 'Open', 'User-Agent', 'Volume', 'a', 'asset_list', 'batch', 'close', 'cpu', 'cyan', 'data-symbol', 'date', 'html.parser', 'last', 'models', 'peewee', 'ticker', 'w', 'yfinance']

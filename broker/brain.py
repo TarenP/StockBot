@@ -549,6 +549,9 @@ class BrokerBrain:
                         logger.debug(f"Pre-trade check blocked {ticker}: {reason}")
                         risk_blocked_skips += 1
                         continue
+                    if "Capped to preserve cash floor" in reason:
+                        max_spend = self.portfolio.cash - equity * risk_engine.cash_floor
+                        alloc_value = min(alloc_value, max(0.0, max_spend))
 
                 shares = alloc_value / price if price > 0 else 0
                 if shares < 0.001 or alloc_value < 1.0:

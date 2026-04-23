@@ -124,6 +124,71 @@ def fetch_spy_returns(
         return pd.Series(dtype=float)
 
 
+def align_return_series(
+    portfolio_rets: np.ndarray,
+    portfolio_dates,
+    benchmark_rets: pd.Series | None = None,
+    extra_series: dict[str, np.ndarray] | None = None,
+) -> pd.DataFrame:
+    """
+    Align portfolio returns, optional benchmark returns, and optional extra
+    series onto a shared normalized date index.
+
+    When benchmark data is unavailable or has no overlap, the portfolio and
+    extra series are still returned on their native dates.
+    """
+    portfolio_arr = np.asarray(portfolio_rets, dtype=float)
+    portfolio_dates = list(portfolio_dates)
+    n = min(len(portfolio_arr), len(portfolio_dates))
+
+    columns = ["portfolio"]
+    if extra_series:
+        columns.extend(extra_series.keys())
+    if benchmark_rets is not None:
+        columns.append("benchmark")
+
+    if n == 0:
+        return pd.DataFrame(columns=columns)
+
+    index = pd.to_datetime(pd.Index(portfolio_dates[:n]), errors="coerce").normalize()
+    frames = [pd.Series(portfolio_arr[:n], index=index, name="portfolio")]
+
+    if extra_series:
+        for name, values in extra_series.items():
+            arr = np.asarray(values, dtype=float)
+            extra_n = min(len(arr), n)
+            frames.append(pd.Series(arr[:extra_n], index=index[:extra_n], name=name))
+
+    base = pd.concat(frames, axis=1).dropna()
+    if benchmark_rets is None or getattr(benchmark_rets, "empty", True):
+        return base
+
+    benchmark = benchmark_rets.copy()
+    if isinstance(benchmark, pd.DataFrame):
+        benchmark = benchmark.iloc[:, 0]
+
+    benchmark_index = pd.to_datetime(benchmark.index, errors="coerce")
+    if getattr(benchmark_index, "tz", None) is not None:
+        benchmark_index = benchmark_index.tz_convert(None)
+    benchmark_index = benchmark_index.normalize()
+
+    if benchmark_index.isna().all() or not benchmark_index.is_unique:
+        bench_arr = np.asarray(benchmark, dtype=float)
+        bench_n = min(len(bench_arr), len(base.index))
+        benchmark = pd.Series(
+            bench_arr[:bench_n],
+            index=base.index[:bench_n],
+            name="benchmark",
+            dtype=float,
+        )
+    else:
+        benchmark.index = benchmark_index
+        benchmark = benchmark.rename("benchmark").astype(float)
+
+    aligned = pd.concat([base, benchmark], axis=1, join="inner").dropna()
+    return aligned if not aligned.empty else base
+
+
 def _sharpe(rets, periods: int = 252) -> float:
     if len(rets) < 2:
         return 0.0

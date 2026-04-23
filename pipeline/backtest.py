@@ -17,7 +17,7 @@ from pipeline.environment import PortfolioEnv
 from pipeline.features    import FEATURE_COLS
 from pipeline.model       import PortfolioTransformer
 from pipeline.benchmark   import (
-    fetch_spy_returns, compute_metrics, benchmark_vs_spy,
+    align_return_series, fetch_spy_returns, compute_metrics, benchmark_vs_spy,
     print_benchmark_report, plot_benchmark,
 )
 
@@ -69,6 +69,7 @@ def run_backtest(
             policy_rets.append(info["port_ret"])
             done = terminated or truncated
     policy_rets = np.array(policy_rets)
+    return_dates = pd.DatetimeIndex(env.dates[env.lookback:env.lookback + len(policy_rets)])
 
     # ── Equal-weight baseline ─────────────────────────────────────────────────
     ew_env = PortfolioEnv(df_test, asset_list, feature_cols=feature_cols)
@@ -83,42 +84,66 @@ def run_backtest(
     ew_rets = np.array(ew_rets)
 
     # ── Fetch SPY (mandatory) ─────────────────────────────────────────────────
+    spy_series = None
+    if spy_rets is not None:
+        spy_rets = np.asarray(spy_rets, dtype=float)
+        spy_series = pd.Series(
+            spy_rets[:len(return_dates)],
+            index=return_dates[:len(spy_rets)],
+            name="benchmark",
+        )
+
     if spy_rets is None:
         dates = sorted(df_test.index.get_level_values("date").unique())
         if len(dates) >= 2:
             start = (pd.Timestamp(dates[0]) - pd.Timedelta(days=5)).strftime("%Y-%m-%d")
             end   = (pd.Timestamp(dates[-1]) + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
-            spy_series = fetch_spy_returns(start=start, end=end)
-            if not spy_series.empty and len(spy_series) >= 2:
-                # Align SPY to the same number of trading days as policy
-                spy_rets = spy_series.values[:len(policy_rets)]
+            fetched_spy = fetch_spy_returns(start=start, end=end)
+            if not fetched_spy.empty and len(fetched_spy) >= 2:
+                spy_series = fetched_spy
             else:
                 print("  Warning: could not fetch SPY — benchmark comparison unavailable")
 
+    aligned = align_return_series(
+        policy_rets,
+        return_dates,
+        benchmark_rets=spy_series,
+        extra_series={"equal_weight": ew_rets},
+    )
+    policy_aligned = aligned["portfolio"].to_numpy(dtype=float)
+    ew_aligned = (
+        aligned["equal_weight"].to_numpy(dtype=float)
+        if "equal_weight" in aligned.columns else None
+    )
+    spy_aligned = (
+        aligned["benchmark"].to_numpy(dtype=float)
+        if "benchmark" in aligned.columns else None
+    )
+
     # ── Metrics ───────────────────────────────────────────────────────────────
     results = {
-        "policy":       compute_metrics(policy_rets, "Policy"),
-        "equal_weight": compute_metrics(ew_rets,     "Equal-Weight"),
+        "policy":       compute_metrics(policy_aligned, "Policy"),
+        "equal_weight": compute_metrics(ew_aligned,     "Equal-Weight"),
     }
-    if spy_rets is not None:
-        n = min(len(spy_rets), len(policy_rets))
+    if spy_aligned is not None:
+        n = min(len(spy_aligned), len(policy_aligned))
         if n >= 2:
-            results["spy"]    = compute_metrics(spy_rets[:n], "SPY")
-            results["vs_spy"] = benchmark_vs_spy(policy_rets[:n], spy_rets[:n])
+            results["spy"]    = compute_metrics(spy_aligned[:n], "SPY")
+            results["vs_spy"] = benchmark_vs_spy(policy_aligned[:n], spy_aligned[:n])
 
     # ── Print report ──────────────────────────────────────────────────────────
     print_benchmark_report(
-        policy_rets,
-        spy_rets if spy_rets is not None else np.zeros_like(policy_rets),
-        ew_rets=ew_rets,
+        policy_aligned,
+        spy_aligned,
+        ew_rets=ew_aligned,
         label="RL Policy",
     )
 
     # ── Plot ──────────────────────────────────────────────────────────────────
     plot_benchmark(
-        policy_rets,
-        spy_rets if spy_rets is not None else np.zeros_like(policy_rets),
-        ew_rets=ew_rets,
+        policy_aligned,
+        spy_aligned,
+        ew_rets=ew_aligned,
         save_path=save_plot,
         label="RL Policy",
     )
