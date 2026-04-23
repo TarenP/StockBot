@@ -94,6 +94,7 @@ def fetch_spy_returns(
     start: str | None = None,
     end: str | None = None,
     n_days: int | None = None,
+    parquet_path: str = "MasterDS/stooq_panel.parquet",
 ) -> pd.Series:
     """
     Fetch SPY daily returns from yfinance.
@@ -111,8 +112,8 @@ def fetch_spy_returns(
             with _quiet():
                 raw = yf.Ticker("SPY").history(start=start, end=end, auto_adjust=True)
         if raw.empty:
-            logger.warning("Could not fetch SPY data")
-            return pd.Series(dtype=float)
+            logger.warning("Could not fetch SPY data from yfinance. Falling back to local parquet.")
+            return _load_local_symbol_returns("SPY", start=start, end=end, parquet_path=parquet_path)
 
         rets = raw["Close"].pct_change().dropna()
         if isinstance(rets, pd.DataFrame):
@@ -121,7 +122,83 @@ def fetch_spy_returns(
         return rets
     except Exception as exc:
         logger.warning("SPY fetch failed: %s", exc)
+        return _load_local_symbol_returns("SPY", start=start, end=end, parquet_path=parquet_path)
+
+
+def _load_local_symbol_returns(
+    symbol: str,
+    start: str | None = None,
+    end: str | None = None,
+    parquet_path: str = "MasterDS/stooq_panel.parquet",
+) -> pd.Series:
+    """
+    Load a benchmark symbol from the local price parquet when network fetches
+    are unavailable. Supports both the repo's flat index + ticker-column shape
+    and older MultiIndex layouts.
+    """
+    if not os.path.exists(parquet_path):
         return pd.Series(dtype=float)
+
+    try:
+        raw = pd.read_parquet(parquet_path)
+    except Exception as exc:
+        logger.warning("Local benchmark fallback failed to read %s: %s", parquet_path, exc)
+        return pd.Series(dtype=float)
+
+    symbol = str(symbol).upper()
+    frame: pd.DataFrame | None = None
+    close_col = None
+
+    if isinstance(raw.index, pd.MultiIndex) and "ticker" in raw.index.names:
+        try:
+            frame = raw.xs(symbol, level="ticker").copy()
+        except Exception:
+            frame = None
+    elif "ticker" in raw.columns:
+        tickers = raw["ticker"].astype(str).str.upper()
+        frame = raw.loc[tickers == symbol].copy()
+
+    if frame is None or frame.empty:
+        return pd.Series(dtype=float)
+
+    if "close" in frame.columns:
+        close_col = "close"
+    elif "Close" in frame.columns:
+        close_col = "Close"
+    else:
+        return pd.Series(dtype=float)
+
+    if isinstance(frame.index, pd.MultiIndex):
+        if "date" not in frame.index.names:
+            return pd.Series(dtype=float)
+        dates = pd.to_datetime(frame.index.get_level_values("date"), errors="coerce")
+        series = pd.Series(frame[close_col].to_numpy(dtype=float), index=dates, name=symbol)
+    elif "date" in frame.columns and not isinstance(frame.index, pd.DatetimeIndex):
+        dates = pd.to_datetime(frame["date"], errors="coerce")
+        series = pd.Series(frame[close_col].to_numpy(dtype=float), index=dates, name=symbol)
+    else:
+        dates = pd.to_datetime(frame.index, errors="coerce")
+        series = pd.Series(frame[close_col].to_numpy(dtype=float), index=dates, name=symbol)
+
+    if getattr(series.index, "tz", None) is not None:
+        series.index = series.index.tz_convert(None)
+    series.index = series.index.normalize()
+    series = series[~series.index.isna()].sort_index()
+
+    if start is not None:
+        series = series[series.index >= pd.Timestamp(start).normalize()]
+    if end is not None:
+        series = series[series.index <= pd.Timestamp(end).normalize()]
+
+    rets = series.pct_change().dropna()
+    if not rets.empty:
+        logger.info(
+            "Loaded %s benchmark from local parquet fallback (%s to %s).",
+            symbol,
+            rets.index.min().date(),
+            rets.index.max().date(),
+        )
+    return rets.astype(float)
 
 
 def align_return_series(

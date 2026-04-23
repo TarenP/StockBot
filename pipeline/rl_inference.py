@@ -49,6 +49,29 @@ def _zscore_df(df: pd.DataFrame) -> pd.DataFrame:
     return (df - mean) / std
 
 
+def _weights_to_rank_scores(asset_weights: np.ndarray) -> np.ndarray:
+    """
+    Convert per-asset model weights into shortlist rank percentiles.
+
+    We keep zero for assets with zero/no conviction so callers can distinguish
+    "unscored" names from genuinely ranked candidates. Positive-weight assets
+    are mapped to percentiles in (0, 1], where 1.0 is the top-ranked ticker.
+    """
+    weights = np.asarray(asset_weights, dtype=float)
+    scores = np.zeros_like(weights, dtype=float)
+    positive_mask = np.isfinite(weights) & (weights > 0.0)
+    if not positive_mask.any():
+        return scores
+
+    ranked = (
+        pd.Series(weights[positive_mask], dtype=float)
+        .rank(method="average", ascending=True)
+        .to_numpy(dtype=float)
+    )
+    scores[positive_mask] = ranked / float(len(ranked))
+    return scores
+
+
 def _load_model(
     checkpoint_path: str,
     device: torch.device,
@@ -242,7 +265,7 @@ def get_rl_targets(
         When a directory or "auto" is given, all valid checkpoints are loaded
         and their weights are averaged (ensemble inference).
     mode : str
-        "rank"    → pd.Series[ticker → rl_score ∈ [0, 1]]
+        "rank"    → pd.Series[ticker → rl_score ∈ [0, 1]] as shortlist rank percentiles
         "weights" → pd.Series[ticker | "CASH" → weight], sum = 1.0
     device : torch.device | None
         Inference device. Defaults to CPU.
@@ -329,12 +352,9 @@ def get_rl_targets(
             asset_weights[asset_map[ticker]] = 0.0
 
     if mode == "rank":
-        # Renormalise asset weights to [0, 1] by dividing by their sum
-        total = asset_weights.sum()
-        if total > 1e-9:
-            scores = asset_weights / total
-        else:
-            scores = asset_weights.copy()
+        # Use rank percentiles for entry/exit semantics so score meaning does
+        # not shrink as the shortlist grows. Zero-weight assets stay at 0.0.
+        scores = _weights_to_rank_scores(asset_weights)
 
         return pd.Series(scores, index=asset_list, name="rl_score", dtype=float)
 

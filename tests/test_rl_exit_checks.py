@@ -2,10 +2,9 @@
 Unit tests for BrokerBrain._rl_exit_checks (Phase 2).
 
 The implementation uses rank percentiles within the current shortlist, not
-raw RL scores. This is because mode="rank" scores sum to 1 across the
-shortlist and shrink as the shortlist grows — comparing them to a fixed
-absolute threshold produces exits that depend on shortlist size, not
-conviction.
+raw RL weights. mode="rank" is already shortlist-relative, and Phase 2
+re-ranks it again so exit thresholds stay stable even if upstream score
+calibration changes.
 
 Rank percentile semantics:
   - With N tickers in rl_scores, the lowest-scoring ticker gets rank_pct ≈ 1/N

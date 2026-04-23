@@ -371,10 +371,17 @@ def compute_regimes(
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_features(
+    df: pd.DataFrame,
+    use_snapshot_fundamentals: bool = False,
+) -> pd.DataFrame:
     """
     df: MultiIndex [date, ticker], columns include OHLCV + optional sentiment.
     Returns df with FEATURE_COLS, cross-sectionally z-scored.
+
+    Snapshot fundamentals from yfinance are disabled by default because they
+    are current-state fields and are not point-in-time safe for historical
+    training, backtests, or broker replay.
     """
     df = df.copy().sort_index()
 
@@ -398,18 +405,23 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.join(market_ctx, on="date", how="left")
 
     # ── Fundamental features (broadcast per ticker) ───────────────────────────
-    tqdm.write("  Fetching fundamental features...")
-    fund = fetch_fundamentals(list(tickers))
-    # Merge by ticker level, then forward-fill within each ticker (up to 20 days)
     fund_cols = ["pe_ratio", "revenue_growth", "short_interest_pct"]
-    for col in fund_cols:
-        df[col] = df.index.get_level_values("ticker").map(fund[col].to_dict())
-        df[col] = (
-            df[col]
-            .groupby(level="ticker")
-            .transform(lambda s: s.ffill(limit=20))
-            .fillna(0.0)
-        )
+    if use_snapshot_fundamentals:
+        tqdm.write("  Fetching snapshot fundamental features...")
+        fund = fetch_fundamentals(list(tickers))
+        # Merge by ticker level, then forward-fill within each ticker (up to 20 days)
+        for col in fund_cols:
+            df[col] = df.index.get_level_values("ticker").map(fund[col].to_dict())
+            df[col] = (
+                df[col]
+                .groupby(level="ticker")
+                .transform(lambda s: s.ffill(limit=20))
+                .fillna(0.0)
+            )
+    else:
+        tqdm.write("  Historical build: snapshot fundamentals disabled.")
+        for col in fund_cols:
+            df[col] = 0.0
 
     # ── Regime features (broadcast per date) ──────────────────────────────────
     tqdm.write("  Computing regime features...")

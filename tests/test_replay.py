@@ -91,6 +91,90 @@ def test_run_replay_returns_one_value_per_replay_date(monkeypatch):
     assert trade_log == []
 
 
+def test_run_replay_executes_trades_on_next_session(monkeypatch):
+    dates = pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"])
+    index = pd.MultiIndex.from_product([dates, ["AAA"]], names=["date", "ticker"])
+    df_features = pd.DataFrame(
+        {
+            "ret_1d": [0.01, 0.02, 0.03],
+            "ret_5d": [0.05, 0.06, 0.07],
+            "vol_ratio": [1.2, 1.1, 1.0],
+            "sent_net": [0.2, 0.1, 0.0],
+            "macd_hist": [0.3, 0.2, 0.1],
+        },
+        index=index,
+    )
+    price_lookup = pd.DataFrame(
+        {
+            "close": [10.0, 11.0, 12.0],
+            "volume": [1_000_000.0, 1_000_000.0, 1_000_000.0],
+        },
+        index=index,
+    )
+
+    import broker.brain as brain_module
+
+    def fake_run_cycle(self, df_slice, screener_top_n=100, risk_engine=None):
+        last_date = df_slice.index.get_level_values("date").max()
+        if pd.Timestamp(last_date) != pd.Timestamp("2024-01-02"):
+            return []
+        return [
+            brain_module.Decision(
+                action="BUY",
+                ticker="AAA",
+                shares=1.0,
+                price=10.0,
+                score=0.9,
+                reason="next-session test",
+            )
+        ]
+
+    monkeypatch.setattr(brain_module.BrokerBrain, "run_cycle", fake_run_cycle)
+
+    returns, trade_log = replay_module.run_replay(
+        df_features,
+        price_lookup,
+        strategy="heuristics_only",
+        rebalance_freq=1,
+        label="next_session_test",
+    )
+
+    assert len(returns) == 3
+    assert len(trade_log) == 1
+    assert pd.Timestamp(trade_log[0]["decision_date"]) == pd.Timestamp("2024-01-02")
+    assert pd.Timestamp(trade_log[0]["fill_date"]) == pd.Timestamp("2024-01-03")
+    assert trade_log[0]["price"] == 11.0
+
+
+def test_execute_replay_decisions_applies_execution_cost_to_sell_proceeds():
+    import broker.brain as brain_module
+
+    portfolio = replay_module.ReplayPortfolio(initial_cash=1_000.0)
+    assert portfolio.buy("AAA", shares=10.0, price=10.0, reason="seed") is True
+
+    trade_log = []
+    decision = brain_module.Decision(
+        action="SELL",
+        ticker="AAA",
+        shares=10.0,
+        price=10.0,
+        score=0.0,
+        reason="spread test",
+    )
+
+    replay_module._execute_replay_decisions(
+        portfolio=portfolio,
+        decisions=[decision],
+        execution_spread=0.10,
+        trade_log=trade_log,
+        date=pd.Timestamp("2024-01-03"),
+    )
+
+    assert portfolio.cash == 990.0
+    assert trade_log[0]["shares"] == 10.0
+    assert trade_log[0]["price"] == 9.0
+
+
 def test_run_replay_preserves_rl_entry_metadata(monkeypatch):
     df_features = _feature_frame()
     price_lookup = _price_lookup()
@@ -112,8 +196,24 @@ def test_run_replay_preserves_rl_entry_metadata(monkeypatch):
 
     original_execute = replay_module._execute_replay_decisions
 
-    def capture_execute(portfolio, decisions, execution_spread, trade_log, date):
-        original_execute(portfolio, decisions, execution_spread, trade_log, date)
+    def capture_execute(
+        portfolio,
+        decisions,
+        execution_spread,
+        trade_log,
+        date,
+        price_lookup=None,
+        decision_date=None,
+    ):
+        original_execute(
+            portfolio,
+            decisions,
+            execution_spread,
+            trade_log,
+            date,
+            price_lookup=price_lookup,
+            decision_date=decision_date,
+        )
         if "AAA" in portfolio.positions:
             captured["rl_entry_scores"].append(
                 portfolio.positions["AAA"].get("rl_score_at_entry")
@@ -414,6 +514,10 @@ def test_run_full_replay_uses_live_config_parameters(monkeypatch):
             "min_score": 0.57,
             "stop_loss": 0.09,
             "take_profit": 0.41,
+            "trailing_stop": 0.11,
+            "trailing_activation": 0.19,
+            "signal_exit_score": 0.21,
+            "signal_exit_grace": 3,
             "partial_profit": 0.24,
             "max_position_pct": 0.18,
             "cash_floor": 0.02,
@@ -435,6 +539,10 @@ def test_run_full_replay_uses_live_config_parameters(monkeypatch):
     assert captured["strategy"] == "screener_rl"
     assert captured["checkpoint_path"] == "models/best_fold0.pt"
     assert captured["partial_profit_pct"] == 0.24
+    assert captured["trailing_stop_pct"] == 0.11
+    assert captured["trailing_activation_pct"] == 0.19
+    assert captured["signal_exit_score"] == 0.21
+    assert captured["signal_exit_grace_cycles"] == 3
     assert captured["max_position_pct"] == 0.18
     assert captured["cash_floor"] == 0.02
     assert captured["max_gross_exposure"] == 0.98
@@ -550,3 +658,109 @@ def test_run_full_replay_aligns_spy_by_replay_dates(monkeypatch):
     assert captured["spy"].tolist() == [0.11, 0.33]
     assert captured["ew"].tolist() == [0.0, 0.03]
     assert captured["label"] == "Broker Replay"
+
+
+def test_run_sensitivity_uses_rl_specific_grid(monkeypatch):
+    labels = []
+
+    monkeypatch.setattr(
+        replay_module,
+        "run_replay",
+        lambda *args, label=None, **kwargs: (
+            labels.append(label) or np.array([0.01, 0.0], dtype=float),
+            [],
+        ),
+    )
+
+    replay_module.run_sensitivity(
+        df_features=_feature_frame(),
+        price_lookup=_price_lookup(),
+        live_config={"rl_enabled": True},
+        strategy="screener_rl",
+        checkpoint_path="models/best_fold0.pt",
+    )
+
+    assert "rl_min=5%" in labels
+    assert "rl_min=10%" in labels
+    assert "rl_min=20%" in labels
+    assert "rl_phase=2" in labels
+    assert "min_score=0.55" not in labels
+    assert "min_score=0.65" not in labels
+
+
+def test_rolling_window_validation_summarizes_subperiods():
+    aligned = pd.DataFrame(
+        {
+            "portfolio": [0.02, -0.01, 0.03, 0.01, -0.02, 0.04],
+            "benchmark": [0.01, 0.00, 0.01, 0.00, -0.01, 0.02],
+            "equal_weight": [0.015, -0.005, 0.02, 0.005, -0.015, 0.03],
+        },
+        index=pd.date_range("2024-01-01", periods=6, freq="D"),
+    )
+
+    rolling_df, summary_df = replay_module._rolling_window_validation(
+        aligned,
+        windows=(3,),
+        step=2,
+    )
+
+    assert len(rolling_df) == 3
+    assert summary_df.loc[0, "window_days"] == 3
+    assert summary_df.loc[0, "n_windows"] == 3
+    assert "beat_rate_vs_spy" in summary_df.columns
+    assert "beat_rate_vs_equal_weight" in summary_df.columns
+
+
+def test_build_trade_attribution_reconstructs_fifo_closed_trades():
+    trade_log = [
+        {
+            "fill_date": "2024-01-02",
+            "action": "BUY",
+            "ticker": "AAA",
+            "shares": 10.0,
+            "price": 10.0,
+            "score": 0.9,
+            "reason": "entry one",
+        },
+        {
+            "fill_date": "2024-01-03",
+            "action": "BUY",
+            "ticker": "AAA",
+            "shares": 5.0,
+            "price": 12.0,
+            "score": 0.8,
+            "reason": "entry two",
+        },
+        {
+            "fill_date": "2024-01-04",
+            "action": "SELL_PARTIAL",
+            "ticker": "AAA",
+            "shares": 12.0,
+            "price": 15.0,
+            "score": 0.7,
+            "reason": "Trailing stop (test)",
+        },
+        {
+            "fill_date": "2024-01-05",
+            "action": "SELL",
+            "ticker": "AAA",
+            "shares": 3.0,
+            "price": 8.0,
+            "score": 0.6,
+            "reason": "Stop-loss (test)",
+        },
+    ]
+
+    attribution = replay_module._build_trade_attribution(
+        trade_log,
+        sector_map={"AAA": "Technology"},
+    )
+
+    assert len(attribution) == 3
+    assert attribution["sector"].unique().tolist() == ["Technology"]
+    assert np.isclose(float(attribution["gross_pnl"].sum()), 44.0)
+    assert attribution["exit_reason_bucket"].tolist() == [
+        "Trailing stop",
+        "Trailing stop",
+        "Stop-loss",
+    ]

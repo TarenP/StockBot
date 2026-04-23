@@ -28,6 +28,7 @@ from hypothesis import strategies as st
 from pipeline.features import FEATURE_COLS
 from pipeline.rl_inference import (
     ModelNotAvailableError,
+    _weights_to_rank_scores,
     _zscore_df,
     get_rl_targets,
 )
@@ -364,4 +365,26 @@ def test_insufficient_history_assigns_zero():
 
     assert (result == 0.0).all(), (
         f"Expected all zeros for insufficient history, got: {result}"
+    )
+
+
+def test_weights_to_rank_scores_returns_percentiles():
+    """Positive RL weights map to shortlist rank percentiles."""
+    scores = _weights_to_rank_scores(np.array([0.05, 0.20, 0.10]))
+
+    np.testing.assert_allclose(
+        scores,
+        np.array([1.0 / 3.0, 1.0, 2.0 / 3.0]),
+        atol=1e-8,
+    )
+
+
+def test_weights_to_rank_scores_keeps_zero_weight_assets_at_zero():
+    """Assets with zero model weight stay at zero so RL mode can skip them."""
+    scores = _weights_to_rank_scores(np.array([0.0, 0.20, 0.10, 0.0]))
+
+    np.testing.assert_allclose(
+        scores,
+        np.array([0.0, 1.0, 0.5, 0.0]),
+        atol=1e-8,
     )

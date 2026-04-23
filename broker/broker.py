@@ -178,14 +178,6 @@ def run_cycle(
         brain.min_score = brain._base_min_score
 
     # ── Risk engine ───────────────────────────────────────────────────────────
-    risk.start_session(portfolio.equity)
-    health_status, health_reason = risk.check_portfolio_health(portfolio)
-
-    if health_status == "halt":
-        logger.warning(f"RISK HALT: {health_reason}")
-        brain.min_score = 999.0
-    elif health_status == "warning":
-        logger.warning(f"RISK WARNING: {health_reason}")
 
     # ── Fetch latest data ─────────────────────────────────────────────────────
     logger.info("Loading market data...")
@@ -196,11 +188,22 @@ def run_cycle(
             min_price=0.01,
             min_avg_volume=5_000,
             include_raw_cols=True,
+            use_snapshot_fundamentals=True,
         )
     except Exception as e:
         logger.error(f"Failed to load data: {e}")
         brain.min_score = brain._base_min_score
         return
+    if hasattr(risk, "set_market_regime"):
+        risk.set_market_regime(brain._current_market_regime(df))
+    risk.start_session(portfolio.equity)
+    health_status, health_reason = risk.check_portfolio_health(portfolio)
+
+    if health_status == "halt":
+        logger.warning(f"RISK HALT: {health_reason}")
+        brain.min_score = 999.0
+    elif health_status == "warning":
+        logger.warning(f"RISK WARNING: {health_reason}")
 
     # ── Run decisions ─────────────────────────────────────────────────────────
     decisions = brain.run_cycle(df, screener_top_n=50, risk_engine=risk)
@@ -310,8 +313,12 @@ def parse_args(config: dict = None):
     p.add_argument("--max_positions",  type=int,   default=cfg.get("max_positions",  10))
     p.add_argument("--max_position_pct", type=float, default=cfg.get("max_position_pct", 0.10))
     p.add_argument("--stop_loss",      type=float, default=cfg.get("stop_loss",      0.08))
-    p.add_argument("--take_profit",    type=float, default=cfg.get("take_profit",    0.35))
-    p.add_argument("--partial_profit", type=float, default=cfg.get("partial_profit", 0.15))
+    p.add_argument("--take_profit",    type=float, default=cfg.get("take_profit",    1.00))
+    p.add_argument("--partial_profit", type=float, default=cfg.get("partial_profit", 0.35))
+    p.add_argument("--trailing_stop",  type=float, default=cfg.get("trailing_stop",  0.12))
+    p.add_argument("--trailing_activation", type=float, default=cfg.get("trailing_activation", 0.18))
+    p.add_argument("--signal_exit_score", type=float, default=cfg.get("signal_exit_score", 0.18))
+    p.add_argument("--signal_exit_grace", type=int, default=cfg.get("signal_exit_grace", 2))
     p.add_argument("--min_score",      type=float, default=cfg.get("min_score",      0.58))
     p.add_argument("--penny_pct",      type=float, default=cfg.get("penny_pct",      0.03))
     p.add_argument("--max_sector",     type=float, default=cfg.get("max_sector",     0.25))
@@ -376,6 +383,10 @@ def main(config: dict = None, maintenance_context: dict | None = None):
         stop_loss_pct_floor = args.stop_loss,
         partial_profit_pct  = args.partial_profit,
         full_profit_pct     = args.take_profit,
+        trailing_stop_pct   = args.trailing_stop,
+        trailing_activation_pct = args.trailing_activation,
+        signal_exit_score   = args.signal_exit_score,
+        signal_exit_grace_cycles = args.signal_exit_grace,
         min_score           = args.min_score,
         penny_max_pct       = args.penny_pct,
         max_sector_pct      = args.max_sector,

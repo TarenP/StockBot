@@ -85,6 +85,36 @@ def _fetch_current_spy_price() -> float | None:
     return None
 
 
+def _max_drawdown_from_equity(equity: pd.Series) -> float:
+    equity = pd.Series(equity, dtype=float).dropna()
+    if equity.empty:
+        return 0.0
+    peaks = equity.cummax()
+    drawdowns = (equity - peaks) / (peaks + 1e-9)
+    return float(drawdowns.min())
+
+
+def _align_equity_and_spy_returns(eq: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    frame = eq.copy()
+    frame["time"] = pd.to_datetime(frame["time"], utc=True, errors="coerce").dt.tz_convert(None)
+    frame = frame.dropna(subset=["time"]).sort_values("time")
+    frame = frame.set_index("time")
+
+    equity = frame["equity"].astype(float)
+    spy_prices = frame["spy_price"].dropna().astype(float)
+
+    portfolio_rets = equity.pct_change(fill_method=None).dropna().rename("portfolio")
+    spy_rets = spy_prices.pct_change(fill_method=None).dropna().rename("benchmark")
+
+    aligned = pd.concat([portfolio_rets, spy_rets], axis=1, join="inner").dropna()
+    if aligned.empty:
+        return np.array([], dtype=float), np.array([], dtype=float)
+    return (
+        aligned["portfolio"].to_numpy(dtype=float),
+        aligned["benchmark"].to_numpy(dtype=float),
+    )
+
+
 # ── Performance reporting ─────────────────────────────────────────────────────
 
 def print_report(portfolio, show_benchmark: bool = True):
@@ -98,10 +128,13 @@ def print_report(portfolio, show_benchmark: bool = True):
     if len(eq) < 2:
         return
 
-    initial = eq["equity"].iloc[0]
-    current = eq["equity"].iloc[-1]
-    peak    = eq["equity"].max()
-    dd      = (current - peak) / peak
+    eq["time"] = pd.to_datetime(eq["time"], utc=True, errors="coerce").dt.tz_convert(None)
+    eq = eq.dropna(subset=["time"]).sort_values("time")
+
+    initial = float(eq["equity"].iloc[0])
+    current = float(eq["equity"].iloc[-1])
+    peak    = float(eq["equity"].max())
+    dd      = _max_drawdown_from_equity(eq["equity"])
 
     print(f"  Equity curve: {len(eq)} data points")
     print(f"  Peak equity:  ${peak:,.2f}")
@@ -117,9 +150,8 @@ def print_report(portfolio, show_benchmark: bool = True):
         print("  SPY benchmark: not enough data yet (will appear after 2+ cycles)\n")
         return
 
-    portfolio_rets = eq["equity"].pct_change().dropna().values
-    spy_rets       = spy_col.pct_change().dropna().values
-    n              = min(len(portfolio_rets), len(spy_rets))
+    portfolio_rets, spy_rets = _align_equity_and_spy_returns(eq)
+    n = min(len(portfolio_rets), len(spy_rets))
 
     if n < 2:
         return

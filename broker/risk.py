@@ -2,18 +2,16 @@
 Portfolio-level risk engine.
 
 Enforces:
-  - Daily loss limit (halt new entries if down X% today)
-  - Drawdown circuit breaker (go to cash if DD from peak > threshold)
-  - Gross exposure limit (max % of equity invested)
-  - Cash floor (always keep minimum cash buffer)
-  - Volatility scaling (reduce position sizes when realized vol is elevated)
-  - Execution cost estimation (spread + market impact per trade)
-
-Called by BrokerBrain before every trade and at the start of every cycle.
+  - Daily loss limit
+  - Drawdown circuit breaker
+  - Gross exposure limit
+  - Cash floor
+  - Volatility scaling
+  - Execution cost estimation
 """
 
 import logging
-from datetime import datetime, date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -28,34 +26,37 @@ EQUITY_PATH = Path("broker/state/equity_curve.csv")
 class PortfolioRiskEngine:
     def __init__(
         self,
-        max_daily_loss:      float = 0.03,   # halt new entries if down 3% today
-        max_drawdown:        float = 0.15,   # go to cash if DD from peak > 15%
-        max_gross_exposure:  float = 0.95,   # max 95% of equity in positions
-        cash_floor:          float = 0.05,   # always keep 5% cash
-        target_volatility:   float = 0.15,   # annualised vol target for scaling
-        vol_lookback:        int   = 20,     # days for realized vol calculation
-        equity_curve_path:   Path | str | None = EQUITY_PATH,
+        max_daily_loss: float = 0.03,
+        max_drawdown: float = 0.15,
+        max_gross_exposure: float = 0.95,
+        cash_floor: float = 0.05,
+        target_volatility: float = 0.15,
+        vol_lookback: int = 20,
+        equity_curve_path: Path | str | None = EQUITY_PATH,
         equity_history_getter: Callable[[], Sequence[float]] | None = None,
     ):
-        self.max_daily_loss     = max_daily_loss
-        self.max_drawdown       = max_drawdown
+        self.max_daily_loss = max_daily_loss
+        self.max_drawdown = max_drawdown
         self.max_gross_exposure = max_gross_exposure
-        self.cash_floor         = cash_floor
-        self.target_volatility  = target_volatility
-        self.vol_lookback       = vol_lookback
+        self.cash_floor = cash_floor
+        self.target_volatility = target_volatility
+        self.vol_lookback = vol_lookback
         self.equity_curve_path = (
             Path(equity_curve_path) if equity_curve_path is not None else None
         )
         self.equity_history_getter = equity_history_getter
 
         self._session_start_equity: float | None = None
-        self._peak_equity:          float | None = None
+        self._peak_equity: float | None = None
+        self._session_key = None
+        self._market_regime: int | None = None
 
-    # ── Session tracking ──────────────────────────────────────────────────────
-
-    def start_session(self, equity: float):
+    def start_session(self, equity: float, session_key=None):
         """Call at the start of each trading cycle."""
-        if self._session_start_equity is None:
+        if session_key is not None and session_key != self._session_key:
+            self._session_start_equity = equity
+            self._session_key = session_key
+        elif self._session_start_equity is None:
             self._session_start_equity = equity
         if self._peak_equity is None or equity > self._peak_equity:
             self._peak_equity = equity
@@ -64,17 +65,28 @@ class PortfolioRiskEngine:
         if self._peak_equity is None or equity > self._peak_equity:
             self._peak_equity = equity
 
-    # ── Portfolio health check ────────────────────────────────────────────────
+    def set_market_regime(self, market_regime: int | None):
+        if market_regime in {0, 1, 2, 3}:
+            self._market_regime = int(market_regime)
+        else:
+            self._market_regime = None
+
+    def _effective_cash_floor(self) -> float:
+        return float(np.clip(float(self.cash_floor), 0.0, 0.15))
+
+    def _effective_max_gross_exposure(self) -> float:
+        return float(np.clip(float(self.max_gross_exposure), 0.75, 1.0))
+
+    def _effective_target_volatility(self) -> float:
+        return float(np.clip(float(self.target_volatility), 0.05, 0.40))
 
     def check_portfolio_health(self, portfolio) -> tuple[str, str]:
         """
-        Returns (status, reason) where status is 'ok', 'warning', or 'halt'.
-        'halt' means: do not open any new positions this cycle.
+        Returns (status, reason) where status is "ok", "warning", or "halt".
         """
         equity = portfolio.equity
         self.update_peak(equity)
 
-        # ── Daily loss check ──────────────────────────────────────────────────
         if self._session_start_equity and self._session_start_equity > 0:
             daily_loss = (equity - self._session_start_equity) / self._session_start_equity
             if daily_loss <= -self.max_daily_loss:
@@ -83,7 +95,6 @@ class PortfolioRiskEngine:
                     f"(limit: -{self.max_daily_loss:.0%}). No new entries."
                 )
 
-        # ── Drawdown circuit breaker ──────────────────────────────────────────
         if self._peak_equity and self._peak_equity > 0:
             drawdown = (equity - self._peak_equity) / self._peak_equity
             if drawdown <= -self.max_drawdown:
@@ -94,66 +105,63 @@ class PortfolioRiskEngine:
             if drawdown <= -self.max_drawdown * 0.7:
                 return "warning", f"Approaching drawdown limit: {drawdown:.1%} from peak"
 
-        # ── Gross exposure check ──────────────────────────────────────────────
         position_value = sum(
             p["shares"] * p["last_price"] for p in portfolio.positions.values()
         )
         gross_exposure = position_value / (equity + 1e-9)
-        if gross_exposure >= self.max_gross_exposure:
-            return "warning", f"Gross exposure at {gross_exposure:.0%} — near limit"
+        effective_gross = self._effective_max_gross_exposure()
+        if gross_exposure >= effective_gross:
+            return "warning", f"Gross exposure at {gross_exposure:.0%} - near limit"
 
-        # ── Cash floor check ──────────────────────────────────────────────────
         cash_pct = portfolio.cash / (equity + 1e-9)
-        if cash_pct < self.cash_floor:
-            return "warning", f"Cash below floor: {cash_pct:.1%} (floor: {self.cash_floor:.0%})"
+        effective_cash_floor = self._effective_cash_floor()
+        if cash_pct < effective_cash_floor:
+            return "warning", (
+                f"Cash below floor: {cash_pct:.1%} "
+                f"(floor: {effective_cash_floor:.0%})"
+            )
 
         return "ok", ""
 
-    # ── Pre-trade check ───────────────────────────────────────────────────────
-
     def check_pre_trade(self, alloc_value: float, portfolio) -> tuple[bool, str]:
-        """
-        Returns (allowed, reason). Called before every BUY decision.
-        """
+        """Returns (allowed, reason). Called before every BUY."""
         equity = portfolio.equity
+        effective_cash_floor = self._effective_cash_floor()
+        effective_gross = self._effective_max_gross_exposure()
 
-        # Cash floor: never let cash drop below floor after this trade
         cash_after = portfolio.cash - alloc_value
-        if cash_after < equity * self.cash_floor:
-            max_spend = portfolio.cash - equity * self.cash_floor
+        if cash_after < equity * effective_cash_floor:
+            max_spend = portfolio.cash - equity * effective_cash_floor
             if max_spend < alloc_value * 0.5:
-                return False, f"Would breach cash floor ({self.cash_floor:.0%})"
-            # Allow but cap the allocation
-            return True, f"Capped to preserve cash floor"
+                return False, f"Would breach cash floor ({effective_cash_floor:.0%})"
+            return True, "Capped to preserve cash floor"
 
-        # Gross exposure: don't exceed limit
         position_value = sum(
             p["shares"] * p["last_price"] for p in portfolio.positions.values()
         )
         new_exposure = (position_value + alloc_value) / (equity + 1e-9)
-        if new_exposure > self.max_gross_exposure:
-            return False, f"Would exceed gross exposure limit ({self.max_gross_exposure:.0%})"
+        if new_exposure > effective_gross:
+            return False, f"Would exceed gross exposure limit ({effective_gross:.0%})"
 
         return True, ""
 
-    # ── Volatility scaling ────────────────────────────────────────────────────
-
     def vol_scale_allocation(self, alloc_value: float) -> float:
-        """
-        Scale position size down when recent portfolio volatility is elevated.
-        Uses equity curve to estimate realized vol.
-        """
+        """Scale position size down when recent portfolio volatility is elevated."""
         realized_vol = self._get_realized_vol()
         if realized_vol <= 0:
             return alloc_value
 
-        scalar = min(1.0, self.target_volatility / realized_vol)
+        scalar = min(1.0, self._effective_target_volatility() / realized_vol)
         if scalar < 0.9:
-            logger.debug(f"  Vol scaling: {scalar:.2f}x (realized vol={realized_vol:.1%})")
+            logger.debug(
+                "  Vol scaling: %.2fx (realized vol=%.1f%%)",
+                scalar,
+                realized_vol * 100,
+            )
         return alloc_value * scalar
 
     def _get_realized_vol(self) -> float:
-        """Compute annualised realized vol from equity curve."""
+        """Compute annualized realized vol from equity history."""
         try:
             if self.equity_history_getter is not None:
                 history = np.asarray(list(self.equity_history_getter()), dtype=float)
@@ -173,43 +181,34 @@ class PortfolioRiskEngine:
         except Exception:
             return 0.0
 
-    # ── Execution cost estimation ─────────────────────────────────────────────
-
     @staticmethod
     def estimate_execution_cost(
         price: float,
         shares: float,
         avg_daily_volume: float = 1_000_000,
     ) -> float:
-        """
-        Estimate total execution cost as a fraction of trade value.
-        Includes bid-ask spread and market impact.
-        """
-        # Spread estimate by price tier
+        """Estimate total execution cost as a fraction of trade value."""
         if price < 1.0:
-            spread_pct = 0.05    # 5% for sub-$1 stocks
+            spread_pct = 0.05
         elif price < 5.0:
-            spread_pct = 0.02    # 2% for penny stocks
+            spread_pct = 0.02
         elif price < 20.0:
-            spread_pct = 0.005   # 0.5% for low-price stocks
+            spread_pct = 0.005
         else:
-            spread_pct = 0.001   # 0.1% for liquid stocks
+            spread_pct = 0.001
 
-        # Market impact: square-root model
-        trade_value       = shares * price
-        participation     = trade_value / (avg_daily_volume * price + 1e-9)
-        impact_pct        = 0.1 * np.sqrt(participation)
+        trade_value = shares * price
+        participation = trade_value / (avg_daily_volume * price + 1e-9)
+        impact_pct = 0.1 * np.sqrt(participation)
 
         return spread_pct + impact_pct
 
     @staticmethod
     def apply_execution_cost(alloc_value: float, price: float, is_penny: bool) -> float:
-        """Return alloc_value reduced by estimated execution cost."""
+        """Return allocation reduced by an estimated spread."""
         spread = 0.02 if is_penny else (0.005 if price < 20 else 0.001)
         return alloc_value * (1.0 - spread)
 
-
-# ── Startup validation ────────────────────────────────────────────────────────
 
 def validate_startup(
     portfolio,
@@ -220,54 +219,50 @@ def validate_startup(
 ) -> list[str]:
     """
     Run pre-flight checks before the broker starts trading.
-    Returns list of error strings. Empty list = all clear.
+    Returns a list of blocking errors.
     """
-    errors   = []
+    errors = []
     warnings = []
-    today    = datetime.today().date()
+    today = datetime.today().date()
 
-    # ── Price data freshness ──────────────────────────────────────────────────
     try:
-        import pandas as pd
-        df        = pd.read_parquet(parquet_path)
+        df = pd.read_parquet(parquet_path)
         last_date = pd.to_datetime(df.index).max().date()
-        stale     = (today - last_date).days
+        stale = (today - last_date).days
         if stale > max_price_staleness_days:
             errors.append(
                 f"PRICE DATA STALE: last date is {last_date} ({stale} days ago). "
-                f"Run: python Agent.py --mode update"
+                "Run: python Agent.py --mode update"
             )
         else:
-            logger.info(f"  Price data: current (last: {last_date})")
-    except Exception as e:
-        errors.append(f"PRICE DATA UNREADABLE: {e}")
+            logger.info("  Price data: current (last: %s)", last_date)
+    except Exception as exc:
+        errors.append(f"PRICE DATA UNREADABLE: {exc}")
 
-    # ── Sentiment data freshness ──────────────────────────────────────────────
     try:
-        sent      = pd.read_csv(sentiment_path, usecols=["date"])
-        # Handle mixed date formats (old: tz-aware strings, new: plain dates)
-        parsed    = pd.to_datetime(sent["date"], utc=False, errors="coerce")
-        # Strip timezone from tz-aware entries
-        parsed    = parsed.apply(lambda x: x.tz_localize(None) if x is not pd.NaT and x.tzinfo else x)
+        sent = pd.read_csv(sentiment_path, usecols=["date"])
+        parsed = pd.to_datetime(sent["date"], utc=False, errors="coerce")
+        parsed = parsed.apply(
+            lambda x: x.tz_localize(None) if x is not pd.NaT and x.tzinfo else x
+        )
         last_sent = parsed.max()
         if pd.isna(last_sent):
             warnings.append("SENTIMENT DATE UNREADABLE")
         else:
             last_sent = last_sent.date()
-            stale     = (today - last_sent).days
+            stale = (today - last_sent).days
             if stale > max_sentiment_staleness_days:
                 warnings.append(
                     f"SENTIMENT DATA STALE: last date is {last_sent} ({stale} days ago). "
-                    f"Run: python Agent.py --mode update"
+                    "Run: python Agent.py --mode update"
                 )
             else:
-                logger.info(f"  Sentiment data: current (last: {last_sent})")
-    except Exception as e:
-        warnings.append(f"SENTIMENT DATA UNREADABLE: {e}")
+                logger.info("  Sentiment data: current (last: %s)", last_sent)
+    except Exception as exc:
+        warnings.append(f"SENTIMENT DATA UNREADABLE: {exc}")
 
-    # ── Portfolio state consistency ───────────────────────────────────────────
     if portfolio.cash < 0:
-        errors.append(f"NEGATIVE CASH: ${portfolio.cash:.2f} — portfolio state is corrupt")
+        errors.append(f"NEGATIVE CASH: ${portfolio.cash:.2f} - portfolio state is corrupt")
 
     total_pos_value = sum(
         p["shares"] * p["last_price"] for p in portfolio.positions.values()
@@ -275,7 +270,7 @@ def validate_startup(
     if total_pos_value > portfolio.equity * 1.05:
         errors.append(
             f"POSITION VALUE (${total_pos_value:,.0f}) EXCEEDS EQUITY "
-            f"(${portfolio.equity:,.0f}) — accounting error"
+            f"(${portfolio.equity:,.0f}) - accounting error"
         )
 
     for ticker, pos in portfolio.positions.items():
@@ -284,22 +279,20 @@ def validate_startup(
         if pos.get("last_price", 0) <= 0:
             warnings.append(f"ZERO/NEGATIVE PRICE for {ticker}: {pos.get('last_price')}")
 
-    # ── Options state consistency ─────────────────────────────────────────────
     reserved = portfolio.options.total_reserved_cash
     if reserved > portfolio.cash + 1.0:
         errors.append(
             f"OPTIONS CASH RESERVATION (${reserved:,.0f}) EXCEEDS CASH "
-            f"(${portfolio.cash:,.0f}) — accounting error"
+            f"(${portfolio.cash:,.0f}) - accounting error"
         )
 
-    # ── Log results ───────────────────────────────────────────────────────────
-    for w in warnings:
-        logger.warning(f"  STARTUP WARNING: {w}")
+    for warning in warnings:
+        logger.warning("  STARTUP WARNING: %s", warning)
 
     if errors:
-        for e in errors:
-            logger.error(f"  STARTUP ERROR: {e}")
+        for error in errors:
+            logger.error("  STARTUP ERROR: %s", error)
     else:
         logger.info("  Startup validation passed.")
 
-    return errors   # warnings don't block startup, errors do
+    return errors

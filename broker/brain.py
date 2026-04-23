@@ -99,6 +99,12 @@ class BrokerBrain:
         stop_loss_pct_ceil:   float = 0.25,   # maximum stop regardless of ATR
         partial_profit_pct:   float = 0.20,   # sell half at +20%
         full_profit_pct:      float = 0.45,   # sell rest at +45%
+        trailing_stop_pct:    float = 0.12,   # trail winners instead of capping them early
+        trailing_activation_pct: float = 0.18,  # activate trailing once a cushion exists
+        signal_exit_score:    float = 0.18,   # only very weak signals can trigger heuristic exits
+        signal_exit_grace_cycles: int = 2,    # repeated weakness required before bailing
+        signal_exit_min_hold_days: int = 5,   # avoid churning fresh entries
+        signal_exit_winner_buffer_pct: float = 0.10,  # let winners run in healthy regimes
         min_score:            float = 0.60,
         penny_max_pct:        float = 0.20,
         penny_threshold:      float = 5.0,
@@ -112,7 +118,7 @@ class BrokerBrain:
         rl_phase:             int   = 1,
         rl_exit_threshold:    float = 0.30,
         rl_conviction_drop:   float = 0.20,
-        rl_min_score:         float = 0.0,   # separate threshold for RL scores (0 = top-k only)
+        rl_min_score:         float = 0.0,   # separate threshold for RL rank percentiles (0 = top-k only)
     ):
         self.portfolio            = portfolio
         self.max_positions        = max_positions
@@ -122,6 +128,12 @@ class BrokerBrain:
         self.stop_loss_pct_ceil   = stop_loss_pct_ceil
         self.partial_profit_pct   = partial_profit_pct
         self.full_profit_pct      = full_profit_pct
+        self.trailing_stop_pct    = trailing_stop_pct
+        self.trailing_activation_pct = trailing_activation_pct
+        self.signal_exit_score    = signal_exit_score
+        self.signal_exit_grace_cycles = signal_exit_grace_cycles
+        self.signal_exit_min_hold_days = signal_exit_min_hold_days
+        self.signal_exit_winner_buffer_pct = signal_exit_winner_buffer_pct
         self.min_score            = min_score
         self.penny_max_pct        = penny_max_pct
         self.penny_threshold      = penny_threshold
@@ -143,6 +155,159 @@ class BrokerBrain:
         # Ensure _base_min_score is always set (broker.py also sets this after init)
         self._base_min_score: float = min_score
 
+    def _current_market_regime(self, df_features: pd.DataFrame) -> int | None:
+        regime_cols = [f"regime_{i}" for i in range(4) if f"regime_{i}" in df_features.columns]
+        if not regime_cols or df_features.empty:
+            return None
+
+        try:
+            latest_date = df_features.index.get_level_values("date").max()
+            snap = df_features.xs(latest_date, level="date")
+            regime_means = snap[regime_cols].mean(axis=0)
+        except Exception:
+            return None
+
+        if regime_means.empty:
+            return None
+
+        best_col = str(regime_means.astype(float).idxmax())
+        try:
+            return int(best_col.rsplit("_", 1)[-1])
+        except Exception:
+            return None
+
+    def _effective_trailing_stop_pct(self, market_regime: int | None) -> float:
+        trail = float(self.trailing_stop_pct)
+        if market_regime == 2:
+            trail *= 0.85
+        elif market_regime == 3:
+            trail *= 0.70
+        return float(np.clip(trail, 0.05, 0.25))
+
+    def _signal_exit_profile(self, market_regime: int | None) -> tuple[float, int]:
+        threshold = float(self.signal_exit_score)
+        streak = int(max(self.signal_exit_grace_cycles, 1))
+
+        if market_regime == 0:
+            threshold = max(0.0, threshold - 0.08)
+            streak += 2
+        elif market_regime == 1:
+            threshold = max(0.0, threshold - 0.05)
+            streak += 1
+        elif market_regime == 3:
+            threshold = min(1.0, threshold + 0.08)
+            streak = max(1, streak - 1)
+
+        return float(threshold), int(streak)
+
+    def _effective_rl_entry_floor(self, market_regime: int | None) -> float:
+        _ = market_regime
+        return float(np.clip(float(self.rl_min_score), 0.0, 0.95))
+
+    @staticmethod
+    def _conviction_from_score(
+        score: float,
+        score_floor: float,
+        market_regime: int | None,
+    ) -> float:
+        conviction = np.clip(
+            (float(score) - float(score_floor)) / max(1.0 - float(score_floor), 1e-6),
+            0.0,
+            1.0,
+        )
+        if market_regime == 0:
+            conviction = conviction ** 0.80
+        elif market_regime == 1:
+            conviction = conviction ** 0.90
+        elif market_regime == 3:
+            conviction = conviction ** 1.20
+        return float(np.clip(conviction, 0.0, 1.0))
+
+    def _effective_max_position_pct(
+        self,
+        market_regime: int | None,
+        conviction: float,
+    ) -> float:
+        cap = float(self.max_position_pct)
+        if market_regime == 0:
+            cap *= 1.15
+        elif market_regime == 1:
+            cap *= 1.08
+        elif market_regime == 3:
+            cap *= 0.85
+        cap *= 1.0 + 0.12 * max(float(conviction) - 0.5, 0.0)
+        return float(np.clip(cap, 0.05, 0.25))
+
+    def _effective_sector_cap(
+        self,
+        market_regime: int | None,
+        conviction: float,
+    ) -> float:
+        cap = float(self.max_sector_pct)
+        if market_regime == 0:
+            cap *= 1.25
+        elif market_regime == 1:
+            cap *= 1.12
+        elif market_regime == 3:
+            cap *= 0.80
+        cap *= 1.0 + 0.10 * max(float(conviction) - 0.4, 0.0)
+        return float(np.clip(cap, 0.15, 0.55))
+
+    def _sector_overflow_scale(
+        self,
+        market_regime: int | None,
+        conviction: float,
+    ) -> float:
+        if market_regime == 0:
+            base = 0.75
+        elif market_regime == 1:
+            base = 0.50
+        elif market_regime == 2:
+            base = 0.20
+        else:
+            base = 0.0
+        return float(np.clip(base * float(conviction), 0.0, 1.0))
+
+    def _effective_max_pair_correlation(
+        self,
+        market_regime: int | None,
+        conviction: float,
+    ) -> float:
+        limit = float(self.max_pair_correlation)
+        if market_regime == 0:
+            limit += 0.08 * float(conviction)
+        elif market_regime == 1:
+            limit += 0.05 * float(conviction)
+        elif market_regime == 3:
+            limit -= 0.10
+        return float(np.clip(limit, 0.55, 1.0))
+
+    def _should_exit_on_signal(
+        self,
+        pos: dict,
+        composite_score: float,
+        pnl_pct: float,
+        market_regime: int | None,
+    ) -> bool:
+        threshold, required_streak = self._signal_exit_profile(market_regime)
+        weak_signal_streak = int(pos.get("weak_signal_streak", 0))
+        days_held = int(pos.get("days_held", 0))
+
+        if composite_score >= threshold:
+            return False
+        if days_held < self.signal_exit_min_hold_days:
+            return False
+        if weak_signal_streak < required_streak:
+            return False
+
+        winner_buffer = float(self.signal_exit_winner_buffer_pct)
+        if pnl_pct >= winner_buffer and market_regime in (None, 0, 1):
+            return False
+        if pnl_pct >= (winner_buffer * 1.5) and market_regime == 2:
+            return False
+
+        return True
+
     # ── Main decision cycle ───────────────────────────────────────────────────
 
     def run_cycle(
@@ -152,6 +317,9 @@ class BrokerBrain:
         risk_engine=None,   # PortfolioRiskEngine instance
     ) -> list[Decision]:
         decisions = []
+        market_regime = self._current_market_regime(df_features)
+        if risk_engine is not None and hasattr(risk_engine, "set_market_regime"):
+            risk_engine.set_market_regime(market_regime)
 
         # ── RL pre-flight check ───────────────────────────────────────────────
         if self.rl_enabled:
@@ -199,6 +367,14 @@ class BrokerBrain:
             if cost <= 0:
                 continue
 
+            days_held = int(pos.get("days_held", 0))
+            pos["days_held"] = days_held + 1
+            pos["peak_price"] = max(
+                float(pos.get("peak_price", cost)),
+                float(cost),
+                float(price),
+            )
+
             pnl_pct = (price - cost) / cost
 
             # Compute volatility-adjusted stop for this position
@@ -210,6 +386,25 @@ class BrokerBrain:
                     action="SELL", ticker=ticker,
                     shares=pos["shares"], price=price, score=0.0,
                     reason=f"Stop-loss ({pnl_pct:.1%} vs -{stop_pct:.1%} ATR-adjusted)",
+                ))
+                continue
+
+            peak_price = float(pos.get("peak_price", price))
+            peak_pnl_pct = (peak_price - cost) / cost if cost > 0 else 0.0
+            drawdown_from_peak = (price - peak_price) / peak_price if peak_price > 0 else 0.0
+            trail_pct = self._effective_trailing_stop_pct(market_regime)
+            if (
+                self.trailing_stop_pct > 0
+                and peak_pnl_pct >= self.trailing_activation_pct
+                and drawdown_from_peak <= -trail_pct
+            ):
+                decisions.append(Decision(
+                    action="SELL", ticker=ticker,
+                    shares=pos["shares"], price=price, score=0.9,
+                    reason=(
+                        f"Trailing stop ({drawdown_from_peak:.1%} from peak after "
+                        f"{peak_pnl_pct:.1%} max gain)"
+                    ),
                 ))
                 continue
 
@@ -237,20 +432,31 @@ class BrokerBrain:
             report, used_local_research = self._research_with_fallback(ticker, df_features)
             if used_local_research:
                 local_research_fallbacks += 1
-            if report and report["composite_score"] < 0.35:
-                decisions.append(Decision(
-                    action="SELL", ticker=ticker,
-                    shares=pos["shares"], price=price,
-                    score=report["composite_score"],
-                    reason=f"Signal deteriorated (score={report['composite_score']:.2f})",
-                ))
-                continue
+            if report:
+                composite_score = float(report.get("composite_score", 0.0))
+                threshold, required_streak = self._signal_exit_profile(market_regime)
+                if composite_score < threshold:
+                    pos["weak_signal_streak"] = int(pos.get("weak_signal_streak", 0)) + 1
+                else:
+                    pos["weak_signal_streak"] = 0
+
+                if self._should_exit_on_signal(pos, composite_score, pnl_pct, market_regime):
+                    decisions.append(Decision(
+                        action="SELL", ticker=ticker,
+                        shares=pos["shares"], price=price,
+                        score=composite_score,
+                        reason=(
+                            f"Signal deteriorated (score={composite_score:.2f}, "
+                            f"streak={pos['weak_signal_streak']}/{required_streak})"
+                        ),
+                    ))
+                    continue
+            else:
+                pos["weak_signal_streak"] = 0
 
             # Delisted / halted ticker check — only for positions held 5+ days
             # with no price movement. Avoids false positives on newly opened positions
             # where last_price == avg_cost by definition.
-            days_held = pos.get("days_held", 0)
-            pos["days_held"] = days_held + 1
             if price > 0 and price == pos.get("avg_cost", 0) and days_held >= 5:
                 # If last_price equals avg_cost and we've never had a price update,
                 # the ticker may be halted. Check if yfinance returns data.
@@ -372,9 +578,16 @@ class BrokerBrain:
                         ticker, rl_score_val, composite, delta,
                     )
 
-                # Apply min_score threshold
+                # Apply RL percentile threshold. A zero RL score means the model
+                # gave no usable conviction for this candidate, so skip it even
+                # when rl_min_score is zero.
                 if self.rl_enabled:
-                    if rl_score_val is None or rl_score_val < self.rl_min_score:
+                    rl_entry_floor = self._effective_rl_entry_floor(market_regime)
+                    if (
+                        rl_score_val is None
+                        or rl_score_val <= 0.0
+                        or rl_score_val < rl_entry_floor
+                    ):
                         threshold_skips += 1
                         continue
                 else:
@@ -389,7 +602,10 @@ class BrokerBrain:
 
             # Sort by rl_score (RL mode) or composite_score (heuristic mode)
             if self.rl_enabled:
-                researched.sort(key=lambda r: r.get("rl_score", 0.0), reverse=True)
+                researched.sort(
+                    key=lambda r: (r.get("rl_score", 0.0), r["composite_score"]),
+                    reverse=True,
+                )
             else:
                 researched.sort(key=lambda r: r["composite_score"], reverse=True)
 
@@ -469,6 +685,12 @@ class BrokerBrain:
 
                 # Conviction score: use rl_score when RL enabled, else composite
                 score = rl_score_val if (self.rl_enabled and rl_score_val is not None) else composite
+                score_floor = (
+                    self._effective_rl_entry_floor(market_regime)
+                    if (self.rl_enabled and rl_score_val is not None)
+                    else self.min_score
+                )
+                conviction = self._conviction_from_score(score, score_floor, market_regime)
 
                 # ── Penny cap ─────────────────────────────────────────────────
                 if is_penny:
@@ -484,7 +706,13 @@ class BrokerBrain:
                     v for t, v in self.portfolio.position_values.items()
                     if self._sector_map.get(t.upper(), "Unknown") == sector
                 ) + sector_spent.get(sector, 0.0)
-                sector_budget = equity * target_alloc - current_sector_val
+                soft_sector_budget = equity * target_alloc - current_sector_val
+                effective_sector_cap = self._effective_sector_cap(market_regime, conviction)
+                hard_sector_budget = equity * effective_sector_cap - current_sector_val
+                sector_budget = max(soft_sector_budget, 0.0)
+                overflow_scale = self._sector_overflow_scale(market_regime, conviction)
+                if hard_sector_budget > sector_budget and overflow_scale > 0:
+                    sector_budget += (hard_sector_budget - sector_budget) * overflow_scale
 
                 if sector_budget <= equity * 0.01:
                     logger.debug(
@@ -499,25 +727,28 @@ class BrokerBrain:
                     ticker,
                     held_tickers_now,
                 )
+                corr_limit = self._effective_max_pair_correlation(market_regime, conviction)
                 if (
                     corr_stats is not None
-                    and corr_stats["max_abs_corr"] > self.max_pair_correlation
+                    and corr_stats["max_abs_corr"] > corr_limit
                 ):
                     logger.debug(
                         "Correlation cap blocked %s (max_abs_corr=%.2f > %.2f)",
                         ticker,
                         corr_stats["max_abs_corr"],
-                        self.max_pair_correlation,
+                        corr_limit,
                     )
                     correlation_blocked_skips += 1
                     continue
 
                 # ── Position sizing ───────────────────────────────────────────
                 # Base size from conviction
-                score_floor = self.rl_min_score if (self.rl_enabled and rl_score_val is not None) else self.min_score
-                conviction  = (score - score_floor) / max(1.0 - score_floor, 1e-6)
-                alloc_pct   = self.max_position_pct * conviction
-                alloc_pct   = np.clip(alloc_pct, 0.01, self.max_position_pct)
+                effective_max_position_pct = self._effective_max_position_pct(
+                    market_regime,
+                    conviction,
+                )
+                alloc_pct   = effective_max_position_pct * conviction
+                alloc_pct   = np.clip(alloc_pct, 0.01, effective_max_position_pct)
                 alloc_value = equity * alloc_pct
 
                 # Volatility scaling
@@ -530,7 +761,7 @@ class BrokerBrain:
                 if corr_stats is not None:
                     diversification_scale = np.clip(
                         1.0 - 0.35 * corr_stats["mean_abs_corr"],
-                        0.60,
+                        0.70 if market_regime == 0 else (0.65 if market_regime == 1 else 0.60),
                         1.0,
                     )
                     alloc_value *= diversification_scale
@@ -550,7 +781,12 @@ class BrokerBrain:
                         risk_blocked_skips += 1
                         continue
                     if "Capped to preserve cash floor" in reason:
-                        max_spend = self.portfolio.cash - equity * risk_engine.cash_floor
+                        effective_cash_floor = (
+                            risk_engine._effective_cash_floor()
+                            if hasattr(risk_engine, "_effective_cash_floor")
+                            else risk_engine.cash_floor
+                        )
+                        max_spend = self.portfolio.cash - equity * effective_cash_floor
                         alloc_value = min(alloc_value, max(0.0, max_spend))
 
                 shares = alloc_value / price if price > 0 else 0
@@ -768,10 +1004,9 @@ class BrokerBrain:
         Phase 2: Compare each held ticker's current RL rank against the rank
         recorded at entry.
 
-        RL scores from mode="rank" are relative — they sum to 1 across the
-        shortlist and shrink as the shortlist grows. Comparing them to a fixed
-        absolute threshold produces exits that depend on shortlist size, not
-        conviction. Instead we use rank percentile within the current shortlist:
+        RL scores from mode="rank" are shortlist-relative rank scores. We still
+        re-rank them here so Phase 2 exits use stable percentiles even for older
+        positions or future score-calibration changes:
 
           - SELL if current rank percentile < rl_exit_threshold
             (e.g. 0.20 means "bottom 20% of today's shortlist")

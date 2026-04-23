@@ -38,14 +38,27 @@ def _select_universe_from_raw(
     min_coverage: float = 0.7,
     min_price: float = 2.0,
     min_avg_volume: float = 500_000,
+    as_of_date: pd.Timestamp | None = None,
 ) -> list[str]:
     """
     Pick the top_n liquid tickers directly from raw price data (before feature
     engineering) so we only build features for the tickers we actually need.
     """
-    dates  = df_prices.index.get_level_values("date").unique()
-    cutoff = dates.max() - pd.DateOffset(years=lookback_years)
-    recent = df_prices[df_prices.index.get_level_values("date") >= cutoff]
+    dates = df_prices.index.get_level_values("date").unique().sort_values()
+    if len(dates) == 0:
+        return []
+
+    anchor = pd.Timestamp(dates.max())
+    if as_of_date is not None:
+        anchor = min(anchor, pd.Timestamp(as_of_date))
+    cutoff = anchor - pd.DateOffset(years=lookback_years)
+    recent = df_prices[
+        (df_prices.index.get_level_values("date") >= cutoff)
+        & (df_prices.index.get_level_values("date") <= anchor)
+    ]
+
+    if recent.empty:
+        return []
 
     n_dates = recent.index.get_level_values("date").nunique()
     counts  = recent.groupby(level="ticker").size()
@@ -114,6 +127,8 @@ def load_master(
     top_n: int = 500,                    # used to auto-select universe if not provided
     include_raw_cols: bool = False,
     sentiment_lag_sessions: int = SENTIMENT_LAG_SESSIONS,
+    use_snapshot_fundamentals: bool = False,
+    universe_as_of_date: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     """
     Load, merge, filter, and feature-engineer the master dataset.
@@ -164,6 +179,7 @@ def load_master(
             universe = _select_universe_from_raw(
                 df_prices, top_n=top_n,
                 min_price=min_price, min_avg_volume=min_avg_volume,
+                as_of_date=universe_as_of_date,
             )
         df_prices = df_prices[df_prices.index.get_level_values("ticker").isin(universe)]
         tqdm.write(f"  Universe: {len(universe)} tickers "
@@ -198,7 +214,10 @@ def load_master(
 
         # ── 5. Feature engineering (only on universe tickers) ────────────────
         pbar.set_description("Building features")
-        df_features = build_features(df_prices)
+        df_features = build_features(
+            df_prices,
+            use_snapshot_fundamentals=use_snapshot_fundamentals,
+        )
         if include_raw_cols:
             raw_cols = df_prices[["close", "volume"]].copy()
             df_features = df_features.join(raw_cols, how="left")
@@ -255,11 +274,24 @@ def get_asset_universe(
     min_coverage: float = 0.7,
     min_price: float = 2.0,
     min_avg_volume: float = 500_000,
+    as_of_date: pd.Timestamp | None = None,
 ) -> list[str]:
     """Select top_n liquid tickers from an already-loaded feature DataFrame."""
-    dates  = sorted(df.index.get_level_values("date").unique())
-    cutoff = pd.Timestamp(dates[-1]) - pd.DateOffset(years=lookback_years)
-    recent = df[df.index.get_level_values("date") >= cutoff]
+    dates = sorted(df.index.get_level_values("date").unique())
+    if not dates:
+        return []
+
+    anchor = pd.Timestamp(dates[-1])
+    if as_of_date is not None:
+        anchor = min(anchor, pd.Timestamp(as_of_date))
+    cutoff = anchor - pd.DateOffset(years=lookback_years)
+    recent = df[
+        (df.index.get_level_values("date") >= cutoff)
+        & (df.index.get_level_values("date") <= anchor)
+    ]
+
+    if recent.empty:
+        return []
 
     n_dates = recent.index.get_level_values("date").nunique()
     counts  = recent.groupby(level="ticker").size()

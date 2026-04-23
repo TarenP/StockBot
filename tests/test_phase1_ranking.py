@@ -246,6 +246,40 @@ class TestPhase1RLRanking(unittest.TestCase):
         self.assertIn("composite_score=", reason)
         self.assertIn("rl_mode=true", reason)
 
+    def test_rl_enabled_skips_zero_rank_scores_even_with_zero_floor(self):
+        """Zero RL score means unranked/no-conviction and should not generate a BUY."""
+        tickers = ["PASS_RL", "ZERO_RL"]
+        df = _make_df_features(tickers)
+        brain = _make_brain(rl_enabled=True, min_score=0.0, rl_min_score=0.0)
+        composite_scores = {"PASS_RL": 0.40, "ZERO_RL": 0.95}
+        rl_scores = pd.Series({"PASS_RL": 0.75, "ZERO_RL": 0.0}, name="rl_score")
+
+        with patch.object(brain, "_assert_model_available"):
+            decisions = self._run_cycle_patched(
+                brain, df, tickers, composite_scores, rl_scores
+            )
+
+        buy_tickers = [d.ticker for d in decisions if d.action == "BUY"]
+        self.assertIn("PASS_RL", buy_tickers)
+        self.assertNotIn("ZERO_RL", buy_tickers)
+
+    def test_rl_enabled_breaks_score_ties_with_composite(self):
+        """Equal RL scores should defer to the stronger composite signal."""
+        tickers = ["AAA", "BBB"]
+        df = _make_df_features(tickers)
+        brain = _make_brain(rl_enabled=True, min_score=0.0, rl_min_score=0.0)
+        composite_scores = {"AAA": 0.70, "BBB": 0.85}
+        rl_scores = pd.Series({"AAA": 0.80, "BBB": 0.80}, name="rl_score")
+
+        with patch.object(brain, "_assert_model_available"):
+            decisions = self._run_cycle_patched(
+                brain, df, tickers, composite_scores, rl_scores
+            )
+
+        buy_tickers = [d.ticker for d in decisions if d.action == "BUY"]
+        self.assertGreaterEqual(len(buy_tickers), 2)
+        self.assertLess(buy_tickers.index("BBB"), buy_tickers.index("AAA"))
+
     # ── Test 6: Abort cycle when _assert_model_available raises ───────────────
 
     def test_rl_enabled_aborts_on_model_unavailable(self):

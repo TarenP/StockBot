@@ -158,10 +158,43 @@ def _load_typed_config(path: str = "broker.config") -> dict:
     return cfg
 
 
-def _load_data_and_universe(top_n: int, include_raw_cols: bool = False):
+def _latest_price_panel_date(price_path: str = "MasterDS/stooq_panel.parquet") -> pd.Timestamp | None:
+    if not os.path.exists(price_path):
+        return None
+
+    raw = pd.read_parquet(price_path)
+    if isinstance(raw.index, pd.MultiIndex) and "date" in raw.index.names:
+        dates = pd.DatetimeIndex(pd.to_datetime(raw.index.get_level_values("date"), utc=True, errors="coerce"))
+    elif "date" in raw.columns:
+        dates = pd.DatetimeIndex(pd.to_datetime(raw["date"], utc=True, errors="coerce"))
+    else:
+        return None
+
+    if getattr(dates, "tz", None) is not None:
+        dates = dates.tz_convert(None)
+    dates = dates.dropna()
+    if len(dates) == 0:
+        return None
+    return pd.Timestamp(dates.max()).normalize()
+
+
+def _load_data_and_universe(
+    top_n: int,
+    include_raw_cols: bool = False,
+    universe_as_of_date: pd.Timestamp | None = None,
+):
     from pipeline.data import load_master, get_asset_universe
-    df = load_master(top_n=top_n, include_raw_cols=include_raw_cols)
-    asset_list = get_asset_universe(df, top_n=top_n, lookback_years=5)
+    df = load_master(
+        top_n=top_n,
+        include_raw_cols=include_raw_cols,
+        universe_as_of_date=universe_as_of_date,
+    )
+    asset_list = get_asset_universe(
+        df,
+        top_n=top_n,
+        lookback_years=5,
+        as_of_date=universe_as_of_date,
+    )
     df = df[df.index.get_level_values("ticker").isin(asset_list)]
     return df, asset_list
 
@@ -721,7 +754,20 @@ def run_screen(args):
 def run_replay_mode(args):
     from broker.replay import run_full_replay
     from broker.broker import _resolve_checkpoint
-    df, asset_list = _load_data_and_universe(_resolve_top_n(args))
+
+    replay_universe_as_of = None
+    latest_price_date = _latest_price_panel_date()
+    if latest_price_date is not None:
+        replay_universe_as_of = latest_price_date - pd.DateOffset(years=args.replay_years)
+        logger.info(
+            "Replay: selecting universe as of %s to avoid forward-looking membership drift.",
+            replay_universe_as_of.date(),
+        )
+
+    df, asset_list = _load_data_and_universe(
+        _resolve_top_n(args),
+        universe_as_of_date=replay_universe_as_of,
+    )
     live_config = _load_typed_config()
     run_full_replay(
         df_features          = df,

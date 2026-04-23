@@ -148,12 +148,17 @@ class Portfolio:
             total_shares = pos["shares"] + shares
             pos["avg_cost"] = (pos["shares"] * pos["avg_cost"] + cost) / total_shares
             pos["shares"]   = total_shares
+            pos["last_price"] = price
+            pos["peak_price"] = max(float(pos.get("peak_price", price)), float(price))
+            pos.setdefault("weak_signal_streak", 0)
         else:
             self.positions[ticker] = {
                 "shares":        shares,
                 "avg_cost":      price,
                 "last_price":    price,
                 "partial_taken": False,   # tracks whether partial profit was taken
+                "peak_price":    price,
+                "weak_signal_streak": 0,
             }
 
         self.cash -= cost

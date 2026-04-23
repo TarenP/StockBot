@@ -235,33 +235,69 @@ def _apply_execution_cost(price: float, shares: float, execution_spread: float) 
     return adj_value, adj_shares
 
 
+def _apply_sell_execution_cost(price: float, execution_spread: float) -> float:
+    return float(price) * (1.0 - float(execution_spread))
+
+
 def _execute_replay_decisions(
     portfolio,
     decisions: list,
     execution_spread: float,
     trade_log: list,
     date,
+    price_lookup: pd.DataFrame | None = None,
+    decision_date=None,
 ) -> None:
+    fill_date = pd.Timestamp(date)
+    decision_date = fill_date if decision_date is None else pd.Timestamp(decision_date)
+
     for d in decisions:
+        fill_price = float(d.price)
+        if price_lookup is not None:
+            quote = _get_historical_quote(price_lookup, d.ticker, fill_date)
+            if quote is None:
+                continue
+            fill_price, _fill_volume = quote
+
         ok = False
+        traded_shares = 0.0
         if d.action == "BUY":
-            _adj_value, adj_shares = _apply_execution_cost(d.price, d.shares, execution_spread)
-            ok = portfolio.buy(d.ticker, adj_shares, d.price, d.reason)
+            target_value = max(float(d.shares), 0.0) * max(float(d.price), 0.0)
+            if fill_price <= 0 or target_value <= 0:
+                continue
+            fill_shares = target_value / fill_price
+            _adj_value, adj_shares = _apply_execution_cost(fill_price, fill_shares, execution_spread)
+            ok = portfolio.buy(d.ticker, adj_shares, fill_price, d.reason)
+            traded_shares = float(adj_shares)
             if ok and hasattr(d, "_rl_score_at_entry") and d.ticker in portfolio.positions:
                 portfolio.positions[d.ticker]["rl_score_at_entry"] = d._rl_score_at_entry
         elif d.action == "SELL":
-            ok = portfolio.sell_all(d.ticker, d.price, d.reason)
+            if d.ticker in portfolio.positions:
+                traded_shares = float(portfolio.positions[d.ticker]["shares"])
+            execution_price = _apply_sell_execution_cost(fill_price, execution_spread)
+            ok = portfolio.sell_all(d.ticker, execution_price, d.reason)
+            fill_price = execution_price
         elif d.action == "SELL_PARTIAL":
-            ok = portfolio.sell(d.ticker, d.shares, d.price, d.reason)
+            if d.ticker in portfolio.positions:
+                traded_shares = float(
+                    min(float(d.shares), float(portfolio.positions[d.ticker]["shares"]))
+                )
+            execution_price = _apply_sell_execution_cost(fill_price, execution_spread)
+            ok = portfolio.sell(d.ticker, d.shares, execution_price, d.reason)
+            fill_price = execution_price
         else:
             ok = True
 
         if ok and d.action in ("BUY", "SELL", "SELL_PARTIAL"):
             trade_log.append({
-                "date": str(date),
+                "date": str(fill_date),
+                "decision_date": str(decision_date),
+                "fill_date": str(fill_date),
                 "action": d.action,
                 "ticker": d.ticker,
-                "price": d.price,
+                "shares": traded_shares,
+                "price": fill_price,
+                "decision_price": float(d.price),
                 "score": getattr(d, "score", 0.0),
                 "reason": d.reason,
             })
@@ -327,10 +363,14 @@ class ReplayPortfolio:
             total = pos["shares"] + shares
             pos["avg_cost"] = (pos["shares"] * pos["avg_cost"] + cost) / total
             pos["shares"]   = total
+            pos["last_price"] = price
+            pos["peak_price"] = max(float(pos.get("peak_price", price)), float(price))
+            pos.setdefault("weak_signal_streak", 0)
         else:
             self.positions[ticker] = {
                 "shares": shares, "avg_cost": price,
                 "last_price": price, "partial_taken": False,
+                "peak_price": price, "weak_signal_streak": 0,
             }
         self.cash -= cost
         self.trade_log.append({"date": None, "action": "BUY", "ticker": ticker,
@@ -420,14 +460,18 @@ def run_replay(
     max_position_pct: float = 0.10,
     min_score: float = 0.60,
     stop_loss_floor: float = 0.07,
-    take_profit: float = 0.45,
+    take_profit: float = 1.00,
+    trailing_stop_pct: float = 0.12,
+    trailing_activation_pct: float = 0.18,
+    signal_exit_score: float = 0.18,
+    signal_exit_grace_cycles: int = 2,
     max_daily_loss: float = 0.03,
     max_drawdown: float = 0.15,
     max_gross_exposure: float = 0.95,
     cash_floor: float = 0.05,
     target_volatility: float = 0.15,
     vol_lookback: int = 20,
-    partial_profit_pct: float = 0.20,
+    partial_profit_pct: float = 0.35,
     penny_pct: float = 0.20,
     max_sector_pct: float = 0.40,
     max_pair_correlation: float = 0.80,
@@ -458,6 +502,10 @@ def run_replay(
         min_score=min_score,
         stop_loss_floor=stop_loss_floor,
         take_profit=take_profit,
+        trailing_stop_pct=trailing_stop_pct,
+        trailing_activation_pct=trailing_activation_pct,
+        signal_exit_score=signal_exit_score,
+        signal_exit_grace_cycles=signal_exit_grace_cycles,
         max_daily_loss=max_daily_loss,
         max_drawdown=max_drawdown,
         max_gross_exposure=max_gross_exposure,
@@ -492,14 +540,18 @@ def _run_replay_v2(
     max_position_pct: float = 0.10,
     min_score: float = 0.60,
     stop_loss_floor: float = 0.07,
-    take_profit: float = 0.45,
+    take_profit: float = 1.00,
+    trailing_stop_pct: float = 0.12,
+    trailing_activation_pct: float = 0.18,
+    signal_exit_score: float = 0.18,
+    signal_exit_grace_cycles: int = 2,
     max_daily_loss: float = 0.03,
     max_drawdown: float = 0.15,
     max_gross_exposure: float = 0.95,
     cash_floor: float = 0.05,
     target_volatility: float = 0.15,
     vol_lookback: int = 20,
-    partial_profit_pct: float = 0.20,
+    partial_profit_pct: float = 0.35,
     penny_pct: float = 0.20,
     max_sector_pct: float = 0.40,
     max_pair_correlation: float = 0.80,
@@ -557,6 +609,7 @@ def _run_replay_v2(
         equity_history_getter=lambda: equity_curve,
     )
     trade_log = []
+    pending_fills: dict[pd.Timestamp, list[tuple[pd.Timestamp, list]]] = {}
 
     original_research = getattr(brain_module, "research", None)
     original_get_next_earnings = getattr(brain_module, "_get_next_earnings_date", None)
@@ -767,6 +820,10 @@ def _run_replay_v2(
         stop_loss_pct_floor=stop_loss_floor,
         partial_profit_pct=partial_profit_pct,
         full_profit_pct=take_profit,
+        trailing_stop_pct=trailing_stop_pct,
+        trailing_activation_pct=trailing_activation_pct,
+        signal_exit_score=signal_exit_score,
+        signal_exit_grace_cycles=signal_exit_grace_cycles,
         min_score=min_score,
         penny_max_pct=penny_pct,
         max_sector_pct=max_sector_pct,
@@ -813,6 +870,18 @@ def _run_replay_v2(
                         continue
                 portfolio.update_prices(prices)
 
+            scheduled_fills = pending_fills.pop(pd.Timestamp(date), [])
+            for decision_date, decisions in scheduled_fills:
+                _execute_replay_decisions(
+                    portfolio=portfolio,
+                    decisions=decisions,
+                    execution_spread=execution_spread,
+                    trade_log=trade_log,
+                    date=date,
+                    price_lookup=price_lookup,
+                    decision_date=decision_date,
+                )
+
             if i % rebalance_freq == 0:
                 df_slice = _slice_up_to(date)
                 if not df_slice.empty:
@@ -821,19 +890,18 @@ def _run_replay_v2(
                     brain._get_stop_loss_pct = MethodType(_make_historical_stop_loss(df_slice), brain)
                     brain.min_score = brain._base_min_score
 
-                    risk.start_session(portfolio.equity)
+                    risk.set_market_regime(brain._current_market_regime(df_slice))
+                    risk.start_session(portfolio.equity, session_key=pd.Timestamp(date).date())
                     health_status, _health_reason = risk.check_portfolio_health(portfolio)
                     if health_status == "halt":
                         brain.min_score = 999.0
 
                     decisions = brain.run_cycle(df_slice, screener_top_n=50, risk_engine=risk)
-                    _execute_replay_decisions(
-                        portfolio=portfolio,
-                        decisions=decisions,
-                        execution_spread=execution_spread,
-                        trade_log=trade_log,
-                        date=date,
-                    )
+                    if decisions and i + 1 < len(dates):
+                        fill_date = pd.Timestamp(dates[i + 1])
+                        pending_fills.setdefault(fill_date, []).append(
+                            (pd.Timestamp(date), decisions)
+                        )
 
             equity_curve.append(portfolio.equity)
 
@@ -874,14 +942,18 @@ def _replay_kwargs_from_live_config(live_config: dict | None = None) -> dict:
         "max_position_pct": float(live_config.get("max_position_pct", 0.10)),
         "min_score": float(live_config.get("min_score", 0.60)),
         "stop_loss_floor": float(live_config.get("stop_loss", 0.07)),
-        "take_profit": float(live_config.get("take_profit", 0.45)),
+        "take_profit": float(live_config.get("take_profit", 1.00)),
+        "trailing_stop_pct": float(live_config.get("trailing_stop", 0.12)),
+        "trailing_activation_pct": float(live_config.get("trailing_activation", 0.18)),
+        "signal_exit_score": float(live_config.get("signal_exit_score", 0.18)),
+        "signal_exit_grace_cycles": int(live_config.get("signal_exit_grace", 2)),
         "max_daily_loss": float(live_config.get("max_daily_loss", 0.03)),
         "max_drawdown": float(live_config.get("max_drawdown", 0.15)),
         "max_gross_exposure": float(live_config.get("max_gross_exposure", 0.95)),
         "cash_floor": float(live_config.get("cash_floor", 0.05)),
         "target_volatility": float(live_config.get("target_volatility", 0.15)),
         "vol_lookback": int(live_config.get("vol_lookback", 20)),
-        "partial_profit_pct": float(live_config.get("partial_profit", 0.20)),
+        "partial_profit_pct": float(live_config.get("partial_profit", 0.35)),
         "penny_pct": float(live_config.get("penny_pct", 0.20)),
         "max_sector_pct": float(live_config.get("max_sector", 0.40)),
         "max_pair_correlation": float(live_config.get("max_correlation", 0.80)),
@@ -916,12 +988,14 @@ def run_sensitivity(
     def add(label: str, **overrides) -> None:
         scenarios.append({**base, **overrides, "label": label})
 
-    add("min_score=0.55", min_score=0.55)
-    add("min_score=0.65", min_score=0.65)
     add("stop=7%", stop_loss_floor=0.07)
     add("stop=10%", stop_loss_floor=0.10)
     add("tp=50%", take_profit=0.50)
     add("tp=65%", take_profit=0.65)
+    add("trail=10%", trailing_stop_pct=0.10)
+    add("trail=15%", trailing_stop_pct=0.15)
+    add("signal_exit=0.15", signal_exit_score=0.15)
+    add("signal_exit=0.25", signal_exit_score=0.25)
     add("max_pos=15%", max_position_pct=0.15)
     add("max_pos=20%", max_position_pct=0.20)
     add("cash_floor=1%", cash_floor=0.01)
@@ -935,9 +1009,15 @@ def run_sensitivity(
     add("spread=20bps", execution_spread=0.0020)
 
     if strategy == "screener_rl":
-        add("rl_phase=1", rl_phase=1)
-        add("rl_exit=15%", rl_exit_threshold=0.15)
-        add("rl_drop=25%", rl_conviction_drop=0.25)
+        add("rl_min=5%", rl_min_score=0.05)
+        add("rl_min=10%", rl_min_score=0.10)
+        add("rl_min=20%", rl_min_score=0.20)
+        add("rl_phase=2", rl_phase=2)
+        add("rl_phase2 exit=15%", rl_phase=2, rl_exit_threshold=0.15)
+        add("rl_phase2 drop=25%", rl_phase=2, rl_conviction_drop=0.25)
+    else:
+        add("min_score=0.55", min_score=0.55)
+        add("min_score=0.65", min_score=0.65)
 
     rows = []
     seen = set()
@@ -988,9 +1068,10 @@ def run_full_replay(
     from pipeline.benchmark import (
         align_return_series,
         fetch_spy_returns,
-        print_benchmark_report,
         plot_benchmark,
+        print_benchmark_report,
     )
+    from broker.sectors import get_cached_sector_map
 
     # Restrict to replay window
     dates  = sorted(df_features.index.get_level_values("date").unique())
@@ -1073,6 +1154,34 @@ def run_full_replay(
     sells    = n_trades - buys
     logger.info(f"Trades: {n_trades} total ({buys} buys, {sells} sells)")
     _print_trade_log_report(trade_log)
+
+    # Rolling-window robustness
+    rolling_df, rolling_summary = _rolling_window_validation(aligned)
+    if not rolling_df.empty:
+        rolling_path = Path(save_plot).with_name(f"{Path(save_plot).stem}_rolling.csv")
+        rolling_summary_path = Path(save_plot).with_name(
+            f"{Path(save_plot).stem}_rolling_summary.csv"
+        )
+        rolling_path.parent.mkdir(parents=True, exist_ok=True)
+        rolling_df.to_csv(rolling_path, index=False)
+        rolling_summary.to_csv(rolling_summary_path, index=False)
+        logger.info("Rolling validation saved -> %s", rolling_path)
+        logger.info("Rolling validation summary saved -> %s", rolling_summary_path)
+    _print_rolling_window_report(rolling_summary)
+
+    # Closed-trade attribution
+    sector_map = get_cached_sector_map(
+        df_replay.index.get_level_values("ticker").unique().tolist()
+    )
+    attribution_df = _build_trade_attribution(trade_log, sector_map=sector_map)
+    if not attribution_df.empty:
+        attribution_path = Path(save_plot).with_name(
+            f"{Path(save_plot).stem}_trade_attribution.csv"
+        )
+        attribution_path.parent.mkdir(parents=True, exist_ok=True)
+        attribution_df.to_csv(attribution_path, index=False)
+        logger.info("Trade attribution saved -> %s", attribution_path)
+    _print_trade_attribution_report(attribution_df)
 
     # Sensitivity sweep
     if run_sensitivity_sweep:
@@ -1188,7 +1297,16 @@ def _print_trade_log_report(trade_log: list[dict]) -> None:
         return
 
     df_trades = pd.DataFrame(trade_log).copy()
-    preferred_cols = ["date", "action", "ticker", "price", "score", "reason"]
+    preferred_cols = [
+        "decision_date",
+        "fill_date",
+        "action",
+        "ticker",
+        "price",
+        "decision_price",
+        "score",
+        "reason",
+    ]
     df_trades = df_trades[[c for c in preferred_cols if c in df_trades.columns]]
 
     formatters = {}
@@ -1198,6 +1316,329 @@ def _print_trade_log_report(trade_log: list[dict]) -> None:
         formatters["score"] = lambda x: f"{float(x):.3f}" if pd.notna(x) else ""
 
     print(df_trades.to_string(index=False, formatters=formatters, justify="left"))
+    print(f"{'='*72}\n")
+
+
+def _rolling_window_validation(
+    aligned: pd.DataFrame,
+    windows: tuple[int, ...] = (63, 126, 252),
+    step: int = 21,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Evaluate rolling subperiod robustness on already-aligned return series."""
+    from pipeline.benchmark import benchmark_vs_spy, compute_metrics
+
+    if aligned.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    rows: list[dict] = []
+    has_benchmark = "benchmark" in aligned.columns
+    has_equal_weight = "equal_weight" in aligned.columns
+
+    for window in windows:
+        if len(aligned) < window:
+            continue
+
+        end_indices = list(range(window - 1, len(aligned), step))
+        if end_indices[-1] != len(aligned) - 1:
+            end_indices.append(len(aligned) - 1)
+
+        for end_idx in end_indices:
+            window_df = aligned.iloc[end_idx - window + 1:end_idx + 1]
+            portfolio_rets = window_df["portfolio"].to_numpy(dtype=float)
+            policy_metrics = compute_metrics(portfolio_rets, "Policy")
+
+            row = {
+                "window_days": int(window),
+                "start_date": pd.Timestamp(window_df.index[0]).date().isoformat(),
+                "end_date": pd.Timestamp(window_df.index[-1]).date().isoformat(),
+                "n_obs": int(len(window_df)),
+                "policy_total_return": policy_metrics["total_return"],
+                "policy_ann_return": policy_metrics["ann_return"],
+                "policy_sharpe": policy_metrics["sharpe"],
+                "policy_max_drawdown": policy_metrics["max_drawdown"],
+            }
+
+            if has_benchmark:
+                benchmark_rets = window_df["benchmark"].to_numpy(dtype=float)
+                benchmark_metrics = compute_metrics(benchmark_rets, "SPY")
+                rel = benchmark_vs_spy(portfolio_rets, benchmark_rets)
+                row.update({
+                    "spy_total_return": benchmark_metrics["total_return"],
+                    "spy_ann_return": benchmark_metrics["ann_return"],
+                    "excess_return_vs_spy": (
+                        policy_metrics["total_return"] - benchmark_metrics["total_return"]
+                    ),
+                    "beats_spy_return": bool(rel["beats_spy_return"]),
+                })
+
+            if has_equal_weight:
+                ew_rets = window_df["equal_weight"].to_numpy(dtype=float)
+                ew_metrics = compute_metrics(ew_rets, "Equal-Weight")
+                row.update({
+                    "equal_weight_total_return": ew_metrics["total_return"],
+                    "excess_return_vs_equal_weight": (
+                        policy_metrics["total_return"] - ew_metrics["total_return"]
+                    ),
+                    "beats_equal_weight_return": (
+                        policy_metrics["total_return"] > ew_metrics["total_return"]
+                    ),
+                })
+
+            rows.append(row)
+
+    rolling_df = pd.DataFrame(rows)
+    if rolling_df.empty:
+        return rolling_df, pd.DataFrame()
+
+    summary_rows: list[dict] = []
+    for window_days, group in rolling_df.groupby("window_days", sort=True):
+        summary = {
+            "window_days": int(window_days),
+            "n_windows": int(len(group)),
+            "median_policy_return": float(group["policy_total_return"].median()),
+            "median_policy_drawdown": float(group["policy_max_drawdown"].median()),
+        }
+        if "excess_return_vs_spy" in group.columns:
+            summary["median_excess_vs_spy"] = float(group["excess_return_vs_spy"].median())
+            summary["beat_rate_vs_spy"] = float(group["beats_spy_return"].mean())
+        if "excess_return_vs_equal_weight" in group.columns:
+            summary["median_excess_vs_equal_weight"] = float(
+                group["excess_return_vs_equal_weight"].median()
+            )
+            summary["beat_rate_vs_equal_weight"] = float(
+                group["beats_equal_weight_return"].mean()
+            )
+        summary_rows.append(summary)
+
+    summary_df = pd.DataFrame(summary_rows).sort_values("window_days").reset_index(drop=True)
+    return rolling_df, summary_df
+
+
+def _print_rolling_window_report(summary_df: pd.DataFrame) -> None:
+    print(f"\n{'='*72}")
+    print("  Rolling Window Validation")
+    print(f"{'='*72}")
+    if summary_df.empty:
+        print("  No rolling-window summary available.")
+        print(f"{'='*72}\n")
+        return
+
+    cols = ["window_days", "n_windows", "median_policy_return", "median_policy_drawdown"]
+    if "median_excess_vs_spy" in summary_df.columns:
+        cols.extend(["median_excess_vs_spy", "beat_rate_vs_spy"])
+    if "median_excess_vs_equal_weight" in summary_df.columns:
+        cols.extend(["median_excess_vs_equal_weight", "beat_rate_vs_equal_weight"])
+
+    pretty = summary_df[cols].copy()
+    print(
+        pretty.to_string(
+            index=False,
+            formatters={
+                "median_policy_return": "{:.2%}".format,
+                "median_policy_drawdown": "{:.2%}".format,
+                "median_excess_vs_spy": "{:.2%}".format,
+                "beat_rate_vs_spy": "{:.2%}".format,
+                "median_excess_vs_equal_weight": "{:.2%}".format,
+                "beat_rate_vs_equal_weight": "{:.2%}".format,
+            },
+            justify="left",
+        )
+    )
+    print(f"{'='*72}\n")
+
+
+def _normalize_exit_reason(reason: str | None) -> str:
+    reason = str(reason or "").strip()
+    if not reason:
+        return "Unknown"
+    return reason.split("(", 1)[0].strip()
+
+
+def _build_trade_attribution(
+    trade_log: list[dict],
+    sector_map: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Reconstruct closed-trade attribution from replay fills using FIFO lots."""
+    if not trade_log:
+        return pd.DataFrame()
+
+    sector_map = {str(k).upper(): str(v) for k, v in (sector_map or {}).items()}
+    df_trades = pd.DataFrame(trade_log).copy()
+    if df_trades.empty:
+        return pd.DataFrame()
+
+    df_trades["fill_date"] = pd.to_datetime(df_trades.get("fill_date", df_trades.get("date")))
+    df_trades["ticker"] = df_trades["ticker"].astype(str).str.upper()
+    df_trades["shares"] = pd.to_numeric(df_trades.get("shares"), errors="coerce").fillna(0.0)
+    df_trades["price"] = pd.to_numeric(df_trades.get("price"), errors="coerce")
+    df_trades["score"] = pd.to_numeric(df_trades.get("score"), errors="coerce")
+    df_trades = df_trades.sort_values(["fill_date", "ticker", "action"]).reset_index(drop=True)
+
+    open_lots: dict[str, list[dict]] = {}
+    rows: list[dict] = []
+
+    for rec in df_trades.to_dict("records"):
+        ticker = rec["ticker"]
+        action = str(rec.get("action", "")).upper()
+        fill_date = pd.Timestamp(rec["fill_date"])
+        price = float(rec.get("price", 0.0) or 0.0)
+        shares = float(rec.get("shares", 0.0) or 0.0)
+        score = rec.get("score")
+        reason = str(rec.get("reason", "") or "")
+
+        if action == "BUY":
+            if shares <= 0 or price <= 0:
+                continue
+            open_lots.setdefault(ticker, []).append({
+                "shares": shares,
+                "entry_date": fill_date,
+                "entry_price": price,
+                "entry_score": float(score) if pd.notna(score) else np.nan,
+                "entry_reason": reason,
+                "sector": sector_map.get(ticker, "Unknown"),
+            })
+            continue
+
+        if action not in {"SELL", "SELL_PARTIAL"}:
+            continue
+
+        lots = open_lots.get(ticker, [])
+        if not lots:
+            continue
+
+        remaining = shares
+        if remaining <= 0 and action == "SELL":
+            remaining = float(sum(lot["shares"] for lot in lots))
+        if remaining <= 0:
+            continue
+
+        while remaining > 1e-9 and lots:
+            lot = lots[0]
+            used_shares = min(remaining, float(lot["shares"]))
+            pnl = used_shares * (price - float(lot["entry_price"]))
+            entry_price = float(lot["entry_price"])
+            rows.append({
+                "ticker": ticker,
+                "sector": lot["sector"],
+                "entry_date": pd.Timestamp(lot["entry_date"]).date().isoformat(),
+                "exit_date": fill_date.date().isoformat(),
+                "holding_days": int((fill_date - pd.Timestamp(lot["entry_date"])).days),
+                "shares": float(used_shares),
+                "entry_price": entry_price,
+                "exit_price": price,
+                "gross_pnl": float(pnl),
+                "return_pct": float((price / entry_price) - 1.0) if entry_price > 0 else np.nan,
+                "entry_score": lot["entry_score"],
+                "exit_score": float(score) if pd.notna(score) else np.nan,
+                "entry_reason": lot["entry_reason"],
+                "exit_reason": reason,
+                "exit_reason_bucket": _normalize_exit_reason(reason),
+            })
+
+            lot["shares"] -= used_shares
+            remaining -= used_shares
+            if lot["shares"] <= 1e-9:
+                lots.pop(0)
+
+    return pd.DataFrame(rows)
+
+
+def _print_trade_attribution_report(attribution_df: pd.DataFrame) -> None:
+    print(f"\n{'='*72}")
+    print("  Closed Trade Attribution")
+    print(f"{'='*72}")
+    if attribution_df.empty:
+        print("  No closed trades yet, so attribution is unavailable.")
+        print(f"{'='*72}\n")
+        return
+
+    realized_pnl = float(attribution_df["gross_pnl"].sum())
+    win_rate = float((attribution_df["gross_pnl"] > 0).mean())
+    avg_holding_days = float(attribution_df["holding_days"].mean())
+    winners = attribution_df.loc[attribution_df["gross_pnl"] > 0, "gross_pnl"].sum()
+    losers = attribution_df.loc[attribution_df["gross_pnl"] < 0, "gross_pnl"].sum()
+    profit_factor = float(winners / abs(losers)) if losers < 0 else np.inf
+
+    print(
+        "  closed_trades={:d}  realized_pnl=${:,.2f}  win_rate={:.2%}  "
+        "avg_holding_days={:.1f}  profit_factor={:.2f}".format(
+            int(len(attribution_df)),
+            realized_pnl,
+            win_rate,
+            avg_holding_days,
+            profit_factor,
+        )
+    )
+
+    sector_summary = (
+        attribution_df.groupby("sector", dropna=False)
+        .agg(
+            trades=("gross_pnl", "size"),
+            total_pnl=("gross_pnl", "sum"),
+            win_rate=("gross_pnl", lambda s: float((s > 0).mean())),
+        )
+        .sort_values("total_pnl", ascending=False)
+        .reset_index()
+    )
+    reason_summary = (
+        attribution_df.groupby("exit_reason_bucket", dropna=False)
+        .agg(
+            trades=("gross_pnl", "size"),
+            total_pnl=("gross_pnl", "sum"),
+            win_rate=("gross_pnl", lambda s: float((s > 0).mean())),
+        )
+        .sort_values(["trades", "total_pnl"], ascending=[False, False])
+        .reset_index()
+    )
+
+    print("\n  Sector Summary")
+    print(
+        sector_summary.head(8).to_string(
+            index=False,
+            formatters={
+                "total_pnl": "${:,.2f}".format,
+                "win_rate": "{:.2%}".format,
+            },
+            justify="left",
+        )
+    )
+
+    print("\n  Exit Reason Summary")
+    print(
+        reason_summary.head(8).to_string(
+            index=False,
+            formatters={
+                "total_pnl": "${:,.2f}".format,
+                "win_rate": "{:.2%}".format,
+            },
+            justify="left",
+        )
+    )
+
+    top_cols = ["ticker", "sector", "gross_pnl", "return_pct", "holding_days", "exit_reason_bucket"]
+    print("\n  Top Winners")
+    print(
+        attribution_df.nlargest(5, "gross_pnl")[top_cols].to_string(
+            index=False,
+            formatters={
+                "gross_pnl": "${:,.2f}".format,
+                "return_pct": "{:.2%}".format,
+            },
+            justify="left",
+        )
+    )
+
+    print("\n  Top Losers")
+    print(
+        attribution_df.nsmallest(5, "gross_pnl")[top_cols].to_string(
+            index=False,
+            formatters={
+                "gross_pnl": "${:,.2f}".format,
+                "return_pct": "{:.2%}".format,
+            },
+            justify="left",
+        )
+    )
     print(f"{'='*72}\n")
 
 
@@ -1213,12 +1654,16 @@ def run_ablation(
     max_position_pct: float = 0.10,
     min_score: float = 0.60,
     stop_loss_floor: float = 0.07,
-    take_profit: float = 0.45,
+    take_profit: float = 1.00,
+    trailing_stop_pct: float = 0.12,
+    trailing_activation_pct: float = 0.18,
+    signal_exit_score: float = 0.18,
+    signal_exit_grace_cycles: int = 2,
     max_gross_exposure: float = 0.95,
     cash_floor: float = 0.05,
     target_volatility: float = 0.15,
     vol_lookback: int = 20,
-    partial_profit_pct: float = 0.20,
+    partial_profit_pct: float = 0.35,
     penny_pct: float = 0.20,
     max_sector_pct: float = 0.40,
     max_pair_correlation: float = 0.80,
@@ -1312,6 +1757,10 @@ def run_ablation(
             min_score=min_score,
             stop_loss_floor=stop_loss_floor,
             take_profit=take_profit,
+            trailing_stop_pct=trailing_stop_pct,
+            trailing_activation_pct=trailing_activation_pct,
+            signal_exit_score=signal_exit_score,
+            signal_exit_grace_cycles=signal_exit_grace_cycles,
             max_gross_exposure=max_gross_exposure,
             cash_floor=cash_floor,
             target_volatility=target_volatility,

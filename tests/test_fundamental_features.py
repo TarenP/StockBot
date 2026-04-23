@@ -16,7 +16,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from unittest.mock import patch, MagicMock
 
-from pipeline.features import FEATURE_COLS, fetch_fundamentals
+from pipeline.features import FEATURE_COLS, build_features, fetch_fundamentals
 
 
 # ── Unit tests ────────────────────────────────────────────────────────────────
@@ -126,6 +126,29 @@ class TestFetchFundamentals:
             assert result.loc["AAPL", "pe_ratio"] == pytest.approx(0.0)
         finally:
             os.unlink(cache_path)
+
+
+def test_build_features_disables_snapshot_fundamentals_by_default():
+    dates = pd.date_range("2024-01-02", periods=30, freq="B")
+    index = pd.MultiIndex.from_product([dates, ["AAA"]], names=["date", "ticker"])
+    df = pd.DataFrame(
+        {
+            "open": np.linspace(10.0, 12.0, len(index)),
+            "high": np.linspace(10.5, 12.5, len(index)),
+            "low": np.linspace(9.5, 11.5, len(index)),
+            "close": np.linspace(10.0, 12.0, len(index)),
+            "volume": np.full(len(index), 1_000_000.0),
+        },
+        index=index,
+    )
+
+    with patch("pipeline.features.fetch_fundamentals") as mock_fetch:
+        result = build_features(df)
+
+    mock_fetch.assert_not_called()
+    for col in ("pe_ratio", "revenue_growth", "short_interest_pct"):
+        assert col in result.columns
+        assert result[col].abs().max() == pytest.approx(0.0)
 
 
 # ── Property-based test ───────────────────────────────────────────────────────

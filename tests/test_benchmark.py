@@ -1,11 +1,15 @@
+import sys
+import types
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from pipeline.benchmark import (
     MIN_HISTORY_FOR_STABLE_METRICS,
     benchmark_vs_spy,
     compute_metrics,
+    fetch_spy_returns,
     plot_benchmark,
     print_benchmark_report,
 )
@@ -76,3 +80,37 @@ def test_print_benchmark_report_marks_hidden_metrics_as_na(capsys):
 
     assert "n/a" in output
     assert "currently 4 observations" in output
+
+
+def test_fetch_spy_returns_falls_back_to_local_parquet(monkeypatch):
+    fake_yf = types.SimpleNamespace(
+        download=lambda *args, **kwargs: pd.DataFrame(),
+        Ticker=lambda symbol: types.SimpleNamespace(
+            history=lambda *args, **kwargs: pd.DataFrame()
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+
+    parquet_path = Path("tests") / "_local_spy_fallback.parquet"
+    try:
+        local_panel = pd.DataFrame(
+            {
+                "ticker": ["SPY", "SPY", "AAA"],
+                "close": [100.0, 110.0, 50.0],
+            },
+            index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-02"]),
+        )
+        local_panel.index.name = "date"
+        local_panel.to_parquet(parquet_path)
+
+        rets = fetch_spy_returns(
+            start="2024-01-01",
+            end="2024-01-03",
+            parquet_path=str(parquet_path),
+        )
+
+        assert rets.index.tolist() == [pd.Timestamp("2024-01-02")]
+        assert np.isclose(float(rets.iloc[0]), 0.10)
+    finally:
+        if parquet_path.exists():
+            parquet_path.unlink()

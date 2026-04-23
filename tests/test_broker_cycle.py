@@ -6,6 +6,7 @@ from uuid import uuid4
 import pandas as pd
 
 import broker.broker as broker_module
+import broker.briefing as briefing_module
 import broker.journal as journal_module
 from broker.portfolio import Portfolio
 from pipeline import data as data_module
@@ -146,6 +147,51 @@ def test_run_cycle_loads_raw_cols_for_local_research_fallback(monkeypatch):
     )
 
     assert load_kwargs["include_raw_cols"] is True
+
+
+def test_run_cycle_sets_market_regime_after_loading_data(monkeypatch):
+    calls = {}
+    loaded_df = pd.DataFrame(
+        {"regime_0": [1.0]},
+        index=pd.MultiIndex.from_tuples(
+            [(pd.Timestamp("2026-04-15"), "AAA")],
+            names=["date", "ticker"],
+        ),
+    )
+
+    class _BrainWithRegime(_DummyBrain):
+        def _current_market_regime(self, df):
+            calls["regime_df_is_loaded"] = df is loaded_df
+            return 0
+
+        def run_cycle(self, df, screener_top_n=50, risk_engine=None):
+            calls["run_cycle_df_is_loaded"] = df is loaded_df
+            return []
+
+    class _RiskWithRegime(_DummyRisk):
+        def set_market_regime(self, regime):
+            calls["market_regime"] = regime
+
+    monkeypatch.setattr(broker_module, "_is_market_hours", lambda: True)
+    monkeypatch.setattr(updater_module, "_load_trained_universe", lambda save_dir: ["AAA"])
+    monkeypatch.setattr(updater_module, "update_parquet", lambda **kwargs: 0)
+    monkeypatch.setattr(sentiment_module, "update_sentiment", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(data_module, "load_master", lambda **kwargs: loaded_df)
+    monkeypatch.setattr(broker_module, "log_cycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(broker_module, "daily_integrity_check", lambda portfolio: {})
+    monkeypatch.setattr(broker_module, "_fetch_current_spy_price", lambda: None)
+    monkeypatch.setattr(journal_module, "plot_live_performance", lambda *args, **kwargs: None)
+    monkeypatch.setattr(briefing_module, "print_daily_briefing", lambda *args, **kwargs: None)
+
+    broker_module.run_cycle(
+        portfolio=_DummyPortfolio(),
+        brain=_BrainWithRegime(),
+        risk=_RiskWithRegime(),
+    )
+
+    assert calls["regime_df_is_loaded"] is True
+    assert calls["run_cycle_df_is_loaded"] is True
+    assert calls["market_regime"] == 0
 
 
 def test_portfolio_summary_always_includes_stock_holdings_section():
