@@ -506,6 +506,35 @@ def get_live_universe(
             f"Resolved broad universe too small: {len(filtered)} < {min_universe_size}"
         )
 
+    # ── Source-health telemetry warnings ─────────────────────────────────────
+    # Warn when the universe is being held up primarily by stale local state
+    # rather than fresh live sources.
+    parquet_count = metadata["source_counts"].get("parquet_recent", 0)
+    trained_count = metadata["source_counts"].get("trained", 0)
+    bootstrap_count = metadata["source_counts"].get("bootstrap", 0)
+    live_sources_total = bootstrap_count  # bootstrap is the only live-fetched source
+
+    if live_sources_total == 0 and (parquet_count + trained_count) > 0:
+        logger.warning(
+            "SOURCE HEALTH: Universe resolved entirely from stale local state "
+            "(parquet=%d, trained=%d, bootstrap=0). "
+            "Run --mode update --expand_universe to refresh from live sources.",
+            parquet_count, trained_count,
+        )
+    elif bootstrap_count > 0 and bootstrap_count < 100:
+        logger.warning(
+            "SOURCE HEALTH: Bootstrap returned only %d tickers — live sources may be degraded. "
+            "Check network access to Wikipedia/Finviz.",
+            bootstrap_count,
+        )
+
+    logger.info(
+        "Source health: parquet=%d trained=%d bootstrap=%d watchlist=%d → filtered=%d",
+        parquet_count, trained_count, bootstrap_count,
+        metadata["source_counts"].get("watchlist", 0),
+        len(filtered),
+    )
+
     if snapshot_path:
         _write_universe_snapshot(
             snapshot_path,

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,36 @@ from typing import Any
 import pandas as pd
 
 RUN_MANIFEST_DIR = Path("plots/manifests")
+
+# ── Required fields per manifest kind ────────────────────────────────────────
+# Tests assert these are present so manifests stay complete over time.
+
+REQUIRED_MANIFEST_FIELDS: dict[str, list[str]] = {
+    "live_cycle": [
+        "mode",
+        "config_hash",
+        "resolved_universe_size",
+        "resolved_universe_hash",
+        "freshness",
+        "freshness_gate",
+    ],
+    "replay": [
+        "mode",
+        "config_hash",
+        "checkpoint_path",
+        "resolved_universe_size",
+        "resolved_universe_hash",
+        "replay_window",
+        "benchmark",
+        "friction",
+    ],
+}
+
+# Fields that every manifest must have regardless of kind
+REQUIRED_MANIFEST_FIELDS_COMMON = [
+    "kind",
+    "generated_at",
+]
 
 
 def _json_default(value: Any):
@@ -39,6 +70,36 @@ def hash_ticker_list(tickers) -> str:
     return stable_hash(cleaned)
 
 
+def get_code_version() -> str:
+    """Return short git commit hash, or 'unknown' if not in a git repo."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def validate_manifest(manifest: dict, kind: str) -> list[str]:
+    """
+    Check that a manifest contains all required fields.
+
+    Returns a list of missing field names. Empty list = valid.
+    """
+    missing: list[str] = []
+    for field in REQUIRED_MANIFEST_FIELDS_COMMON:
+        if field not in manifest:
+            missing.append(field)
+    for field in REQUIRED_MANIFEST_FIELDS.get(kind, []):
+        if field not in manifest:
+            missing.append(field)
+    return missing
+
+
 def write_run_manifest(
     kind: str,
     payload: dict[str, Any],
@@ -47,6 +108,15 @@ def write_run_manifest(
     manifest = dict(payload)
     manifest.setdefault("kind", kind)
     manifest.setdefault("generated_at", datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"))
+    manifest.setdefault("code_version", get_code_version())
+
+    # Warn if required fields are missing — helps catch regressions early
+    missing = validate_manifest(manifest, kind)
+    if missing:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Run manifest '%s' is missing required fields: %s", kind, missing
+        )
 
     if output_path is None:
         RUN_MANIFEST_DIR.mkdir(parents=True, exist_ok=True)

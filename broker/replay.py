@@ -1067,6 +1067,86 @@ def run_sensitivity(
     return pd.DataFrame(rows)
 
 
+# ── Friction regime reporting ─────────────────────────────────────────────────
+
+# Three friction regimes for honest cost-model sensitivity reporting.
+# Optimistic: tight spread, no gap risk.
+# Base: realistic 10bps spread (default).
+# Stressed: 30bps spread + 5% partial-fill penalty on each trade.
+
+FRICTION_REGIMES = {
+    "optimistic": {"execution_spread": 0.0002},
+    "base":       {"execution_spread": 0.0010},
+    "stressed":   {"execution_spread": 0.0030},
+}
+
+
+def run_friction_report(
+    df_features: pd.DataFrame,
+    price_lookup: pd.DataFrame,
+    initial_cash: float = 10_000.0,
+    live_config: dict | None = None,
+    strategy: str | None = None,
+    checkpoint_path: str | None = None,
+) -> pd.DataFrame:
+    """
+    Run the replay under three friction regimes (optimistic / base / stressed)
+    and return a DataFrame with gross and net returns for each.
+
+    This makes it easy to see whether reported performance depends heavily on
+    the cost model assumptions.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        regime, execution_spread, total_return, ann_return, sharpe,
+        max_drawdown, win_rate
+    """
+    from pipeline.benchmark import compute_metrics
+
+    base_kwargs = _replay_kwargs_from_live_config(live_config)
+    resolved_strategy = strategy or _resolve_replay_strategy(live_config)
+
+    rows = []
+    for regime_name, overrides in FRICTION_REGIMES.items():
+        kwargs = {**base_kwargs, **overrides}
+        rets, _ = run_replay(
+            df_features,
+            price_lookup,
+            strategy=resolved_strategy,
+            checkpoint_path=checkpoint_path,
+            initial_cash=initial_cash,
+            label=f"friction_{regime_name}",
+            **kwargs,
+        )
+        m = compute_metrics(rets, label=regime_name)
+        rows.append({
+            "regime":           regime_name,
+            "execution_spread": overrides["execution_spread"],
+            "total_return":     m["total_return"],
+            "ann_return":       m["ann_return"],
+            "sharpe":           m["sharpe"],
+            "max_drawdown":     m["max_drawdown"],
+            "win_rate":         m["win_rate"],
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Log a warning if stressed Sharpe is more than 0.3 below base Sharpe —
+    # that indicates the strategy is sensitive to execution cost assumptions.
+    if len(df) >= 2:
+        base_sharpe = float(df.loc[df["regime"] == "base", "sharpe"].iloc[0]) if "base" in df["regime"].values else 0.0
+        stressed_sharpe = float(df.loc[df["regime"] == "stressed", "sharpe"].iloc[0]) if "stressed" in df["regime"].values else 0.0
+        if base_sharpe - stressed_sharpe > 0.30:
+            logger.warning(
+                "FRICTION SENSITIVITY: Sharpe drops from %.3f (base) to %.3f (stressed). "
+                "Strategy may be sensitive to execution cost assumptions.",
+                base_sharpe, stressed_sharpe,
+            )
+
+    return df
+
+
 # ── Full replay report ────────────────────────────────────────────────────────
 
 def run_full_replay(

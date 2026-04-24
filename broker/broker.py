@@ -46,6 +46,7 @@ from broker.journal   import (
 )
 from pipeline.checkpoints import resolve_checkpoint_path
 from pipeline.run_manifest import (
+    get_code_version,
     hash_config,
     hash_ticker_list,
     summarize_price_sentiment_freshness,
@@ -127,6 +128,7 @@ def run_cycle(
     run_manifest: dict[str, object] = {
         "mode": "live",
         "config_hash": hash_config(config or {}),
+        "code_version": get_code_version(),
     }
     now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
     logger.info(f"{'='*55}")

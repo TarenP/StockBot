@@ -33,7 +33,7 @@ python Broker.py
 
 ## How it works
 
-Every stock is scored using 19 features computed daily:
+Every stock is scored using 29 features computed daily:
 
 **Technical signals (10):** returns over 1/5/20 days, RSI, MACD histogram,
 Bollinger Band position, ATR volatility, volume ratio, volume z-score,
@@ -44,8 +44,15 @@ net sentiment score, 3/7/14-day rolling averages, sentiment surprise (today
 vs 14-day baseline), sentiment acceleration, 7-day trend slope, raw positive
 confidence, negativity spike detection.
 
-The sentiment surprise signal is the most forward-looking — a sudden jump in
-positive news before price moves is the strongest buy signal in the system.
+**Market context (3):** SPY 20-day return, VIX level, market breadth (fraction
+of stocks above 200-day moving average).
+
+**Fundamental signals (3):** trailing P/E ratio, revenue growth, short interest
+percentage. Fetched from yfinance with a 24-hour cache.
+
+**Regime features (4):** one-hot encoded market regime (calm bull / trending /
+choppy / risk-off) derived from SPY realised volatility and cross-sectional
+return dispersion.
 
 All features are cross-sectionally z-scored against the full universe each
 day, so a value of +1.5 means that stock is 1.5 standard deviations above
@@ -115,28 +122,43 @@ After step 3, just run `python Broker.py` every morning. Everything else is auto
 Edit `broker.config` once. These become your defaults every run — no flags needed.
 
 ```
-cash           = 10000    # starting cash (first run only — ignored after that)
-max_positions  = 10       # focused portfolio — 10 names on $10k is enough
-stop_loss      = 0.08     # ATR-adjusted upward per stock; 8% floor avoids noise clips
-take_profit    = 0.35     # full exit — realistic for a daily-checked system
-partial_profit = 0.15     # take half off at +15%, let rest run to take_profit
-min_score      = 0.58     # high enough to filter mediocre setups
-penny_pct      = 0.03     # minimal speculative exposure until system is proven
-max_sector     = 0.25     # prevents correlated sector drawdowns
-avoid_earnings = 5        # earnings risk starts well before the report date
-top_n          = 500      # sufficient universe for a $10k daily broker
-max_daily_loss = 0.025    # tighter during paper trading — 2.5% daily halt
-max_drawdown   = 0.12     # tighter during paper trading — 12% circuit breaker
-no_options     = true     # disabled until stock-side edge is proven in paper trading
+universe_mode  = sp500     # strict S&P 500 membership enforced end-to-end
+                           # options: sp500, sp1500, tradable_us, custom
+cash           = 10000     # starting cash (first run only — ignored after that)
+max_positions  = 20        # more positions = more capital deployed
+stop_loss      = 0.115     # ATR-adjusted per stock; 8% floor avoids noise clips
+take_profit    = 1.000     # disable hard cap; trailing exits manage the rest
+partial_profit = 0.350     # trim at +35%, let leaders compound
+trailing_stop  = 0.120     # exit a winner after it gives back 12% from peak
+trailing_activation = 0.180 # start trailing once position has 18% cushion
+min_score      = 0.58      # heuristic entry floor (RL path uses rl_min_score)
+penny_pct      = 0.03      # minimal speculative exposure
+max_sector     = 0.400     # hard cap per sector
+max_correlation = 0.80     # blocks adding names too correlated with held positions
+avoid_earnings = 4         # skip stocks within N days of earnings
+top_n          = 500       # fallback only; universe_mode controls actual membership
+max_daily_loss = 0.025     # 2.5% daily halt
+max_drawdown   = 0.12      # 12% circuit breaker
+no_options     = true      # disabled until stock-side edge is proven
 
-# RL integration (opt-in — defaults to heuristic mode)
-rl_enabled            = false              # set true to activate RL ranking
-rl_checkpoint_path    = auto               # auto = use best available checkpoint in models/
-rl_phase              = 1                  # 1=ranking, 2=ranking+exits, 3=weights (future)
-rl_exit_threshold     = 0.30              # Phase 2: sell if rl_score drops below this
-rl_conviction_drop    = 0.20              # Phase 2: sell 50% if score drops by this much
-rl_min_score          = 0.0               # Phase 1: min rl_score to enter (0 = top-k only)
+# Freshness gates — block new entries when data quality degrades
+min_fresh_price_coverage    = 0.90   # require 90% of universe to have today's prices
+min_fresh_sentiment_coverage = 0.50  # require 50% sentiment coverage on latest slice
+
+# RL integration
+rl_enabled            = true   # activate RL ranking
+rl_checkpoint_path    = auto   # auto = best checkpoint by val_sharpe
+rl_phase              = 1      # 1=ranking, 2=ranking+exits
+rl_exit_threshold     = 0.150  # Phase 2: sell if rank_pct drops below this
+rl_conviction_drop    = 0.250  # Phase 2: sell 50% if rank_pct drops by this much
+rl_min_score          = 0.0    # Phase 1: min rl_score to enter (0 = top-k only)
 ```
+
+**Important operational notes:**
+- `universe_mode = sp500` enforces strict S&P 500 membership end-to-end — no parquet tickers, watchlist names, or Finviz discoveries can enter the tradable universe
+- New entries are blocked automatically when `fresh_price_coverage` or `fresh_sentiment_coverage` fall below their thresholds — the broker continues exits and holds but makes no new buys
+- If the benchmark (SPY) is unavailable, relative metrics are omitted from the report but trading continues normally
+- `rl_checkpoint_path = auto` always picks the checkpoint with the highest validation Sharpe, not the most recently trained one
 
 ---
 
@@ -397,8 +419,19 @@ python Agent.py --mode replay --replay_years 5     # use 5 years of history
 python Agent.py --mode replay --sensitivity        # also run sensitivity sweep
 ```
 
-The sensitivity sweep runs the replay across 13 parameter combinations to
+The sensitivity sweep runs the replay across parameter combinations to
 test whether results are robust or collapse under parameter changes.
+
+**Replay determinism:** replay uses the same universe resolver as the live
+broker. For reproducible results, set `freeze_universe_snapshot = true` and
+`universe_snapshot_path = broker/state/universe_snapshot.json` in
+`broker.config` — this freezes the tradable universe to a dated snapshot so
+re-running the same replay always uses the same ticker set.
+
+**Friction sensitivity:** the replay reports results under three execution-cost
+regimes (optimistic / base / stressed). If the stressed Sharpe drops more than
+0.3 below the base Sharpe, a warning is logged — the strategy may be sensitive
+to cost assumptions. Run `run_friction_report()` directly for a full breakdown.
 
 ### RL ablation study
 ```bash
