@@ -10,6 +10,7 @@ from pipeline.benchmark import (
     benchmark_vs_spy,
     compute_trade_friction_metrics,
     compute_metrics,
+    fetch_spy_benchmark_data,
     fetch_spy_returns,
     plot_benchmark,
     print_benchmark_report,
@@ -112,6 +113,41 @@ def test_fetch_spy_returns_falls_back_to_local_parquet(monkeypatch):
 
         assert rets.index.tolist() == [pd.Timestamp("2024-01-02")]
         assert np.isclose(float(rets.iloc[0]), 0.10)
+    finally:
+        if parquet_path.exists():
+            parquet_path.unlink()
+
+
+def test_fetch_spy_benchmark_data_reports_local_fallback_status(monkeypatch):
+    fake_yf = types.SimpleNamespace(
+        download=lambda *args, **kwargs: pd.DataFrame(),
+        Ticker=lambda symbol: types.SimpleNamespace(
+            history=lambda *args, **kwargs: pd.DataFrame()
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "yfinance", fake_yf)
+
+    parquet_path = Path("tests") / "_local_spy_fallback_status.parquet"
+    try:
+        local_panel = pd.DataFrame(
+            {
+                "ticker": ["SPY", "SPY"],
+                "close": [100.0, 110.0],
+            },
+            index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
+        )
+        local_panel.index.name = "date"
+        local_panel.to_parquet(parquet_path)
+
+        bundle = fetch_spy_benchmark_data(
+            start="2024-01-01",
+            end="2024-01-03",
+            parquet_path=str(parquet_path),
+        )
+
+        assert bundle["status"] == "local_fallback"
+        assert bundle["source"] == "local_parquet"
+        assert len(bundle["returns"]) == 1
     finally:
         if parquet_path.exists():
             parquet_path.unlink()

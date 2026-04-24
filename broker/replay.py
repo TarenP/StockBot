@@ -29,6 +29,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from broker.portfolio import CASH_YIELD_ANNUAL_RATE, DAYS_PER_YEAR
+from pipeline.run_manifest import hash_config, hash_ticker_list, write_run_manifest
 
 logger = logging.getLogger(__name__)
 _REPLAY_MIN_PRICE = 0.01
@@ -1083,6 +1084,7 @@ def run_full_replay(
     from pipeline.benchmark import (
         align_return_series,
         compute_trade_friction_metrics,
+        fetch_spy_benchmark_data,
         fetch_spy_returns,
         plot_benchmark,
         print_benchmark_report,
@@ -1122,10 +1124,22 @@ def run_full_replay(
     )
 
     # Fetch SPY for same period
-    spy_series = fetch_spy_returns(
+    benchmark_bundle = fetch_spy_benchmark_data(
         start=(replay_dates[0] - pd.Timedelta(days=5)).strftime("%Y-%m-%d"),
         end=(replay_dates[-1] + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
     )
+    spy_series = benchmark_bundle["returns"]
+    if getattr(spy_series, "empty", True):
+        spy_series = fetch_spy_returns(
+            start=(replay_dates[0] - pd.Timedelta(days=5)).strftime("%Y-%m-%d"),
+            end=(replay_dates[-1] + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
+        )
+        if spy_series is not None and len(spy_series) > 0:
+            benchmark_bundle = {
+                "returns": spy_series,
+                "status": "present",
+                "source": "compat_fetch_spy_returns",
+            }
 
     # Equal-weight baseline (buy-and-hold all tickers equally)
     logger.info("Computing equal-weight baseline...")
@@ -1149,12 +1163,21 @@ def run_full_replay(
         logger.warning("SPY benchmark unavailable for this replay run; skipping relative comparisons.")
 
     # Print report
-    print_benchmark_report(
-        broker_aligned,
-        spy_rets,
-        ew_rets=ew_aligned,
-        label="Broker Replay",
-    )
+    try:
+        print_benchmark_report(
+            broker_aligned,
+            spy_rets,
+            ew_rets=ew_aligned,
+            label="Broker Replay",
+            benchmark_status=str(benchmark_bundle.get("status", "unknown")),
+        )
+    except TypeError:
+        print_benchmark_report(
+            broker_aligned,
+            spy_rets,
+            ew_rets=ew_aligned,
+            label="Broker Replay",
+        )
     friction = compute_trade_friction_metrics(
         trade_log,
         broker_aligned,
@@ -1254,6 +1277,35 @@ def run_full_replay(
                 f"ROBUST: Sharpe std across parameter grid = {sharpes.std():.2f}. "
                 "Results appear stable."
             )
+
+    try:
+        manifest_path = Path(save_plot).with_name(f"{Path(save_plot).stem}_manifest.json")
+        payload = {
+            "mode": "replay",
+            "config_hash": hash_config(live_config or {}),
+            "checkpoint_path": checkpoint_path,
+            "resolved_universe_size": int(df_replay.index.get_level_values("ticker").nunique()),
+            "resolved_universe_hash": hash_ticker_list(
+                df_replay.index.get_level_values("ticker").unique().tolist()
+            ),
+            "replay_window": {
+                "start": replay_dates[0].date().isoformat(),
+                "end": replay_dates[-1].date().isoformat(),
+                "years": replay_years,
+                "trading_days": len(replay_dates),
+            },
+            "benchmark": {
+                "status": benchmark_bundle.get("status"),
+                "source": benchmark_bundle.get("source"),
+                "available": spy_rets is not None,
+                "aligned_observations": int(len(spy_rets)) if spy_rets is not None else 0,
+            },
+            "friction": friction,
+        }
+        write_run_manifest("replay", payload, output_path=manifest_path)
+        logger.info("Replay run manifest saved -> %s", manifest_path)
+    except Exception as exc:
+        logger.warning("Could not save replay run manifest: %s", exc)
 
     return broker_rets, trade_log
 

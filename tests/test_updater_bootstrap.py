@@ -210,3 +210,75 @@ def test_update_parquet_keeps_benchmark_symbol_in_price_universe(monkeypatch):
         assert {"AAA", "BBB"} <= set(calls["tickers"])
     finally:
         parquet_path.unlink(missing_ok=True)
+
+
+def test_get_live_universe_can_freeze_to_snapshot(monkeypatch):
+    snapshot_path = _workspace_csv_path("test_universe_snapshot").with_suffix(".json")
+
+    try:
+        monkeypatch.setattr(updater, "_load_trained_universe", lambda save_dir="models": ["AAA", "BBB"])
+        monkeypatch.setattr(updater, "_load_parquet_universe", lambda max_stale_days=30: ["CCC"])
+        monkeypatch.setattr(updater, "_bootstrap_universe", lambda target_size=1500: ["DDD"])
+
+        resolved = updater.get_live_universe(
+            save_dir="models",
+            config={
+                "universe_mode": "tradable_us",
+                "freeze_universe_snapshot": True,
+                "universe_snapshot_path": str(snapshot_path),
+                "min_broad_universe_size": 2,
+            },
+        )
+
+        assert resolved[:3] == ["AAA", "BBB", "CCC"]
+        assert snapshot_path.exists()
+
+        monkeypatch.setattr(updater, "_load_trained_universe", lambda save_dir="models": ["ZZZ"])
+        frozen = updater.get_live_universe(
+            save_dir="models",
+            config={
+                "universe_mode": "tradable_us",
+                "freeze_universe_snapshot": True,
+                "universe_snapshot_path": str(snapshot_path),
+                "min_broad_universe_size": 2,
+            },
+        )
+
+        assert frozen == resolved
+    finally:
+        snapshot_path.unlink(missing_ok=True)
+
+
+def test_get_live_universe_excludes_watchlist_by_default(monkeypatch):
+    monkeypatch.setattr(updater, "_load_trained_universe", lambda save_dir="models": ["AAA"])
+    monkeypatch.setattr(updater, "_load_parquet_universe", lambda max_stale_days=30: ["BBB"])
+    monkeypatch.setattr(updater, "_load_watchlist_universe", lambda: ["WATCH"])
+    monkeypatch.setattr(updater, "_bootstrap_universe", lambda target_size=1500: [])
+
+    resolved = updater.get_live_universe(
+        save_dir="models",
+        config={
+            "universe_mode": "tradable_us",
+            "min_broad_universe_size": 2,
+        },
+    )
+
+    assert "WATCH" not in resolved
+
+
+def test_get_live_universe_can_include_watchlist_when_enabled(monkeypatch):
+    monkeypatch.setattr(updater, "_load_trained_universe", lambda save_dir="models": ["AAA"])
+    monkeypatch.setattr(updater, "_load_parquet_universe", lambda max_stale_days=30: ["BBB"])
+    monkeypatch.setattr(updater, "_load_watchlist_universe", lambda: ["WATCH"])
+    monkeypatch.setattr(updater, "_bootstrap_universe", lambda target_size=1500: [])
+
+    resolved = updater.get_live_universe(
+        save_dir="models",
+        config={
+            "universe_mode": "tradable_us",
+            "include_watchlist_in_universe": True,
+            "min_broad_universe_size": 3,
+        },
+    )
+
+    assert "WATCH" in resolved

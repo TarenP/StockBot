@@ -263,6 +263,90 @@ def test_run_cycle_uses_resolved_universe_for_refreshes(monkeypatch):
     assert captured["sentiment_universe"] == ["AAA", "BBB"]
 
 
+def test_run_cycle_emits_live_manifest(monkeypatch):
+    captured = {}
+    loaded_df = pd.DataFrame(
+        {"sent_net": [0.1, 0.2]},
+        index=pd.MultiIndex.from_tuples(
+            [
+                (pd.Timestamp("2026-04-15"), "AAA"),
+                (pd.Timestamp("2026-04-15"), "BBB"),
+            ],
+            names=["date", "ticker"],
+        ),
+    )
+
+    monkeypatch.setattr(broker_module, "_is_market_hours", lambda: True)
+    monkeypatch.setattr(broker_module, "_resolve_cycle_universe", lambda **kwargs: ["AAA", "BBB"])
+    monkeypatch.setattr(updater_module, "update_parquet", lambda **kwargs: 0)
+    monkeypatch.setattr(sentiment_module, "update_sentiment", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(data_module, "load_master", lambda **kwargs: loaded_df)
+    monkeypatch.setattr(broker_module, "log_cycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(broker_module, "daily_integrity_check", lambda portfolio: {})
+    monkeypatch.setattr(broker_module, "_fetch_current_spy_price", lambda: None)
+    monkeypatch.setattr(journal_module, "plot_live_performance", lambda *args, **kwargs: None)
+    monkeypatch.setattr(briefing_module, "print_daily_briefing", lambda *args, **kwargs: None)
+
+    def _fake_write(kind, payload, output_path=None):
+        captured["kind"] = kind
+        captured["payload"] = payload
+        captured["output_path"] = output_path
+        return Path(output_path)
+
+    monkeypatch.setattr(broker_module, "write_run_manifest", _fake_write)
+
+    broker_module.run_cycle(
+        portfolio=_DummyPortfolio(),
+        brain=_DummyBrain(),
+        risk=_DummyRisk(),
+    )
+
+    assert captured["kind"] == "live_cycle"
+    assert captured["payload"]["resolved_universe_size"] == 2
+    assert captured["payload"]["freshness"]["fresh_price_coverage"] == 1.0
+
+
+def test_run_cycle_blocks_new_entries_when_freshness_gate_fails(monkeypatch):
+    loaded_df = pd.DataFrame(
+        {"sent_net": [0.1]},
+        index=pd.MultiIndex.from_tuples(
+            [(pd.Timestamp("2026-04-15"), "AAA")],
+            names=["date", "ticker"],
+        ),
+    )
+    calls = {}
+
+    class _GateBrain(_DummyBrain):
+        def run_cycle(self, df, screener_top_n=50, risk_engine=None):
+            calls["min_score_during_cycle"] = self.min_score
+            return []
+
+    brain = _GateBrain()
+    portfolio = _DummyPortfolio()
+    portfolio.positions = {"STALE": {"shares": 1.0, "avg_cost": 100.0, "last_price": 100.0}}
+
+    monkeypatch.setattr(broker_module, "_is_market_hours", lambda: True)
+    monkeypatch.setattr(broker_module, "_resolve_cycle_universe", lambda **kwargs: ["AAA", "BBB"])
+    monkeypatch.setattr(updater_module, "update_parquet", lambda **kwargs: 0)
+    monkeypatch.setattr(sentiment_module, "update_sentiment", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(data_module, "load_master", lambda **kwargs: loaded_df)
+    monkeypatch.setattr(broker_module, "log_cycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(broker_module, "daily_integrity_check", lambda portfolio: {})
+    monkeypatch.setattr(broker_module, "_fetch_current_spy_price", lambda: None)
+    monkeypatch.setattr(journal_module, "plot_live_performance", lambda *args, **kwargs: None)
+    monkeypatch.setattr(briefing_module, "print_daily_briefing", lambda *args, **kwargs: None)
+    monkeypatch.setattr(broker_module, "write_run_manifest", lambda *args, **kwargs: Path("broker/state/last_live_manifest.json"))
+
+    broker_module.run_cycle(
+        portfolio=portfolio,
+        brain=brain,
+        risk=_DummyRisk(),
+        config={"min_fresh_price_coverage": 0.9, "min_fresh_sentiment_coverage": 0.5},
+    )
+
+    assert calls["min_score_during_cycle"] == 999.0
+
+
 def test_portfolio_summary_always_includes_stock_holdings_section():
     class _EmptyOptions:
         positions = {}

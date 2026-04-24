@@ -8,6 +8,7 @@ import time
 import logging
 import os
 import sys
+import json
 import requests
 from contextlib import contextmanager
 from pathlib import Path
@@ -347,6 +348,39 @@ def _load_watchlist_universe() -> list[str]:
     return _clean_tickers(df["ticker"].dropna().tolist())
 
 
+def _load_universe_snapshot(path: str | Path) -> list[str]:
+    snapshot_path = Path(path)
+    if not snapshot_path.exists():
+        return []
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Could not read universe snapshot %s: %s", snapshot_path, exc)
+        return []
+
+    tickers = payload.get("tickers", []) if isinstance(payload, dict) else payload
+    return _clean_tickers(tickers)
+
+
+def _write_universe_snapshot(
+    path: str | Path,
+    *,
+    mode: str,
+    tickers: list[str],
+    metadata: dict | None = None,
+) -> None:
+    snapshot_path = Path(path)
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "mode": mode,
+        "count": len(tickers),
+        "tickers": list(tickers),
+    }
+    if metadata:
+        payload["metadata"] = metadata
+    snapshot_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def get_live_universe(
     preferred: list[str] | None = None,
     save_dir: str = "models",
@@ -354,6 +388,7 @@ def get_live_universe(
     config: dict | None = None,
     mode: str | None = None,
     as_of_date=None,
+    return_metadata: bool = False,
 ) -> list[str]:
     """
     Resolve the configured live ticker universe.
@@ -364,6 +399,15 @@ def get_live_universe(
     """
     cfg = config if config is not None else load_typed_config()
     resolved_mode = (mode or get_universe_mode(cfg)).strip().lower()
+    metadata = {
+        "mode": resolved_mode,
+        "as_of_date": str(pd.Timestamp(as_of_date).date()) if as_of_date is not None else None,
+        "source_counts": {},
+        "watchlist_included": False,
+        "snapshot_path": str(cfg.get("universe_snapshot_path", "") or ""),
+        "used_snapshot": False,
+        "min_universe_size": int(cfg.get("min_broad_universe_size", 1000)),
+    }
 
     if is_benchmark_constrained_mode(resolved_mode):
         resolved = resolve_configured_universe(
@@ -383,7 +427,7 @@ def get_live_universe(
                 len(resolved),
                 resolved_mode,
             )
-            return resolved
+            return (resolved, metadata) if return_metadata else resolved
 
         preferred_set = set(preferred_tickers)
         ordered = preferred_tickers + [ticker for ticker in resolved if ticker not in preferred_set]
@@ -393,13 +437,17 @@ def get_live_universe(
             resolved_mode,
             len(preferred_tickers),
         )
-        return ordered
+        return (ordered, metadata) if return_metadata else ordered
 
     broad_target = int(
         target_size
         or cfg.get("live_target_size")
         or max(int(cfg.get("top_n", 500)) * 3, 1000)
     )
+    freeze_snapshot = bool(cfg.get("freeze_universe_snapshot", False))
+    snapshot_path = str(cfg.get("universe_snapshot_path", "") or "").strip()
+    include_watchlist = bool(cfg.get("include_watchlist_in_universe", False))
+    min_universe_size = int(cfg.get("min_broad_universe_size", 1000))
     filters = get_investable_universe_filters(cfg)
     candidates: list[str] = []
     seen: set[str] = set()
@@ -407,25 +455,74 @@ def get_live_universe(
     def _extend(symbols) -> None:
         _extend_unique_tickers(candidates, seen, symbols)
 
-    _extend(preferred)
-    _extend(_load_trained_universe(save_dir))
-    _extend(_load_parquet_universe(max_stale_days=int(filters["max_stale_days"])))
-    _extend(_load_watchlist_universe())
+    if freeze_snapshot and snapshot_path:
+        snapshot_tickers = _load_universe_snapshot(snapshot_path)
+        if snapshot_tickers:
+            metadata["used_snapshot"] = True
+            metadata["source_counts"]["snapshot"] = len(snapshot_tickers)
+            filtered_snapshot = filter_candidate_tickers(snapshot_tickers, config=cfg)
+            if broad_target > 0:
+                filtered_snapshot = filtered_snapshot[:broad_target]
+            logger.info(
+                "Resolved live universe from snapshot: %d tickers (mode=%s, path=%s)",
+                len(filtered_snapshot),
+                resolved_mode,
+                snapshot_path,
+            )
+            if len(filtered_snapshot) < min_universe_size:
+                raise ValueError(
+                    f"Resolved broad universe too small from snapshot: {len(filtered_snapshot)} < {min_universe_size}"
+                )
+            return (filtered_snapshot, metadata) if return_metadata else filtered_snapshot
+
+    preferred_clean = _clean_tickers(preferred)
+    trained = _load_trained_universe(save_dir)
+    parquet = _load_parquet_universe(max_stale_days=int(filters["max_stale_days"]))
+    watchlist = _load_watchlist_universe() if include_watchlist else []
+
+    _extend(preferred_clean)
+    _extend(trained)
+    _extend(parquet)
+    _extend(watchlist)
     if len(candidates) < broad_target:
-        _extend(_bootstrap_universe(broad_target))
+        bootstrap = _bootstrap_universe(broad_target)
+        _extend(bootstrap)
+        metadata["source_counts"]["bootstrap"] = len(_clean_tickers(bootstrap))
+    else:
+        bootstrap = []
+
+    metadata["source_counts"]["preferred"] = len(preferred_clean)
+    metadata["source_counts"]["trained"] = len(_clean_tickers(trained))
+    metadata["source_counts"]["parquet_recent"] = len(_clean_tickers(parquet))
+    metadata["source_counts"]["watchlist"] = len(_clean_tickers(watchlist))
+    metadata["watchlist_included"] = include_watchlist
 
     filtered = filter_candidate_tickers(candidates, config=cfg)
     if broad_target > 0:
         filtered = filtered[:broad_target]
 
+    if len(filtered) < min_universe_size:
+        raise ValueError(
+            f"Resolved broad universe too small: {len(filtered)} < {min_universe_size}"
+        )
+
+    if snapshot_path:
+        _write_universe_snapshot(
+            snapshot_path,
+            mode=resolved_mode,
+            tickers=filtered,
+            metadata=metadata,
+        )
+
     logger.info(
-        "Resolved live universe: %d tickers (mode=%s, target=%d, preferred=%d)",
+        "Resolved live universe: %d tickers (mode=%s, target=%d, preferred=%d, watchlist=%s)",
         len(filtered),
         resolved_mode,
         broad_target,
         len(_clean_tickers(preferred)),
+        include_watchlist,
     )
-    return filtered
+    return (filtered, metadata) if return_metadata else filtered
 
 
 def _prune_to_allowed_universe(

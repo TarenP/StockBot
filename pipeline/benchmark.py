@@ -99,6 +99,24 @@ def fetch_spy_returns(
     """
     Fetch SPY daily returns from yfinance.
     """
+    return fetch_spy_benchmark_data(
+        start=start,
+        end=end,
+        n_days=n_days,
+        parquet_path=parquet_path,
+    )["returns"]
+
+
+def fetch_spy_benchmark_data(
+    start: str | None = None,
+    end: str | None = None,
+    n_days: int | None = None,
+    parquet_path: str = "MasterDS/stooq_panel.parquet",
+) -> dict[str, object]:
+    """
+    Fetch SPY benchmark data and report whether it came from network,
+    local fallback, or was unavailable.
+    """
     import yfinance as yf
 
     if n_days and not start:
@@ -113,16 +131,32 @@ def fetch_spy_returns(
                 raw = yf.Ticker("SPY").history(start=start, end=end, auto_adjust=True)
         if raw.empty:
             logger.warning("Could not fetch SPY data from yfinance. Falling back to local parquet.")
-            return _load_local_symbol_returns("SPY", start=start, end=end, parquet_path=parquet_path)
+            local = _load_local_symbol_returns("SPY", start=start, end=end, parquet_path=parquet_path)
+            status = "local_fallback" if not local.empty else "unavailable"
+            return {
+                "returns": local,
+                "status": status,
+                "source": "local_parquet" if status == "local_fallback" else "unavailable",
+            }
 
         rets = raw["Close"].pct_change().dropna()
         if isinstance(rets, pd.DataFrame):
             rets = rets.iloc[:, 0]
         rets.index = pd.to_datetime(rets.index).normalize()
-        return rets
+        return {
+            "returns": rets,
+            "status": "present",
+            "source": "yfinance",
+        }
     except Exception as exc:
         logger.warning("SPY fetch failed: %s", exc)
-        return _load_local_symbol_returns("SPY", start=start, end=end, parquet_path=parquet_path)
+        local = _load_local_symbol_returns("SPY", start=start, end=end, parquet_path=parquet_path)
+        status = "local_fallback" if not local.empty else "unavailable"
+        return {
+            "returns": local,
+            "status": status,
+            "source": "local_parquet" if status == "local_fallback" else "unavailable",
+        }
 
 
 def _load_local_symbol_returns(
@@ -527,6 +561,7 @@ def print_benchmark_report(
     spy_rets: np.ndarray | None,
     ew_rets: np.ndarray | None = None,
     label: str = "Strategy",
+    benchmark_status: str | None = None,
 ):
     """Print a benchmark comparison table."""
     min_obs = MIN_HISTORY_FOR_STABLE_METRICS
@@ -584,6 +619,8 @@ def print_benchmark_report(
     print(_console_safe(f"\n{'='*72}"))
     print(_console_safe(f"  Benchmark Report - {label} vs SPY"))
     print(_console_safe(f"{'='*72}"))
+    if benchmark_status:
+        print(_console_safe(f"  Benchmark status: {benchmark_status}"))
     header = f"  {'Metric':<22}"
     for col in cols:
         header += f" {col:>14}"

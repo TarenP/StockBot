@@ -45,6 +45,12 @@ from broker.journal   import (
     daily_integrity_check, _fetch_current_spy_price,
 )
 from pipeline.checkpoints import resolve_checkpoint_path
+from pipeline.run_manifest import (
+    hash_config,
+    hash_ticker_list,
+    summarize_price_sentiment_freshness,
+    write_run_manifest,
+)
 from pipeline.universe_resolver import get_investable_universe_filters
 from pipeline.universe_resolver import load_typed_config
 
@@ -118,6 +124,10 @@ def run_cycle(
     maintenance_context: dict | None = None,
     config: dict | None = None,
 ):
+    run_manifest: dict[str, object] = {
+        "mode": "live",
+        "config_hash": hash_config(config or {}),
+    }
     now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
     logger.info(f"{'='*55}")
     logger.info(f"Broker cycle | {now_et} | Equity: ${portfolio.equity:,.2f}")
@@ -186,6 +196,9 @@ def run_cycle(
     try:
         from pipeline.data import load_master
         investable_filters = get_investable_universe_filters(config)
+        cycle_universe = _resolve_cycle_universe(config=config, save_dir="models")
+        run_manifest["resolved_universe_size"] = len(cycle_universe)
+        run_manifest["resolved_universe_hash"] = hash_ticker_list(cycle_universe)
         df = load_master(
             top_n=top_n,
             min_history_days=int(investable_filters["min_history_days"]),
@@ -199,6 +212,33 @@ def run_cycle(
         logger.error(f"Failed to load data: {e}")
         brain.min_score = brain._base_min_score
         return
+    freshness = summarize_price_sentiment_freshness(df, positions=portfolio.positions)
+    run_manifest["freshness"] = freshness
+    cfg = config or {}
+    min_price_coverage = float(cfg.get("min_fresh_price_coverage", 0.90))
+    min_sentiment_coverage = float(cfg.get("min_fresh_sentiment_coverage", 0.50))
+    freshness_gate_failed = (
+        freshness["fresh_price_coverage"] < min_price_coverage
+        or freshness["stale_holdings_count"] > 0
+        or (
+            "sent_net" in df.columns
+            and freshness["fresh_sentiment_coverage"] < min_sentiment_coverage
+        )
+    )
+    run_manifest["freshness_gate"] = {
+        "passed": not freshness_gate_failed,
+        "min_fresh_price_coverage": min_price_coverage,
+        "min_fresh_sentiment_coverage": min_sentiment_coverage,
+    }
+    if freshness_gate_failed:
+        logger.warning(
+            "Freshness gate triggered: price_coverage=%.2f sentiment_coverage=%.2f stale_holdings=%d. "
+            "Blocking new entries for this cycle.",
+            float(freshness["fresh_price_coverage"]),
+            float(freshness["fresh_sentiment_coverage"]),
+            int(freshness["stale_holdings_count"]),
+        )
+        brain.min_score = 999.0
     if hasattr(risk, "set_market_regime"):
         risk.set_market_regime(brain._current_market_regime(df))
     risk.start_session(portfolio.equity)
@@ -297,6 +337,16 @@ def run_cycle(
         plot_live_performance("plots/live_performance.png")
     except Exception:
         pass
+
+    try:
+        manifest_path = write_run_manifest(
+            "live_cycle",
+            run_manifest,
+            output_path=Path("broker/state") / "last_live_manifest.json",
+        )
+        logger.info("Live run manifest saved -> %s", manifest_path)
+    except Exception as exc:
+        logger.warning("Could not save live run manifest: %s", exc)
 
     # ── Daily briefing — the primary human-facing output ──────────────────────
     from broker.briefing import print_daily_briefing
