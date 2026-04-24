@@ -796,6 +796,7 @@ def run_screen(args):
 def run_replay_mode(args):
     from broker.replay import run_full_replay
     from broker.broker import _resolve_checkpoint
+    from pathlib import Path as _Path
 
     replay_universe_as_of = None
     latest_price_date = _latest_price_panel_date()
@@ -811,14 +812,31 @@ def run_replay_mode(args):
         universe_as_of_date=replay_universe_as_of,
     )
     live_config = _load_typed_config()
+
+    # P1: Auto-enable universe snapshot for replay determinism unless explicitly disabled.
+    # This ensures re-running the same replay always uses the same ticker set.
+    replay_config = dict(live_config)
+    if not replay_config.get("freeze_universe_snapshot", False):
+        snapshot_path = str(replay_config.get(
+            "universe_snapshot_path",
+            "plots/live_universe_snapshot.json",
+        ))
+        replay_config["freeze_universe_snapshot"] = True
+        replay_config["universe_snapshot_path"] = snapshot_path
+        logger.info(
+            "Replay: auto-enabled universe snapshot for determinism -> %s. "
+            "Set freeze_universe_snapshot = true in broker.config to make this permanent.",
+            snapshot_path,
+        )
+
     run_full_replay(
         df_features          = df,
-        initial_cash         = float(live_config.get("cash", 10_000.0)),
+        initial_cash         = float(replay_config.get("cash", 10_000.0)),
         replay_years         = args.replay_years,
         run_sensitivity_sweep= args.sensitivity,
         save_plot            = "plots/replay.png",
-        live_config          = live_config,
-        checkpoint_path      = _resolve_checkpoint(live_config.get("rl_checkpoint_path")),
+        live_config          = replay_config,
+        checkpoint_path      = _resolve_checkpoint(replay_config.get("rl_checkpoint_path")),
     )
 
 

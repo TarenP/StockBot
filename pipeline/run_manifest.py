@@ -22,20 +22,27 @@ REQUIRED_MANIFEST_FIELDS: dict[str, list[str]] = {
     "live_cycle": [
         "mode",
         "config_hash",
+        "code_version",
         "resolved_universe_size",
         "resolved_universe_hash",
         "freshness",
         "freshness_gate",
+        "benchmark_status",
+        "snapshot_path",
+        "watchlist_included",
     ],
     "replay": [
         "mode",
         "config_hash",
+        "code_version",
         "checkpoint_path",
         "resolved_universe_size",
         "resolved_universe_hash",
         "replay_window",
         "benchmark",
         "friction",
+        "snapshot_path",
+        "watchlist_included",
     ],
 }
 

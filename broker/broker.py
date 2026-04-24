@@ -129,6 +129,9 @@ def run_cycle(
         "mode": "live",
         "config_hash": hash_config(config or {}),
         "code_version": get_code_version(),
+        "snapshot_path": str((config or {}).get("universe_snapshot_path", "")),
+        "watchlist_included": bool((config or {}).get("include_watchlist_in_universe", False)),
+        "benchmark_status": {"symbol": "SPY", "available": None},  # updated after data load
     }
     now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
     logger.info(f"{'='*55}")

@@ -933,7 +933,90 @@ def _run_replay_v2(
             _LAST_REPLAY_SCORE_AUDIT = pd.DataFrame()
 
     daily_returns = np.diff(equity_curve) / (np.array(equity_curve[:-1]) + 1e-9)
+
+    # ── P9: Replay invariant checks ───────────────────────────────────────────
+    _check_replay_invariants(trade_log, dates)
+
     return daily_returns, trade_log
+
+
+def _check_replay_invariants(trade_log: list, dates: list) -> dict[str, bool]:
+    """
+    Assert post-hoc invariants on a completed replay.
+
+    Returns a dict of {invariant_name: passed} and logs warnings for failures.
+    These are "trust but verify" checks — they catch impossible states that
+    indicate bugs in the replay logic.
+    """
+    results: dict[str, bool] = {}
+    date_set = {pd.Timestamp(d) for d in dates}
+
+    # 1. No fill date before signal date
+    fill_before_signal = [
+        t for t in trade_log
+        if t.get("fill_date") and t.get("decision_date")
+        and pd.Timestamp(t["fill_date"]) < pd.Timestamp(t["decision_date"])
+    ]
+    results["no_fill_before_signal"] = len(fill_before_signal) == 0
+    if fill_before_signal:
+        logger.warning(
+            "INVARIANT FAIL: %d trade(s) have fill_date before decision_date (lookahead): %s",
+            len(fill_before_signal),
+            [t["ticker"] for t in fill_before_signal[:3]],
+        )
+
+    # 2. No fill date outside the replay date range
+    out_of_range = [
+        t for t in trade_log
+        if t.get("fill_date") and pd.Timestamp(t["fill_date"]) not in date_set
+    ]
+    results["fills_within_replay_dates"] = len(out_of_range) == 0
+    if out_of_range:
+        logger.warning(
+            "INVARIANT FAIL: %d trade(s) filled on dates outside the replay window.",
+            len(out_of_range),
+        )
+
+    # 3. No negative share counts in trade log
+    negative_shares = [t for t in trade_log if float(t.get("shares", 0)) < 0]
+    results["no_negative_shares"] = len(negative_shares) == 0
+    if negative_shares:
+        logger.warning(
+            "INVARIANT FAIL: %d trade(s) have negative share counts.",
+            len(negative_shares),
+        )
+
+    # 4. No zero-price fills
+    zero_price = [t for t in trade_log if float(t.get("price", 1)) <= 0]
+    results["no_zero_price_fills"] = len(zero_price) == 0
+    if zero_price:
+        logger.warning(
+            "INVARIANT FAIL: %d trade(s) filled at zero or negative price.",
+            len(zero_price),
+        )
+
+    # 5. All actions are known types
+    known_actions = {"BUY", "SELL", "SELL_PARTIAL"}
+    unknown_actions = [t for t in trade_log if t.get("action") not in known_actions]
+    results["all_actions_known"] = len(unknown_actions) == 0
+    if unknown_actions:
+        logger.warning(
+            "INVARIANT FAIL: %d trade(s) have unknown action types: %s",
+            len(unknown_actions),
+            list({t.get("action") for t in unknown_actions}),
+        )
+
+    passed = sum(results.values())
+    total = len(results)
+    if passed == total:
+        logger.info("Replay invariants: all %d checks passed.", total)
+    else:
+        logger.warning(
+            "Replay invariants: %d/%d checks passed. See warnings above.",
+            passed, total,
+        )
+
+    return results
 
 
 run_replay = _run_replay_v2
@@ -1267,6 +1350,33 @@ def run_full_replay(
     spy_total_return = float(np.prod(1.0 + spy_rets) - 1.0) if spy_rets is not None else None
     print_trade_friction_report(friction, spy_total_return=spy_total_return)
 
+    # ── Friction regime summary (P6: always-on) ───────────────────────────────
+    try:
+        friction_df = run_friction_report(
+            df_replay,
+            price_lookup,
+            initial_cash=initial_cash,
+            live_config=live_config,
+            strategy=strategy,
+            checkpoint_path=checkpoint_path,
+        )
+        print(f"\n{'='*72}")
+        print("  Friction Sensitivity (optimistic / base / stressed execution cost)")
+        print(f"{'='*72}")
+        print(f"  {'Regime':<12} {'Spread':>8}  {'Return':>8}  {'Sharpe':>8}  {'MaxDD':>8}")
+        print(f"  {'-'*52}")
+        for _, row in friction_df.iterrows():
+            print(
+                f"  {row['regime']:<12} {row['execution_spread']:>7.2%}  "
+                f"{row['total_return']:>7.2%}  {row['sharpe']:>8.3f}  "
+                f"{row['max_drawdown']:>7.2%}"
+            )
+        print(f"{'='*72}\n")
+        # Store in manifest
+        friction["regime_sensitivity"] = friction_df.to_dict(orient="records")
+    except Exception as exc:
+        logger.warning("Friction regime report failed (continuing): %s", exc)
+
     # Plot
     plot_benchmark(
         broker_aligned,
@@ -1359,11 +1469,16 @@ def run_full_replay(
             )
 
     try:
+        from pipeline.run_manifest import get_code_version as _get_code_version
         manifest_path = Path(save_plot).with_name(f"{Path(save_plot).stem}_manifest.json")
+        cfg = live_config or {}
         payload = {
             "mode": "replay",
-            "config_hash": hash_config(live_config or {}),
+            "config_hash": hash_config(cfg),
+            "code_version": _get_code_version(),
             "checkpoint_path": checkpoint_path,
+            "snapshot_path": str(cfg.get("universe_snapshot_path", "")),
+            "watchlist_included": bool(cfg.get("include_watchlist_in_universe", False)),
             "resolved_universe_size": int(df_replay.index.get_level_values("ticker").nunique()),
             "resolved_universe_hash": hash_ticker_list(
                 df_replay.index.get_level_values("ticker").unique().tolist()

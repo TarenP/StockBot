@@ -122,8 +122,24 @@ After step 3, just run `python Broker.py` every morning. Everything else is auto
 Edit `broker.config` once. These become your defaults every run — no flags needed.
 
 ```
-universe_mode  = sp500     # strict S&P 500 membership enforced end-to-end
-                           # options: sp500, sp1500, tradable_us, custom
+# Universe — broad tradable U.S. equities, SPY as benchmark only
+universe_mode  = tradable_us  # broad tradable U.S. equity universe
+                               # options: tradable_us, sp500, sp1500, custom
+live_target_size = 1500        # breadth to maintain in the price/news universe
+allow_etfs     = false         # ETFs excluded from tradable names; SPY is benchmark only
+allow_otc      = false
+allow_preferreds = false
+allow_warrants = false
+benchmark_symbols = SPY        # SPY stays in parquet for benchmark tracking
+freeze_universe_snapshot = false  # set true for reproducible replay
+universe_snapshot_path = plots/live_universe_snapshot.json
+min_broad_universe_size = 1000    # fail loudly if universe resolves below this
+
+# Freshness gates — block new entries when data quality degrades
+min_fresh_price_coverage    = 0.90   # require 90% of universe to have today's prices
+min_fresh_sentiment_coverage = 0.50  # require 50% sentiment coverage on latest slice
+
+# Portfolio
 cash           = 10000     # starting cash (first run only — ignored after that)
 max_positions  = 20        # more positions = more capital deployed
 stop_loss      = 0.115     # ATR-adjusted per stock; 8% floor avoids noise clips
@@ -136,17 +152,12 @@ penny_pct      = 0.03      # minimal speculative exposure
 max_sector     = 0.400     # hard cap per sector
 max_correlation = 0.80     # blocks adding names too correlated with held positions
 avoid_earnings = 4         # skip stocks within N days of earnings
-top_n          = 500       # fallback only; universe_mode controls actual membership
 max_daily_loss = 0.025     # 2.5% daily halt
 max_drawdown   = 0.12      # 12% circuit breaker
 no_options     = true      # disabled until stock-side edge is proven
 
-# Freshness gates — block new entries when data quality degrades
-min_fresh_price_coverage    = 0.90   # require 90% of universe to have today's prices
-min_fresh_sentiment_coverage = 0.50  # require 50% sentiment coverage on latest slice
-
 # RL integration
-rl_enabled            = true   # activate RL ranking
+rl_enabled            = true
 rl_checkpoint_path    = auto   # auto = best checkpoint by val_sharpe
 rl_phase              = 1      # 1=ranking, 2=ranking+exits
 rl_exit_threshold     = 0.150  # Phase 2: sell if rank_pct drops below this
@@ -155,10 +166,25 @@ rl_min_score          = 0.0    # Phase 1: min rl_score to enter (0 = top-k only)
 ```
 
 **Important operational notes:**
-- `universe_mode = sp500` enforces strict S&P 500 membership end-to-end — no parquet tickers, watchlist names, or Finviz discoveries can enter the tradable universe
-- New entries are blocked automatically when `fresh_price_coverage` or `fresh_sentiment_coverage` fall below their thresholds — the broker continues exits and holds but makes no new buys
-- If the benchmark (SPY) is unavailable, relative metrics are omitted from the report but trading continues normally
-- `rl_checkpoint_path = auto` always picks the checkpoint with the highest validation Sharpe, not the most recently trained one
+- `universe_mode = tradable_us` (the default) builds a broad investable U.S. equity universe from live sources. ETFs, OTC names, preferreds, and warrants are excluded. SPY is retained in the parquet as a benchmark reference only — it is never a tradable candidate.
+- `universe_mode = sp500` is available as a stricter alternative that enforces exact S&P 500 membership. Use it if you want index-constrained behavior.
+- New entries are blocked automatically when `fresh_price_coverage` or `fresh_sentiment_coverage` fall below their thresholds — the broker continues exits and holds but makes no new buys. The manifest records exactly which gate triggered and why.
+- If the benchmark (SPY) is unavailable, relative metrics (alpha, beta, information ratio) are omitted from the report but trading continues normally.
+- `rl_checkpoint_path = auto` always picks the checkpoint with the highest validation Sharpe, not the most recently trained one.
+- Set `freeze_universe_snapshot = true` for reproducible replay — the universe is frozen to a dated snapshot file so re-running the same replay always uses the same ticker set.
+
+### Degraded-mode behavior
+
+| Condition | New entries | Exits | Status run |
+|---|---|---|---|
+| Price coverage < threshold | Blocked | Allowed | Allowed |
+| Sentiment coverage < threshold | Blocked | Allowed | Allowed |
+| Held ticker missing from fresh slice | Blocked | Allowed | Allowed |
+| Benchmark (SPY) unavailable | Allowed | Allowed | Allowed (no relative metrics) |
+| Universe below min_broad_universe_size | Error — run aborts | — | — |
+| Risk halt (daily loss / drawdown) | Blocked | Allowed | Allowed |
+
+Each blocked condition is named in the manifest and printed to the console.
 
 ---
 
@@ -605,7 +631,29 @@ Shows portfolio, SPY benchmark, and shadow portfolio standings.
 
 ---
 
-## Tips
+## How to run a reproducible evaluation
+
+To produce a result you can audit and reproduce later:
+
+```bash
+# 1. Freeze the universe snapshot
+# In broker.config:
+#   freeze_universe_snapshot = true
+#   universe_snapshot_path = plots/live_universe_snapshot.json
+
+# 2. Run the replay
+python Agent.py --mode replay --replay_years 3
+
+# 3. Archive the artifacts
+# plots/replay_manifest.json  — config hash, universe hash, checkpoint, benchmark status
+# plots/replay.png            — equity curve
+# plots/replay_score_audit.csv — per-ticker decision trace
+# plots/live_universe_snapshot.json — frozen universe used
+```
+
+The manifest records: timestamp, code version (git commit), config hash, checkpoint path, universe hash and size, benchmark availability, freshness coverage, and friction regime assumptions. Re-running with the same snapshot and checkpoint will produce the same trade log.
+
+---
 
 - The sentiment surprise signal is the strongest indicator — sudden positive
   news before price moves is what the model looks for most

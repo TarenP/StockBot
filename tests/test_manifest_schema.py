@@ -26,10 +26,14 @@ class TestValidateManifest:
             "generated_at": "2026-04-24T12:00:00Z",
             "mode": "live",
             "config_hash": "abc123",
+            "code_version": "a1b2c3d",
             "resolved_universe_size": 500,
             "resolved_universe_hash": "def456",
             "freshness": {"fresh_price_coverage": 0.98},
             "freshness_gate": {"passed": True},
+            "benchmark_status": {"symbol": "SPY", "available": True},
+            "snapshot_path": "plots/live_universe_snapshot.json",
+            "watchlist_included": False,
         }
         missing = validate_manifest(manifest, "live_cycle")
         assert missing == [], f"Unexpected missing fields: {missing}"
@@ -40,12 +44,15 @@ class TestValidateManifest:
             "generated_at": "2026-04-24T12:00:00Z",
             "mode": "replay",
             "config_hash": "abc123",
+            "code_version": "a1b2c3d",
             "checkpoint_path": "models/best_fold1.pt",
             "resolved_universe_size": 500,
             "resolved_universe_hash": "def456",
             "replay_window": {"start": "2024-01-01", "end": "2025-01-01"},
             "benchmark": {"available": True},
             "friction": {"execution_spread": 0.001},
+            "snapshot_path": "plots/live_universe_snapshot.json",
+            "watchlist_included": False,
         }
         missing = validate_manifest(manifest, "replay")
         assert missing == [], f"Unexpected missing fields: {missing}"
@@ -128,10 +135,14 @@ class TestWriteRunManifestAutoFields:
         complete = {
             "mode": "live",
             "config_hash": "abc",
+            "code_version": "a1b2c3d",
             "resolved_universe_size": 100,
             "resolved_universe_hash": "xyz",
             "freshness": {},
             "freshness_gate": {},
+            "benchmark_status": {"symbol": "SPY", "available": True},
+            "snapshot_path": "plots/snapshot.json",
+            "watchlist_included": False,
         }
         with caplog.at_level(logging.WARNING, logger="pipeline.run_manifest"):
             write_run_manifest("live_cycle", complete, output_path=out)
@@ -142,12 +153,15 @@ class TestWriteRunManifestAutoFields:
         write_run_manifest("replay", {
             "mode": "replay",
             "config_hash": hash_config({"min_score": 0.6}),
+            "code_version": "a1b2c3d",
             "checkpoint_path": "models/best_fold1.pt",
             "resolved_universe_size": 500,
             "resolved_universe_hash": hash_ticker_list(["AAPL", "MSFT"]),
             "replay_window": {"start": "2024-01-01", "end": "2025-01-01"},
             "benchmark": {"available": True},
             "friction": {"execution_spread": 0.001},
+            "snapshot_path": "plots/snapshot.json",
+            "watchlist_included": False,
         }, output_path=out)
         import json
         data = json.loads(out.read_text())
