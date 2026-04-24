@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 _REPLAY_MIN_PRICE = 0.01
 _REPLAY_SPLIT_RATIO_THRESHOLD = 2.0
 _REPLAY_CORP_ACTION_LOOKBACK = 20
+_LAST_REPLAY_SCORE_AUDIT = pd.DataFrame()
 
 
 # ── Historical research stub ──────────────────────────────────────────────────
@@ -285,6 +286,8 @@ def _execute_replay_decisions(
             execution_price = _apply_sell_execution_cost(fill_price, execution_spread)
             ok = portfolio.sell(d.ticker, d.shares, execution_price, d.reason)
             fill_price = execution_price
+            if ok and d.ticker in portfolio.positions:
+                portfolio.positions[d.ticker]["partial_taken"] = True
         else:
             ok = True
 
@@ -564,6 +567,8 @@ def _run_replay_v2(
     rl_min_score: float = 0.0,
     label: str | None = None,
 ) -> tuple[np.ndarray, list]:
+    global _LAST_REPLAY_SCORE_AUDIT
+    _LAST_REPLAY_SCORE_AUDIT = pd.DataFrame()
     if label is None:
         label = strategy
 
@@ -609,6 +614,7 @@ def _run_replay_v2(
         equity_history_getter=lambda: equity_curve,
     )
     trade_log = []
+    score_audit_parts: list[pd.DataFrame] = []
     pending_fills: dict[pd.Timestamp, list[tuple[pd.Timestamp, list]]] = {}
 
     original_research = getattr(brain_module, "research", None)
@@ -897,6 +903,11 @@ def _run_replay_v2(
                         brain.min_score = 999.0
 
                     decisions = brain.run_cycle(df_slice, screener_top_n=50, risk_engine=risk)
+                    cycle_audit = getattr(brain, "_last_cycle_audit", pd.DataFrame())
+                    if isinstance(cycle_audit, pd.DataFrame) and not cycle_audit.empty:
+                        score_audit_parts.append(
+                            cycle_audit.assign(cycle_date=pd.Timestamp(date).date().isoformat())
+                        )
                     if decisions and i + 1 < len(dates):
                         fill_date = pd.Timestamp(dates[i + 1])
                         pending_fills.setdefault(fill_date, []).append(
@@ -915,6 +926,10 @@ def _run_replay_v2(
             brain_module.research = original_research
         if original_get_next_earnings is not None:
             brain_module._get_next_earnings_date = original_get_next_earnings
+        if score_audit_parts:
+            _LAST_REPLAY_SCORE_AUDIT = pd.concat(score_audit_parts, ignore_index=True)
+        else:
+            _LAST_REPLAY_SCORE_AUDIT = pd.DataFrame()
 
     daily_returns = np.diff(equity_curve) / (np.array(equity_curve[:-1]) + 1e-9)
     return daily_returns, trade_log
@@ -1067,9 +1082,11 @@ def run_full_replay(
     """
     from pipeline.benchmark import (
         align_return_series,
+        compute_trade_friction_metrics,
         fetch_spy_returns,
         plot_benchmark,
         print_benchmark_report,
+        print_trade_friction_report,
     )
     from broker.sectors import get_cached_sector_map
 
@@ -1138,6 +1155,14 @@ def run_full_replay(
         ew_rets=ew_aligned,
         label="Broker Replay",
     )
+    friction = compute_trade_friction_metrics(
+        trade_log,
+        broker_aligned,
+        initial_cash=initial_cash,
+        execution_spread=float(replay_kwargs.get("execution_spread", 0.0)),
+    )
+    spy_total_return = float(np.prod(1.0 + spy_rets) - 1.0) if spy_rets is not None else None
+    print_trade_friction_report(friction, spy_total_return=spy_total_return)
 
     # Plot
     plot_benchmark(
@@ -1154,6 +1179,11 @@ def run_full_replay(
     sells    = n_trades - buys
     logger.info(f"Trades: {n_trades} total ({buys} buys, {sells} sells)")
     _print_trade_log_report(trade_log)
+    if isinstance(_LAST_REPLAY_SCORE_AUDIT, pd.DataFrame) and not _LAST_REPLAY_SCORE_AUDIT.empty:
+        score_audit_path = Path(save_plot).with_name(f"{Path(save_plot).stem}_score_audit.csv")
+        score_audit_path.parent.mkdir(parents=True, exist_ok=True)
+        _LAST_REPLAY_SCORE_AUDIT.to_csv(score_audit_path, index=False)
+        logger.info("Score audit saved -> %s", score_audit_path)
 
     # Rolling-window robustness
     rolling_df, rolling_summary = _rolling_window_validation(aligned)

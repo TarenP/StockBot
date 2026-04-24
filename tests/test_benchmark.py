@@ -8,6 +8,7 @@ import pandas as pd
 from pipeline.benchmark import (
     MIN_HISTORY_FOR_STABLE_METRICS,
     benchmark_vs_spy,
+    compute_trade_friction_metrics,
     compute_metrics,
     fetch_spy_returns,
     plot_benchmark,
@@ -114,3 +115,24 @@ def test_fetch_spy_returns_falls_back_to_local_parquet(monkeypatch):
     finally:
         if parquet_path.exists():
             parquet_path.unlink()
+
+
+def test_compute_trade_friction_metrics_reports_turnover_and_cost_drag():
+    friction = compute_trade_friction_metrics(
+        trade_log=[
+            {"action": "BUY", "shares": 10.0, "price": 100.0},
+            {"action": "SELL", "shares": 10.0, "price": 101.0},
+        ],
+        portfolio_rets=np.array([0.01, -0.005, 0.002], dtype=float),
+        initial_cash=10_000.0,
+        execution_spread=0.001,
+    )
+
+    assert friction["n_trades"] == 2
+    assert friction["gross_traded_value"] == 2010.0
+    assert friction["annual_turnover"] > 0.0
+    assert friction["estimated_cost_dollars"] > 0.0
+    assert np.isclose(
+        friction["net_cost_adjusted_return"],
+        float(np.prod(1.0 + np.array([0.01, -0.005, 0.002], dtype=float)) - 1.0),
+    )

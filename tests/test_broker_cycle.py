@@ -62,7 +62,7 @@ def test_run_cycle_skips_duplicate_refresh_after_maintenance(monkeypatch):
 
     monkeypatch.setattr(broker_module, "_is_market_hours", lambda: True)
     monkeypatch.setattr(broker_module, "_today_et", lambda: cycle_date)
-    monkeypatch.setattr(updater_module, "_load_trained_universe", lambda save_dir: ["AAA"])
+    monkeypatch.setattr(broker_module, "_resolve_cycle_universe", lambda **kwargs: ["AAA"])
     monkeypatch.setattr(
         updater_module,
         "update_parquet",
@@ -98,7 +98,7 @@ def test_run_cycle_prints_summary_only_via_report(monkeypatch):
     printed: list[str] = []
 
     monkeypatch.setattr(broker_module, "_is_market_hours", lambda: True)
-    monkeypatch.setattr(updater_module, "_load_trained_universe", lambda save_dir: ["AAA"])
+    monkeypatch.setattr(broker_module, "_resolve_cycle_universe", lambda **kwargs: ["AAA"])
     monkeypatch.setattr(updater_module, "update_parquet", lambda **kwargs: 0)
     monkeypatch.setattr(sentiment_module, "update_sentiment", lambda *args, **kwargs: 0)
     monkeypatch.setattr(data_module, "load_master", lambda **kwargs: pd.DataFrame())
@@ -125,7 +125,7 @@ def test_run_cycle_loads_raw_cols_for_local_research_fallback(monkeypatch):
     load_kwargs = {}
 
     monkeypatch.setattr(broker_module, "_is_market_hours", lambda: True)
-    monkeypatch.setattr(updater_module, "_load_trained_universe", lambda save_dir: ["AAA"])
+    monkeypatch.setattr(broker_module, "_resolve_cycle_universe", lambda **kwargs: ["AAA"])
     monkeypatch.setattr(updater_module, "update_parquet", lambda **kwargs: 0)
     monkeypatch.setattr(sentiment_module, "update_sentiment", lambda *args, **kwargs: 0)
 
@@ -147,6 +147,41 @@ def test_run_cycle_loads_raw_cols_for_local_research_fallback(monkeypatch):
     )
 
     assert load_kwargs["include_raw_cols"] is True
+
+
+def test_run_cycle_uses_configured_investable_filters(monkeypatch):
+    load_kwargs = {}
+
+    monkeypatch.setattr(broker_module, "_is_market_hours", lambda: True)
+    monkeypatch.setattr(broker_module, "_resolve_cycle_universe", lambda **kwargs: ["AAA"])
+    monkeypatch.setattr(updater_module, "update_parquet", lambda **kwargs: 0)
+    monkeypatch.setattr(sentiment_module, "update_sentiment", lambda *args, **kwargs: 0)
+
+    def _fake_load_master(**kwargs):
+        load_kwargs.update(kwargs)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(data_module, "load_master", _fake_load_master)
+    monkeypatch.setattr(broker_module, "log_cycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(broker_module, "daily_integrity_check", lambda portfolio: {})
+    monkeypatch.setattr(broker_module, "print_report", lambda *args, **kwargs: None)
+    monkeypatch.setattr(broker_module, "_fetch_current_spy_price", lambda: None)
+    monkeypatch.setattr(journal_module, "plot_live_performance", lambda *args, **kwargs: None)
+
+    broker_module.run_cycle(
+        portfolio=_DummyPortfolio(),
+        brain=_DummyBrain(),
+        risk=_DummyRisk(),
+        config={
+            "universe_min_history_days": 400,
+            "universe_min_price": 12.5,
+            "universe_min_avg_volume": 750_000,
+        },
+    )
+
+    assert load_kwargs["min_history_days"] == 400
+    assert load_kwargs["min_price"] == 12.5
+    assert load_kwargs["min_avg_volume"] == 750_000
 
 
 def test_run_cycle_sets_market_regime_after_loading_data(monkeypatch):
@@ -173,7 +208,7 @@ def test_run_cycle_sets_market_regime_after_loading_data(monkeypatch):
             calls["market_regime"] = regime
 
     monkeypatch.setattr(broker_module, "_is_market_hours", lambda: True)
-    monkeypatch.setattr(updater_module, "_load_trained_universe", lambda save_dir: ["AAA"])
+    monkeypatch.setattr(broker_module, "_resolve_cycle_universe", lambda **kwargs: ["AAA"])
     monkeypatch.setattr(updater_module, "update_parquet", lambda **kwargs: 0)
     monkeypatch.setattr(sentiment_module, "update_sentiment", lambda *args, **kwargs: 0)
     monkeypatch.setattr(data_module, "load_master", lambda **kwargs: loaded_df)
@@ -192,6 +227,40 @@ def test_run_cycle_sets_market_regime_after_loading_data(monkeypatch):
     assert calls["regime_df_is_loaded"] is True
     assert calls["run_cycle_df_is_loaded"] is True
     assert calls["market_regime"] == 0
+
+
+def test_run_cycle_uses_resolved_universe_for_refreshes(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(broker_module, "_is_market_hours", lambda: True)
+    monkeypatch.setattr(broker_module, "_resolve_cycle_universe", lambda **kwargs: ["AAA", "BBB"])
+    monkeypatch.setattr(
+        updater_module,
+        "update_parquet",
+        lambda **kwargs: captured.__setitem__("price_universe", list(kwargs["universe"])) or 0,
+    )
+    monkeypatch.setattr(
+        sentiment_module,
+        "update_sentiment",
+        lambda tickers, *args, **kwargs: captured.__setitem__("sentiment_universe", list(tickers)) or 0,
+    )
+    monkeypatch.setattr(data_module, "load_master", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(broker_module, "log_cycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(broker_module, "daily_integrity_check", lambda portfolio: {})
+    monkeypatch.setattr(broker_module, "print_report", lambda *args, **kwargs: None)
+    monkeypatch.setattr(broker_module, "_fetch_current_spy_price", lambda: None)
+    monkeypatch.setattr(journal_module, "plot_live_performance", lambda *args, **kwargs: None)
+    monkeypatch.setattr(briefing_module, "print_daily_briefing", lambda *args, **kwargs: None)
+
+    broker_module.run_cycle(
+        portfolio=_DummyPortfolio(),
+        brain=_DummyBrain(),
+        risk=_DummyRisk(),
+        config={"universe_mode": "sp500"},
+    )
+
+    assert captured["price_universe"] == ["AAA", "BBB"]
+    assert captured["sentiment_universe"] == ["AAA", "BBB"]
 
 
 def test_portfolio_summary_always_includes_stock_holdings_section():

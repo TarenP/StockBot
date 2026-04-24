@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from unittest.mock import patch
 
-from broker.brain import BrokerBrain
+from broker.brain import BrokerBrain, Decision
 
 
 class _DummyOptions:
@@ -186,6 +186,81 @@ def test_run_cycle_uses_trailing_stop_for_winner_pullback():
         decisions = brain.run_cycle(_make_df_features_with_regime(0), screener_top_n=10)
 
     assert any(d.action == "SELL" and "Trailing stop" in d.reason for d in decisions)
+
+
+def test_run_cycle_partial_take_profit_does_not_mutate_position_before_execution():
+    portfolio = _DummyPortfolio()
+    portfolio.positions["AAA"].update(
+        {
+            "avg_cost": 100.0,
+            "last_price": 125.0,
+            "peak_price": 125.0,
+            "days_held": 10,
+            "partial_taken": False,
+        }
+    )
+    brain = BrokerBrain(portfolio=portfolio, max_positions=2, min_score=0.60)
+    brain._sector_map = {"AAA": "Technology"}
+
+    with (
+        patch.object(brain, "_screen_candidates", return_value=[]),
+        patch.object(brain, "_maybe_refresh_sector_map"),
+        patch.object(brain, "_get_current_prices", return_value={"AAA": 125.0}),
+        patch.object(brain, "_evaluate_options", return_value=[]),
+        patch("broker.brain.validate_portfolio_prices", return_value={"AAA": 125.0}),
+        patch("broker.brain.score_sectors", return_value={}),
+        patch("broker.brain.get_portfolio_sector_weights", return_value={"Technology": 0.05}),
+        patch("broker.brain.compute_target_allocations", return_value={"Technology": 1.0}),
+    ):
+        decisions = brain.run_cycle(_make_df_features(), screener_top_n=10)
+
+    assert any(d.action == "SELL_PARTIAL" and d.ticker == "AAA" for d in decisions)
+    assert portfolio.positions["AAA"]["partial_taken"] is False
+
+
+def test_reconcile_decisions_keeps_highest_priority_exit_per_ticker():
+    brain = BrokerBrain(portfolio=_DummyPortfolio(), max_positions=2, min_score=0.60)
+    decisions = [
+        Decision(
+            action="SELL_PARTIAL",
+            ticker="AAA",
+            shares=5.0,
+            price=100.0,
+            score=0.4,
+            reason="RL conviction drop: entry_rank_pct=0.9000",
+        ),
+        Decision(
+            action="SELL",
+            ticker="AAA",
+            shares=10.0,
+            price=95.0,
+            score=0.2,
+            reason="Signal deteriorated (score=0.12, streak=2/2)",
+        ),
+        Decision(
+            action="SELL",
+            ticker="AAA",
+            shares=10.0,
+            price=89.0,
+            score=0.0,
+            reason="Stop-loss (-11.0% vs -7.0% ATR-adjusted)",
+        ),
+        Decision(
+            action="BUY",
+            ticker="BBB",
+            shares=2.0,
+            price=50.0,
+            score=0.9,
+            reason="new entry",
+        ),
+    ]
+
+    reconciled = brain._reconcile_decisions(decisions)
+
+    aaa_exits = [d for d in reconciled if d.ticker == "AAA"]
+    assert len(aaa_exits) == 1
+    assert aaa_exits[0].reason.startswith("Stop-loss")
+    assert any(d.action == "BUY" and d.ticker == "BBB" for d in reconciled)
 
 
 def test_run_cycle_does_not_dump_winner_on_single_weak_signal_in_calm_regime():

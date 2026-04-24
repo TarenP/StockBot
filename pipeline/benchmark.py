@@ -438,6 +438,90 @@ def rolling_relative_performance(
     return result
 
 
+def compute_trade_friction_metrics(
+    trade_log: list[dict] | None,
+    portfolio_rets: np.ndarray,
+    initial_cash: float = 10_000.0,
+    execution_spread: float | None = None,
+) -> dict:
+    """
+    Summarize trading intensity and execution drag for a replay.
+
+    ``portfolio_rets`` are assumed to already be net of configured frictions, so
+    ``net_cost_adjusted_return`` is the realized return after costs.
+    """
+    rets = np.asarray(portfolio_rets, dtype=float)
+    if len(rets) == 0:
+        return {
+            "n_trades": 0,
+            "gross_traded_value": 0.0,
+            "annual_turnover": 0.0,
+            "estimated_cost_dollars": 0.0,
+            "estimated_cost_drag_pct": 0.0,
+            "net_cost_adjusted_return": 0.0,
+        }
+
+    df_trades = pd.DataFrame(trade_log or [])
+    if df_trades.empty:
+        gross_traded_value = 0.0
+        n_trades = 0
+    else:
+        trade_value = (
+            pd.to_numeric(df_trades.get("shares"), errors="coerce").fillna(0.0).abs()
+            * pd.to_numeric(df_trades.get("price"), errors="coerce").fillna(0.0).abs()
+        )
+        gross_traded_value = float(trade_value.sum())
+        n_trades = int(len(df_trades))
+
+    years = max(len(rets) / 252.0, 1.0 / 252.0)
+    equity_curve = initial_cash * np.cumprod(1.0 + rets)
+    avg_equity = float(np.nanmean(equity_curve)) if len(equity_curve) else float(initial_cash)
+    annual_turnover = (
+        gross_traded_value / max(avg_equity, 1e-9) / years if gross_traded_value > 0 else 0.0
+    )
+
+    spread = float(execution_spread or 0.0)
+    estimated_cost_dollars = 0.0
+    if spread > 0.0 and gross_traded_value > 0.0:
+        estimated_cost_dollars = gross_traded_value * (spread / max(1.0 - spread, 1e-9))
+
+    return {
+        "n_trades": n_trades,
+        "gross_traded_value": gross_traded_value,
+        "annual_turnover": float(annual_turnover),
+        "estimated_cost_dollars": float(estimated_cost_dollars),
+        "estimated_cost_drag_pct": float(estimated_cost_dollars / max(initial_cash, 1e-9)),
+        "net_cost_adjusted_return": float(np.prod(1.0 + rets) - 1.0),
+    }
+
+
+def print_trade_friction_report(
+    friction: dict,
+    spy_total_return: float | None = None,
+) -> None:
+    print(_console_safe(f"\n{'='*72}"))
+    print(_console_safe("  Execution / Friction Metrics"))
+    print(_console_safe(f"{'='*72}"))
+    print(_console_safe(
+        "  annual_turnover={:.2f}x  gross_traded_value=${:,.2f}  trades={:d}".format(
+            float(friction.get("annual_turnover", 0.0)),
+            float(friction.get("gross_traded_value", 0.0)),
+            int(friction.get("n_trades", 0)),
+        )
+    ))
+    print(_console_safe(
+        "  net_cost_adjusted_return={:.2%}  estimated_execution_drag={:.2%} (${:.2f})".format(
+            float(friction.get("net_cost_adjusted_return", 0.0)),
+            float(friction.get("estimated_cost_drag_pct", 0.0)),
+            float(friction.get("estimated_cost_dollars", 0.0)),
+        )
+    ))
+    if spy_total_return is not None:
+        excess = float(friction.get("net_cost_adjusted_return", 0.0)) - float(spy_total_return)
+        print(_console_safe(f"  excess_return_vs_spy={excess:.2%}"))
+    print(_console_safe(f"{'='*72}\n"))
+
+
 def print_benchmark_report(
     portfolio_rets: np.ndarray,
     spy_rets: np.ndarray | None,
@@ -525,6 +609,7 @@ def print_benchmark_report(
     else:
         print(_console_safe(f"  {'Beta':<22} {format_metric_cell(rel['beta'], '.3f', 14)}"))
         print(_console_safe(f"  {'Alpha (ann)':<22} {format_metric_cell(rel['alpha_ann'], '.2%', 13)}"))
+        print(_console_safe(f"  {'Active Return (ann)':<22} {format_metric_cell(rel['active_return_ann'], '.2%', 13)}"))
         print(_console_safe(f"  {'Information Ratio':<22} {format_metric_cell(rel['information_ratio'], '.3f', 14)}"))
         print(_console_safe(f"  {'Tracking Error':<22} {format_metric_cell(rel['tracking_error'], '.2%', 13)}"))
         if rel["upside_capture"] is not None:

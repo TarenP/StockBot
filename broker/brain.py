@@ -154,6 +154,9 @@ class BrokerBrain:
         self._sector_cache_date: datetime | None = None
         # Ensure _base_min_score is always set (broker.py also sets this after init)
         self._base_min_score: float = min_score
+        self._last_rl_scores: pd.Series = pd.Series(dtype=float)
+        self._last_rl_audit: pd.DataFrame = pd.DataFrame()
+        self._last_cycle_audit: pd.DataFrame = pd.DataFrame()
 
     def _current_market_regime(self, df_features: pd.DataFrame) -> int | None:
         regime_cols = [f"regime_{i}" for i in range(4) if f"regime_{i}" in df_features.columns]
@@ -416,7 +419,6 @@ class BrokerBrain:
                     shares=half_shares, price=price, score=0.8,
                     reason=f"Partial take-profit ({pnl_pct:.1%}), selling 50%",
                 ))
-                pos["partial_taken"] = True
                 continue
 
             # Full take-profit at +45%
@@ -492,19 +494,35 @@ class BrokerBrain:
 
         # ── Phase 1: RL scoring of shortlist ──────────────────────────────────
         rl_scores: pd.Series | None = None
+        rl_score_table: pd.DataFrame | None = None
+        self._last_rl_scores = pd.Series(dtype=float)
+        self._last_rl_audit = pd.DataFrame()
+        self._last_cycle_audit = pd.DataFrame()
         if self.rl_enabled and candidates:
             try:
-                rl_scores = get_rl_targets(
+                rl_score_table = get_rl_targets(
                     df_features,
                     candidates,
                     self.rl_checkpoint_path,
-                    mode="rank",
+                    mode="audit",
                 )
+                if isinstance(rl_score_table, pd.Series):
+                    rl_scores = rl_score_table.astype(float)
+                    rl_score_table = pd.DataFrame(
+                        {
+                            "rl_rank_pct": rl_scores,
+                            "rl_weight": np.nan,
+                            "rl_raw_weight": np.nan,
+                        }
+                    )
+                else:
+                    rl_scores = rl_score_table["rl_rank_pct"].astype(float)
                 logger.info(
                     "RL scored %d tickers in shortlist.", len(candidates)
                 )
                 # Cache for broker.py to use when storing entry rank percentile
                 self._last_rl_scores = rl_scores
+                self._last_rl_audit = rl_score_table.copy()
             except Exception as exc:
                 logger.error(
                     "RL inference failed — aborting cycle: %s", exc, exc_info=True
@@ -518,6 +536,24 @@ class BrokerBrain:
             )
             decisions.extend(rl_exit_decisions)
             rl_exited_tickers = {d.ticker for d in rl_exit_decisions}
+
+        # ── Deduplicate exits: one action per ticker, highest priority wins ───
+        # Priority: SELL (stop/tp/signal) > SELL_PARTIAL
+        # If both heuristic and RL generated exits for the same ticker, keep
+        # the SELL (full exit) over SELL_PARTIAL, and the first SELL wins.
+        exit_by_ticker: dict[str, Decision] = {}
+        buy_decisions: list[Decision] = []
+        for d in decisions:
+            if d.action in ("SELL", "SELL_PARTIAL"):
+                existing = exit_by_ticker.get(d.ticker)
+                if existing is None:
+                    exit_by_ticker[d.ticker] = d
+                elif existing.action == "SELL_PARTIAL" and d.action == "SELL":
+                    # Full exit beats partial
+                    exit_by_ticker[d.ticker] = d
+            else:
+                buy_decisions.append(d)
+        decisions = list(exit_by_ticker.values()) + buy_decisions
 
         # ── 7. Buy decisions ──────────────────────────────────────────────────
         sells_pending = sum(1 for d in decisions if d.action in ("SELL",))
@@ -538,6 +574,7 @@ class BrokerBrain:
         risk_blocked_skips = 0
         tiny_alloc_skips = 0
         buyable_count = 0
+        cycle_audit_rows: list[dict] = []
         if n_slots > 0 and candidates:
             held_tickers_now = list(self.portfolio.positions.keys())
             recent_return_frame = (
@@ -569,6 +606,11 @@ class BrokerBrain:
 
                 composite = report["composite_score"]
                 rl_score_val = float(rl_scores.get(ticker, 0.0)) if rl_scores is not None else None
+                rl_weight_val = None
+                rl_raw_weight_val = None
+                if rl_score_table is not None and ticker in rl_score_table.index:
+                    rl_weight_val = float(rl_score_table.at[ticker, "rl_weight"])
+                    rl_raw_weight_val = float(rl_score_table.at[ticker, "rl_raw_weight"])
 
                 # Diagnostic logging — always log both scores when RL is active
                 if self.rl_enabled and rl_score_val is not None:
@@ -598,16 +640,37 @@ class BrokerBrain:
                 report["sector"] = self._sector_map.get(ticker.upper(), "Unknown")
                 if rl_score_val is not None:
                     report["rl_score"] = rl_score_val
+                    report["rl_rank_pct"] = rl_score_val
+                if rl_weight_val is not None:
+                    report["rl_weight"] = rl_weight_val
+                if rl_raw_weight_val is not None:
+                    report["rl_raw_weight"] = rl_raw_weight_val
                 researched.append(report)
+                cycle_audit_rows.append(
+                    {
+                        "ticker": ticker,
+                        "candidate_status": "researched",
+                        "logged_score": (
+                            float(rl_score_val)
+                            if rl_score_val is not None else float(composite)
+                        ),
+                        "composite_score": float(composite),
+                        "rl_rank_pct": float(rl_score_val) if rl_score_val is not None else np.nan,
+                        "rl_weight": float(rl_weight_val) if rl_weight_val is not None else np.nan,
+                        "rl_raw_weight": (
+                            float(rl_raw_weight_val) if rl_raw_weight_val is not None else np.nan
+                        ),
+                        "sector": report["sector"],
+                    }
+                )
 
             # Sort by rl_score (RL mode) or composite_score (heuristic mode)
             if self.rl_enabled:
                 researched.sort(
-                    key=lambda r: (r.get("rl_score", 0.0), r["composite_score"]),
-                    reverse=True,
+                    key=lambda r: (-r.get("rl_score", 0.0), -r["composite_score"], r["ticker"]),
                 )
             else:
-                researched.sort(key=lambda r: r["composite_score"], reverse=True)
+                researched.sort(key=lambda r: (-r["composite_score"], r["ticker"]))
 
             # ── Per-cycle RL summary log ──────────────────────────────────────
             if self.rl_enabled and rl_scores is not None:
@@ -615,7 +678,8 @@ class BrokerBrain:
 
                 # Compute heuristic rank order vs RL rank order
                 heuristic_order = sorted(
-                    researched, key=lambda r: r["composite_score"], reverse=True
+                    researched,
+                    key=lambda r: (-r["composite_score"], r["ticker"]),
                 )
                 heuristic_rank = {r["ticker"]: i for i, r in enumerate(heuristic_order)}
                 rl_rank = {r["ticker"]: i for i, r in enumerate(researched)}
@@ -680,6 +744,9 @@ class BrokerBrain:
                 price         = report["price"]
                 composite     = report["composite_score"]
                 rl_score_val  = report.get("rl_score")
+                rl_rank_pct_val = report.get("rl_rank_pct", rl_score_val)
+                rl_weight_val = report.get("rl_weight")
+                rl_raw_weight_val = report.get("rl_raw_weight")
                 sector        = report.get("sector", "Unknown")
                 is_penny      = price < self.penny_threshold
 
@@ -809,7 +876,11 @@ class BrokerBrain:
                     if corr_stats is not None:
                         corr_note = f" | MaxCorr={corr_stats['max_abs_corr']:.2f}"
                     reason = (
-                        f"rl_score={rl_score_val:.4f} | composite_score={composite:.4f} | "
+                        f"logged_score={score:.4f} | rl_score={float(rl_rank_pct_val):.4f} | "
+                        f"rl_rank_pct={float(rl_rank_pct_val):.4f} | "
+                        f"rl_weight={float(rl_weight_val or 0.0):.4f} | "
+                        f"rl_raw_weight={float(rl_raw_weight_val or 0.0):.6f} | "
+                        f"composite_score={composite:.4f} | score_source=rl_rank_pct | "
                         f"rl_mode=true | Sector={sector} "
                         f"(target={target_alloc:.0%}) | "
                         f"Sentiment={sent_label}{earnings_note}{corr_note} | "
@@ -821,7 +892,8 @@ class BrokerBrain:
                     if corr_stats is not None:
                         corr_note = f" | MaxCorr={corr_stats['max_abs_corr']:.2f}"
                     reason = (
-                        f"Score={composite:.2f} | Sector={sector} "
+                        f"logged_score={score:.4f} | composite_score={composite:.4f} | "
+                        f"score_source=composite | Sector={sector} "
                         f"(target={target_alloc:.0%}) | "
                         f"Sentiment={sent_label}{earnings_note}{corr_note} | "
                         f"{'PENNY ' if is_penny else ''}"
@@ -838,6 +910,23 @@ class BrokerBrain:
                 if is_penny:
                     penny_value += alloc_value
                 buyable_count += 1
+                cycle_audit_rows.append(
+                    {
+                        "ticker": ticker,
+                        "candidate_status": "buy_selected",
+                        "logged_score": float(score),
+                        "composite_score": float(composite),
+                        "rl_rank_pct": float(rl_rank_pct_val) if rl_rank_pct_val is not None else np.nan,
+                        "rl_weight": float(rl_weight_val) if rl_weight_val is not None else np.nan,
+                        "rl_raw_weight": float(rl_raw_weight_val) if rl_raw_weight_val is not None else np.nan,
+                        "sector": sector,
+                        "alloc_value": float(alloc_value),
+                        "alloc_pct": float(alloc_value / equity) if equity > 0 else np.nan,
+                        "shares": float(shares),
+                        "target_sector_alloc": float(target_alloc),
+                        "max_position_pct": float(effective_max_position_pct),
+                    }
+                )
 
             logger.debug(
                 "Buy funnel: researched=%d slots=%d buys=%d penny_blocked=%d "
@@ -869,6 +958,11 @@ class BrokerBrain:
                     risk_blocked_skips,
                     tiny_alloc_skips,
                 )
+            if cycle_audit_rows:
+                self._last_cycle_audit = pd.DataFrame(cycle_audit_rows).sort_values(
+                    ["candidate_status", "logged_score", "composite_score", "ticker"],
+                    ascending=[True, False, False, True],
+                ).reset_index(drop=True)
 
         # ── 8. Options decisions (suppressed when RL enabled) ─────────────────
         if not self.rl_enabled:
@@ -878,7 +972,7 @@ class BrokerBrain:
             )
             decisions.extend(options_decisions)
 
-        return decisions
+        return self._reconcile_decisions(decisions)
 
     # ── Volatility-adjusted stop-loss ─────────────────────────────────────────
 
@@ -995,6 +1089,75 @@ class BrokerBrain:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _is_stock_exit_action(decision: Decision) -> bool:
+        return decision.action in {"SELL", "SELL_PARTIAL"}
+
+    @staticmethod
+    def _exit_priority(decision: Decision) -> int:
+        reason = str(getattr(decision, "reason", "") or "").strip().lower()
+
+        if "stop-loss" in reason:
+            return 0
+        if "trailing stop" in reason:
+            return 1
+        if "full take-profit" in reason:
+            return 2
+        if decision.action == "SELL" and reason.startswith("rl exit"):
+            return 3
+        if decision.action == "SELL" and "signal deteriorated" in reason:
+            return 4
+        if decision.action == "SELL_PARTIAL" and "rl conviction drop" in reason:
+            return 5
+        if decision.action == "SELL_PARTIAL" and "partial take-profit" in reason:
+            return 6
+        if decision.action == "SELL":
+            return 7
+        return 8
+
+    def _reconcile_decisions(self, decisions: list[Decision]) -> list[Decision]:
+        """
+        Keep at most one stock-exit action per ticker per cycle.
+
+        Independent checks can fire on the same position during a single pass.
+        The execution layer should only see the highest-priority exit.
+        """
+        best_exit_by_ticker: dict[str, tuple[tuple[int, int], Decision]] = {}
+        exit_counts: dict[str, int] = {}
+
+        for idx, decision in enumerate(decisions):
+            if not self._is_stock_exit_action(decision):
+                continue
+
+            exit_counts[decision.ticker] = exit_counts.get(decision.ticker, 0) + 1
+            rank = (self._exit_priority(decision), idx)
+            incumbent = best_exit_by_ticker.get(decision.ticker)
+            if incumbent is None or rank < incumbent[0]:
+                best_exit_by_ticker[decision.ticker] = (rank, decision)
+
+        if not best_exit_by_ticker:
+            return decisions
+
+        dropped = sum(count - 1 for count in exit_counts.values() if count > 1)
+        if dropped > 0:
+            logger.debug("Reconciled %d lower-priority duplicate stock exit(s).", dropped)
+
+        reconciled: list[Decision] = []
+        emitted_exit_tickers: set[str] = set()
+        for decision in decisions:
+            if not self._is_stock_exit_action(decision):
+                reconciled.append(decision)
+                continue
+
+            winner = best_exit_by_ticker.get(decision.ticker)
+            if winner is None:
+                continue
+            if decision is winner[1] and decision.ticker not in emitted_exit_tickers:
+                reconciled.append(decision)
+                emitted_exit_tickers.add(decision.ticker)
+
+        return reconciled
+
     def _rl_exit_checks(
         self,
         held_tickers: list[str],
@@ -1004,9 +1167,8 @@ class BrokerBrain:
         Phase 2: Compare each held ticker's current RL rank against the rank
         recorded at entry.
 
-        RL scores from mode="rank" are shortlist-relative rank scores. We still
-        re-rank them here so Phase 2 exits use stable percentiles even for older
-        positions or future score-calibration changes:
+        RL scores from mode="rank" are already shortlist-relative rank
+        percentiles, so Phase 2 compares those values directly:
 
           - SELL if current rank percentile < rl_exit_threshold
             (e.g. 0.20 means "bottom 20% of today's shortlist")
@@ -1021,24 +1183,23 @@ class BrokerBrain:
         if rl_scores.empty:
             return exit_decisions
 
-        # Convert raw scores to rank percentiles within the current shortlist.
+        # Higher rl_scores values already mean higher shortlist percentile.
         # Higher score → higher percentile (1.0 = top of shortlist).
         n = len(rl_scores)
-        rank_series = rl_scores.rank(method="average", ascending=True) / n
 
         for ticker in held_tickers:
             pos = self.portfolio.positions.get(ticker)
             if pos is None:
                 continue
 
-            if ticker not in rank_series.index:
+            if ticker not in rl_scores.index:
                 logger.debug(
                     "RL exit check: %s not in cycle rl_scores — deferring to heuristic exits",
                     ticker,
                 )
                 continue
 
-            current_rank_pct = float(rank_series[ticker])
+            current_rank_pct = float(rl_scores[ticker])
             price = pos.get("last_price", 0.0)
             shares = pos.get("shares", 0.0)
             # Use rank-percentile at entry if available; fall back to raw score

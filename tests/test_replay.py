@@ -175,6 +175,35 @@ def test_execute_replay_decisions_applies_execution_cost_to_sell_proceeds():
     assert trade_log[0]["price"] == 9.0
 
 
+def test_execute_replay_partial_sale_marks_partial_taken_after_fill():
+    import broker.brain as brain_module
+
+    portfolio = replay_module.ReplayPortfolio(initial_cash=1_000.0)
+    assert portfolio.buy("AAA", shares=10.0, price=10.0, reason="seed") is True
+
+    trade_log = []
+    decision = brain_module.Decision(
+        action="SELL_PARTIAL",
+        ticker="AAA",
+        shares=5.0,
+        price=10.0,
+        score=0.8,
+        reason="Partial take-profit (25.0%), selling 50%",
+    )
+
+    replay_module._execute_replay_decisions(
+        portfolio=portfolio,
+        decisions=[decision],
+        execution_spread=0.0,
+        trade_log=trade_log,
+        date=pd.Timestamp("2024-01-03"),
+    )
+
+    assert portfolio.positions["AAA"]["shares"] == 5.0
+    assert portfolio.positions["AAA"]["partial_taken"] is True
+    assert trade_log[0]["action"] == "SELL_PARTIAL"
+
+
 def test_run_replay_preserves_rl_entry_metadata(monkeypatch):
     df_features = _feature_frame()
     price_lookup = _price_lookup()

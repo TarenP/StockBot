@@ -18,6 +18,19 @@ import pandas as pd
 import yfinance as yf
 from tqdm import tqdm
 
+from pipeline.checkpoints import load_checkpoint_asset_list
+from pipeline.universe_resolver import (
+    constrain_to_configured_universe,
+    filter_candidate_tickers,
+    get_investable_universe_filters,
+    get_universe_mode,
+    is_benchmark_constrained_mode,
+    load_typed_config,
+    normalize_ticker,
+    normalize_tickers,
+    resolve_configured_universe,
+)
+
 logger = logging.getLogger(__name__)
 
 # Silence yfinance's own error output entirely
@@ -39,10 +52,11 @@ def _suppress_stderr():
 PARQUET_PATH = Path("MasterDS/stooq_panel.parquet")
 WATCHLIST_PATH = Path("broker/state/watchlist.csv")
 CHUNK_SIZE   = 50   # tickers per yfinance batch request
+_DEFAULT_BENCHMARK_SYMBOLS = ["SPY"]
 
 
 def _normalize_ticker(ticker: str) -> str:
-    return str(ticker).strip().upper().replace(".", "-")
+    return normalize_ticker(ticker)
 
 
 def _is_bootstrap_symbol(ticker: str) -> bool:
@@ -53,15 +67,10 @@ def _is_bootstrap_symbol(ticker: str) -> bool:
 
 
 def _clean_tickers(symbols) -> list[str]:
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for symbol in symbols or []:
-        ticker = _normalize_ticker(symbol)
-        if not _is_bootstrap_symbol(ticker) or ticker in seen:
-            continue
-        seen.add(ticker)
-        cleaned.append(ticker)
-    return cleaned
+    return [
+        ticker for ticker in normalize_tickers(symbols)
+        if _is_bootstrap_symbol(ticker)
+    ]
 
 
 def _extend_unique_tickers(candidates: list[str], seen: set[str], symbols) -> None:
@@ -70,6 +79,14 @@ def _extend_unique_tickers(candidates: list[str], seen: set[str], symbols) -> No
             continue
         seen.add(ticker)
         candidates.append(ticker)
+
+
+def _benchmark_symbols(config: dict | None = None) -> list[str]:
+    cfg = config or {}
+    raw = cfg.get("benchmark_symbols", _DEFAULT_BENCHMARK_SYMBOLS)
+    if isinstance(raw, str):
+        raw = [part for part in raw.replace(";", ",").split(",") if part.strip()]
+    return _clean_tickers(raw)
 
 
 def _bootstrap_universe(target_size: int = 1500) -> list[str]:
@@ -278,20 +295,12 @@ def _load_trained_universe(save_dir: str = "models") -> list[str] | None:
     Read the universe (top_n tickers) from the best available checkpoint.
     Falls back to None if no checkpoint found.
     """
-    import glob, torch
-    ckpts = sorted(glob.glob(f"{save_dir}/best_fold*.pt"))
-    if not ckpts:
-        return None
-    try:
-        meta = torch.load(ckpts[-1], map_location="cpu", weights_only=False)
-        # model_cfg stores n_assets which tells us the universe size,
-        # but we need the actual ticker list — stored in asset_list if present
-        return meta.get("asset_list", None)
-    except Exception:
-        return None
+    return load_checkpoint_asset_list(save_dir=save_dir)
 
 
-def _load_parquet_universe() -> list[str]:
+def _load_parquet_universe(
+    max_stale_days: int = 30,
+) -> list[str]:
     if not PARQUET_PATH.exists():
         return []
     try:
@@ -301,7 +310,28 @@ def _load_parquet_universe() -> list[str]:
         return []
     if "ticker" not in df.columns:
         return []
-    return _clean_tickers(df["ticker"].dropna().tolist())
+
+    if "date" not in df.columns:
+        try:
+            df = pd.read_parquet(PARQUET_PATH)
+        except Exception as exc:
+            logger.debug("Could not load dated parquet universe: %s", exc)
+            return _clean_tickers(df["ticker"].dropna().tolist())
+
+    if "date" not in df.columns:
+        return _clean_tickers(df["ticker"].dropna().tolist())
+
+    frame = df.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+    frame["ticker"] = frame["ticker"].astype(str).str.upper()
+    frame = frame.dropna(subset=["date", "ticker"])
+    if frame.empty:
+        return []
+
+    latest_date = frame["date"].max()
+    cutoff = latest_date - pd.Timedelta(days=int(max_stale_days))
+    recent = frame.loc[frame["date"] >= cutoff, "ticker"].dropna().tolist()
+    return _clean_tickers(recent)
 
 
 def _load_watchlist_universe() -> list[str]:
@@ -321,44 +351,277 @@ def get_live_universe(
     preferred: list[str] | None = None,
     save_dir: str = "models",
     target_size: int | None = None,
+    config: dict | None = None,
+    mode: str | None = None,
+    as_of_date=None,
 ) -> list[str]:
     """
-    Resolve the broadest live ticker universe currently available.
+    Resolve the configured live ticker universe.
 
-    Priority order:
-    1. Caller-supplied preferred tickers
-    2. Trained checkpoint universe (when no preferred list is supplied)
-    3. All tickers already cached in the local parquet
-    4. Watchlist discoveries
-    5. Live bootstrap sources to fill any remaining gaps
+    Benchmark-constrained modes such as ``sp500`` return the exact membership
+    snapshot. Broad mode (``tradable_us``) unions local sources and bootstrap
+    candidates, then filters obvious non-equity / malformed instruments.
     """
+    cfg = config if config is not None else load_typed_config()
+    resolved_mode = (mode or get_universe_mode(cfg)).strip().lower()
+
+    if is_benchmark_constrained_mode(resolved_mode):
+        resolved = resolve_configured_universe(
+            as_of_date=as_of_date,
+            save_dir=save_dir,
+            config={**cfg, "universe_mode": resolved_mode},
+        )
+        preferred_tickers = constrain_to_configured_universe(
+            preferred,
+            as_of_date=as_of_date,
+            save_dir=save_dir,
+            config={**cfg, "universe_mode": resolved_mode},
+        )
+        if not preferred_tickers:
+            logger.info(
+                "Resolved live universe: %d tickers (mode=%s)",
+                len(resolved),
+                resolved_mode,
+            )
+            return resolved
+
+        preferred_set = set(preferred_tickers)
+        ordered = preferred_tickers + [ticker for ticker in resolved if ticker not in preferred_set]
+        logger.info(
+            "Resolved live universe: %d tickers (mode=%s, preferred=%d)",
+            len(ordered),
+            resolved_mode,
+            len(preferred_tickers),
+        )
+        return ordered
+
+    broad_target = int(
+        target_size
+        or cfg.get("live_target_size")
+        or max(int(cfg.get("top_n", 500)) * 3, 1000)
+    )
+    filters = get_investable_universe_filters(cfg)
     candidates: list[str] = []
     seen: set[str] = set()
 
-    preferred_tickers = _clean_tickers(preferred or [])
-    _extend_unique_tickers(candidates, seen, preferred_tickers)
+    def _extend(symbols) -> None:
+        _extend_unique_tickers(candidates, seen, symbols)
 
-    if not preferred_tickers:
-        _extend_unique_tickers(candidates, seen, _load_trained_universe(save_dir) or [])
+    _extend(preferred)
+    _extend(_load_trained_universe(save_dir))
+    _extend(_load_parquet_universe(max_stale_days=int(filters["max_stale_days"])))
+    _extend(_load_watchlist_universe())
+    if len(candidates) < broad_target:
+        _extend(_bootstrap_universe(broad_target))
 
-    parquet_universe = _load_parquet_universe()
-    watchlist_universe = _load_watchlist_universe()
-    _extend_unique_tickers(candidates, seen, parquet_universe)
-    _extend_unique_tickers(candidates, seen, watchlist_universe)
-
-    minimum_target = 1500 if not parquet_universe else len(parquet_universe)
-    target = max(int(target_size or 0), len(candidates), minimum_target)
-    if len(candidates) < target:
-        _extend_unique_tickers(candidates, seen, _bootstrap_universe(target))
+    filtered = filter_candidate_tickers(candidates, config=cfg)
+    if broad_target > 0:
+        filtered = filtered[:broad_target]
 
     logger.info(
-        "Resolved live universe: %d tickers (%d preferred, %d parquet, %d watchlist)",
-        len(candidates),
-        len(preferred_tickers),
-        len(parquet_universe),
-        len(watchlist_universe),
+        "Resolved live universe: %d tickers (mode=%s, target=%d, preferred=%d)",
+        len(filtered),
+        resolved_mode,
+        broad_target,
+        len(_clean_tickers(preferred)),
     )
-    return candidates
+    return filtered
+
+
+def _prune_to_allowed_universe(
+    df: pd.DataFrame,
+    allowed_tickers: list[str],
+) -> tuple[pd.DataFrame, list[str]]:
+    if df.empty:
+        return df, []
+
+    allowed = set(_clean_tickers(allowed_tickers))
+    if not allowed:
+        return df, []
+
+    df_reset = df.reset_index()
+    if "ticker" not in df_reset.columns:
+        return df, []
+
+    tickers = df_reset["ticker"].astype(str).str.upper()
+    removed = sorted(set(_clean_tickers(tickers.tolist())) - allowed)
+    if not removed:
+        return df, []
+
+    pruned = df_reset[tickers.isin(allowed)].copy()
+    pruned["date"] = pd.to_datetime(pruned["date"]).dt.normalize()
+    pruned = pruned.set_index("date").sort_index()
+    return pruned, removed
+
+
+def _update_parquet_configured(
+    universe: list[str] | None = None,
+    force_full_refresh: bool = False,
+    save_dir: str = "models",
+    config: dict | None = None,
+    universe_mode: str | None = None,
+    prune_to_resolved_universe: bool | None = None,
+    as_of_date=None,
+) -> int:
+    if PARQUET_PATH.exists():
+        existing = pd.read_parquet(PARQUET_PATH)
+        last_date = pd.to_datetime(existing.index).max().normalize()
+    else:
+        existing = None
+        last_date = None
+
+    cfg = config if config is not None else load_typed_config()
+    resolved_mode = (universe_mode or get_universe_mode(cfg)).strip().lower()
+    if is_benchmark_constrained_mode(resolved_mode):
+        resolved_universe = resolve_configured_universe(
+            as_of_date=as_of_date,
+            save_dir=save_dir,
+            config={**cfg, "universe_mode": resolved_mode},
+        )
+        if prune_to_resolved_universe is None:
+            prune_to_resolved_universe = bool(cfg.get("prune_universe_rows", False))
+
+        if universe is None:
+            effective_universe = list(resolved_universe)
+        else:
+            explicit_universe = _clean_tickers(universe)
+            effective_universe = constrain_to_configured_universe(
+                explicit_universe,
+                as_of_date=as_of_date,
+                save_dir=save_dir,
+                config={**cfg, "universe_mode": resolved_mode},
+            )
+            dropped = sorted(set(explicit_universe) - set(effective_universe))
+            if dropped:
+                logger.warning(
+                    "Dropped %d ticker(s) outside configured %s universe: %s%s",
+                    len(dropped),
+                    resolved_mode,
+                    ", ".join(dropped[:10]),
+                    f" ... (+{len(dropped) - 10} more)" if len(dropped) > 10 else "",
+                )
+    else:
+        resolved_universe = []
+        if prune_to_resolved_universe is None:
+            prune_to_resolved_universe = bool(cfg.get("prune_universe_rows", False))
+        effective_universe = get_live_universe(
+            preferred=universe,
+            save_dir=save_dir,
+            target_size=int(cfg.get("live_target_size", max(int(cfg.get("top_n", 500)) * 3, 1000))),
+            config={**cfg, "universe_mode": resolved_mode},
+            mode=resolved_mode,
+            as_of_date=as_of_date,
+        )
+
+    if not effective_universe:
+        raise ValueError(
+            f"Configured universe for mode={resolved_mode!r} resolved to zero tickers."
+        )
+
+    benchmark_symbols = _benchmark_symbols(cfg)
+    if benchmark_symbols:
+        combined_universe: list[str] = []
+        seen_combined: set[str] = set()
+        _extend_unique_tickers(combined_universe, seen_combined, effective_universe)
+        _extend_unique_tickers(combined_universe, seen_combined, benchmark_symbols)
+        effective_universe = combined_universe
+
+    logger.info(
+        "Updating %d tickers (mode=%s).",
+        len(effective_universe),
+        resolved_mode,
+    )
+
+    existing_tickers = set(existing["ticker"].unique()) if existing is not None else set()
+    new_tickers = [ticker for ticker in effective_universe if ticker not in existing_tickers]
+    known_tickers = [ticker for ticker in effective_universe if ticker in existing_tickers]
+
+    if new_tickers:
+        logger.info("  %d new tickers â€” fetching full history from 2010...", len(new_tickers))
+    if known_tickers:
+        logger.info("  %d existing tickers â€” fetching recent data...", len(known_tickers))
+
+    if last_date is not None:
+        if force_full_refresh:
+            fetch_start = (last_date - timedelta(days=30)).strftime("%Y-%m-%d")
+        else:
+            fetch_start = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+    else:
+        fetch_start = "2010-01-01"
+
+    fetch_end = (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+    today_str = datetime.today().strftime("%Y-%m-%d")
+
+    all_new_rows: list[pd.DataFrame] = []
+    if known_tickers and fetch_start < today_str:
+        logger.info("Fetching from %s to %s...", fetch_start, fetch_end)
+        df_known = _fetch_yfinance(known_tickers, fetch_start, fetch_end)
+        if not df_known.empty:
+            all_new_rows.append(df_known)
+
+    if new_tickers:
+        logger.info("Fetching full history for %d new tickers...", len(new_tickers))
+        df_new_tickers = _fetch_yfinance(new_tickers, "2010-01-01", fetch_end)
+        if not df_new_tickers.empty:
+            all_new_rows.append(df_new_tickers)
+            logger.info(
+                "  Got %d rows for %d new tickers.",
+                len(df_new_tickers),
+                df_new_tickers["ticker"].nunique(),
+            )
+
+    if not all_new_rows:
+        logger.info("No new price data returned.")
+        return 0
+
+    new_df = pd.concat(all_new_rows, ignore_index=True)
+    new_df["date"] = pd.to_datetime(new_df["date"]).dt.normalize()
+    new_df = new_df.set_index("date").sort_index()
+
+    if existing is not None:
+        if force_full_refresh:
+            cutoff = pd.to_datetime(fetch_start)
+            existing = existing[pd.to_datetime(existing.index) < cutoff]
+        combined = pd.concat([existing, new_df])
+    else:
+        combined = new_df
+
+    combined = combined.reset_index()
+    combined["date"] = pd.to_datetime(combined["date"]).dt.normalize()
+    combined = combined.drop_duplicates(subset=["date", "ticker"], keep="last")
+    combined = combined.set_index("date").sort_index()
+
+    if prune_to_resolved_universe and resolved_universe:
+        combined, removed_non_members = _prune_to_allowed_universe(combined, resolved_universe)
+        if removed_non_members:
+            logger.info(
+                "Pruned %d non-member ticker(s) from parquet for mode=%s: %s%s",
+                len(removed_non_members),
+                resolved_mode,
+                ", ".join(removed_non_members[:10]),
+                f" ... (+{len(removed_non_members) - 10} more)"
+                if len(removed_non_members) > 10 else "",
+            )
+
+    if bool(cfg.get("prune_stale_history", False)):
+        filters = get_investable_universe_filters(cfg)
+        combined, pruned = prune_stale_tickers(
+            combined,
+            stale_days=int(filters["max_stale_days"]),
+            min_history_days=int(filters["min_history_days"]),
+        )
+        if pruned:
+            logger.info(
+                "Parquet pruned: %d stale ticker(s) removed, %d remaining.",
+                len(pruned),
+                combined["ticker"].nunique(),
+            )
+
+    combined.to_parquet(PARQUET_PATH, index=True)
+
+    n_new = len(new_df)
+    logger.info("Done. %d new rows added. Total: %d", n_new, len(combined))
+    return n_new
 
 
 def prune_stale_tickers(
@@ -479,26 +742,38 @@ def update_parquet(
     force_full_refresh: bool = False,
     save_dir: str = "models",
     bootstrap_universe_size: int | None = None,
+    config: dict | None = None,
+    universe_mode: str | None = None,
+    prune_to_resolved_universe: bool | None = None,
+    as_of_date=None,
 ) -> int:
     """
     Append new trading days to the master parquet.
 
-    Only updates tickers in `universe`. If universe is None, tries to load
-    it from the best checkpoint. Falls back to all parquet tickers only as
-    a last resort (and warns loudly).
+    Only updates tickers in `universe`. If universe is None, it resolves the
+    configured benchmark universe.
 
     Args:
         universe:           explicit list of tickers to update
         force_full_refresh: re-download the last 30 days (fixes gaps)
         save_dir:           where to look for checkpoints
         bootstrap_universe_size:
-            first-run fallback when there is no checkpoint and no existing
-            parquet yet. Ignored once either of those exists.
+            retained for backward compatibility; ignored by the configured
+            benchmark-aware implementation.
 
     Returns:
         Number of new rows appended.
     """
     PARQUET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return _update_parquet_configured(
+        universe=universe,
+        force_full_refresh=force_full_refresh,
+        save_dir=save_dir,
+        config=config,
+        universe_mode=universe_mode,
+        prune_to_resolved_universe=prune_to_resolved_universe,
+        as_of_date=as_of_date,
+    )
 
     # ── Load existing parquet ────────────────────────────────────────────────
     if PARQUET_PATH.exists():

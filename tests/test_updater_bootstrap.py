@@ -34,50 +34,50 @@ def _workspace_csv_path(prefix: str) -> Path:
     return Path.cwd() / f".{prefix}_{uuid4().hex}.csv"
 
 
-def test_update_parquet_bootstraps_initial_universe(monkeypatch):
+def test_update_parquet_uses_configured_universe_when_universe_missing(monkeypatch):
     parquet_path = _workspace_parquet_path()
     calls: dict[str, object] = {}
 
     try:
         monkeypatch.setattr(updater, "PARQUET_PATH", parquet_path)
-        monkeypatch.setattr(updater, "_load_trained_universe", lambda save_dir: None)
-
-        def fake_bootstrap(size: int) -> list[str]:
-            calls["bootstrap_size"] = size
-            return ["AAA", "BBB"]
+        monkeypatch.setattr(
+            updater,
+            "resolve_configured_universe",
+            lambda **kwargs: ["AAA", "BBB"],
+        )
+        monkeypatch.setattr(updater, "prune_stale_tickers", lambda df: (df, []))
 
         def fake_fetch(tickers: list[str], start: str, end: str) -> pd.DataFrame:
             calls["tickers"] = list(tickers)
+            calls["start"] = start
+            calls["end"] = end
             return _price_rows(list(tickers))
 
-        monkeypatch.setattr(updater, "_bootstrap_universe", fake_bootstrap)
         monkeypatch.setattr(updater, "_fetch_yfinance", fake_fetch)
 
         n_new = updater.update_parquet(
             save_dir="models",
-            bootstrap_universe_size=123,
+            config={"universe_mode": "sp500"},
         )
 
-        assert n_new == 2
-        assert calls["bootstrap_size"] == 123
-        assert calls["tickers"] == ["AAA", "BBB"]
+        assert n_new == 3
+        assert calls["tickers"] == ["AAA", "BBB", "SPY"]
         assert parquet_path.exists()
 
         saved = pd.read_parquet(parquet_path)
-        assert sorted(saved["ticker"].tolist()) == ["AAA", "BBB"]
+        assert sorted(saved["ticker"].tolist()) == ["AAA", "BBB", "SPY"]
     finally:
         parquet_path.unlink(missing_ok=True)
 
 
-def test_update_parquet_raises_if_bootstrap_finds_no_tickers(monkeypatch):
+def test_update_parquet_raises_if_configured_universe_is_empty(monkeypatch):
     parquet_path = _workspace_parquet_path()
     try:
         monkeypatch.setattr(updater, "PARQUET_PATH", parquet_path)
-        monkeypatch.setattr(updater, "_load_trained_universe", lambda save_dir: None)
-        monkeypatch.setattr(updater, "_bootstrap_universe", lambda size: [])
+        monkeypatch.setattr(updater, "resolve_configured_universe", lambda **kwargs: [])
 
-        with pytest.raises(ValueError, match="Could not bootstrap an initial ticker universe"):
-            updater.update_parquet(save_dir="models", bootstrap_universe_size=50)
+        with pytest.raises(ValueError, match="resolved to zero tickers"):
+            updater.update_parquet(save_dir="models", config={"universe_mode": "sp500"})
     finally:
         parquet_path.unlink(missing_ok=True)
 
@@ -106,7 +106,7 @@ def test_ensure_price_data_bootstraps_missing_parquet(monkeypatch):
         parquet_path.unlink(missing_ok=True)
 
 
-def test_get_live_universe_uses_local_sources_before_bootstrap(monkeypatch):
+def test_get_live_universe_uses_resolved_configured_membership(monkeypatch):
     parquet_path = _workspace_parquet_path()
     watchlist_path = _workspace_csv_path("test_watchlist")
 
@@ -116,16 +116,24 @@ def test_get_live_universe_uses_local_sources_before_bootstrap(monkeypatch):
 
         monkeypatch.setattr(updater, "PARQUET_PATH", parquet_path)
         monkeypatch.setattr(updater, "WATCHLIST_PATH", watchlist_path)
-        monkeypatch.setattr(updater, "_load_trained_universe", lambda save_dir: ["AAA", "DDD"])
         monkeypatch.setattr(
             updater,
-            "_bootstrap_universe",
-            lambda target_size: pytest.fail("bootstrap should not run when local sources are sufficient"),
+            "resolve_configured_universe",
+            lambda **kwargs: ["AAA", "DDD", "BBB"],
+        )
+        monkeypatch.setattr(
+            updater,
+            "constrain_to_configured_universe",
+            lambda tickers, **kwargs: [ticker for ticker in (tickers or []) if ticker in {"AAA", "DDD", "BBB"}],
         )
 
-        resolved = updater.get_live_universe(save_dir="models")
+        resolved = updater.get_live_universe(
+            preferred=["DDD", "ZZZ"],
+            save_dir="models",
+            config={"universe_mode": "sp500"},
+        )
 
-        assert resolved == ["AAA", "DDD", "BBB", "CCC"]
+        assert resolved == ["DDD", "AAA", "BBB"]
     finally:
         parquet_path.unlink(missing_ok=True)
         watchlist_path.unlink(missing_ok=True)
@@ -140,7 +148,7 @@ def test_update_sentiment_expands_to_live_universe(monkeypatch):
         monkeypatch.setattr(
             updater,
             "get_live_universe",
-            lambda preferred, save_dir, target_size: ["AAA", "BBB", "CCC"],
+            lambda **kwargs: ["AAA", "BBB", "CCC"],
         )
 
         def fake_fetch_and_score(tickers: list[str], lookback_days: int = 7) -> pd.DataFrame:
@@ -172,3 +180,33 @@ def test_update_sentiment_expands_to_live_universe(monkeypatch):
         assert saved["stock"].tolist() == ["AAA"]
     finally:
         sentiment_path.unlink(missing_ok=True)
+
+
+def test_update_parquet_keeps_benchmark_symbol_in_price_universe(monkeypatch):
+    parquet_path = _workspace_parquet_path()
+    calls: dict[str, object] = {}
+
+    try:
+        monkeypatch.setattr(updater, "PARQUET_PATH", parquet_path)
+        monkeypatch.setattr(
+            updater,
+            "get_live_universe",
+            lambda **kwargs: ["AAA", "BBB"],
+        )
+        monkeypatch.setattr(updater, "prune_stale_tickers", lambda df, **kwargs: (df, []))
+
+        def fake_fetch(tickers: list[str], start: str, end: str) -> pd.DataFrame:
+            calls["tickers"] = list(tickers)
+            return _price_rows(list(tickers))
+
+        monkeypatch.setattr(updater, "_fetch_yfinance", fake_fetch)
+
+        updater.update_parquet(
+            save_dir="models",
+            config={"universe_mode": "tradable_us", "benchmark_symbols": "SPY"},
+        )
+
+        assert "SPY" in calls["tickers"]
+        assert {"AAA", "BBB"} <= set(calls["tickers"])
+    finally:
+        parquet_path.unlink(missing_ok=True)

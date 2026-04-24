@@ -23,6 +23,19 @@ logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 WATCHLIST_PATH = Path("broker/state/watchlist.csv")
 
 
+def _discovery_enabled() -> bool:
+    try:
+        from pipeline.universe_resolver import (
+            get_universe_mode,
+            is_benchmark_constrained_mode,
+            load_typed_config,
+        )
+
+        return not is_benchmark_constrained_mode(get_universe_mode(load_typed_config()))
+    except Exception:
+        return True
+
+
 @contextmanager
 def _quiet():
     with open(os.devnull, "w") as dn:
@@ -58,6 +71,10 @@ def discover_new_tickers(max_new: int = 200) -> list[str]:
     2. Yahoo Finance trending
     Returns list of new validated tickers.
     """
+    if not _discovery_enabled():
+        logger.info("Universe discovery disabled in benchmark-constrained mode.")
+        return []
+
     known    = get_parquet_universe()
     watchlist = load_watchlist()
     already  = known | watchlist
@@ -129,6 +146,10 @@ def refresh_universe(max_new: int = 200) -> list[str]:
     and append to the master parquet.
     Returns list of newly added tickers.
     """
+    if not _discovery_enabled():
+        logger.info("Universe refresh disabled in benchmark-constrained mode.")
+        return []
+
     new_tickers = discover_new_tickers(max_new=max_new)
     if not new_tickers:
         logger.info("No new tickers discovered.")

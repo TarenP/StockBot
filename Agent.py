@@ -94,21 +94,9 @@ def parse_args():
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _best_checkpoint(save_dir: str) -> str | None:
-    ckpts = sorted(glob.glob(f"{save_dir}/best_fold*.pt"))
-    if not ckpts:
-        return None
-    # Pick by best val_sharpe, not alphabetically
-    best, best_sharpe = None, float("-inf")
-    for p in ckpts:
-        try:
-            meta = torch.load(p, map_location="cpu", weights_only=False)
-            s = float(meta.get("val_sharpe", float("-inf")))
-            if s > best_sharpe:
-                best_sharpe = s
-                best = p
-        except Exception:
-            pass
-    return best or ckpts[-1]
+    from pipeline.checkpoints import resolve_checkpoint_path
+
+    return resolve_checkpoint_path(save_dir=save_dir)
 
 
 def _load_broker_config(path: str = "broker.config") -> dict:
@@ -132,6 +120,27 @@ def _resolve_top_n(args) -> int:
         return int(args.top_n)
 
     cfg = _load_broker_config()
+    typed_cfg = _load_typed_config()
+    try:
+        from pipeline.universe_resolver import (
+            get_universe_mode,
+            is_benchmark_constrained_mode,
+            resolve_configured_universe,
+        )
+
+        universe_mode = get_universe_mode(typed_cfg)
+        configured_universe = resolve_configured_universe(config=typed_cfg)
+        if configured_universe and is_benchmark_constrained_mode(universe_mode):
+            top_n = len(configured_universe)
+            logger.info(
+                "Using top_n=%d from configured universe mode=%s",
+                top_n,
+                universe_mode,
+            )
+            return top_n
+    except Exception as exc:
+        logger.warning("Could not resolve configured universe size for top_n: %s", exc)
+
     try:
         top_n = int(cfg.get("top_n", 500))
     except (TypeError, ValueError):
@@ -184,17 +193,44 @@ def _load_data_and_universe(
     universe_as_of_date: pd.Timestamp | None = None,
 ):
     from pipeline.data import load_master, get_asset_universe
+    from pipeline.universe_resolver import (
+        get_investable_universe_filters,
+        get_universe_mode,
+        is_benchmark_constrained_mode,
+        normalize_tickers,
+        resolve_configured_universe,
+    )
+
+    cfg = _load_typed_config()
+    investable_filters = get_investable_universe_filters(cfg)
     df = load_master(
         top_n=top_n,
+        min_history_days=int(investable_filters["min_history_days"]),
+        min_price=float(investable_filters["min_price"]),
+        min_avg_volume=float(investable_filters["min_avg_volume"]),
         include_raw_cols=include_raw_cols,
         universe_as_of_date=universe_as_of_date,
+        config=cfg,
     )
-    asset_list = get_asset_universe(
-        df,
-        top_n=top_n,
-        lookback_years=5,
-        as_of_date=universe_as_of_date,
-    )
+    if is_benchmark_constrained_mode(get_universe_mode(cfg)):
+        configured_universe = normalize_tickers(
+            resolve_configured_universe(
+                as_of_date=universe_as_of_date,
+                save_dir="models",
+                config=cfg,
+            )
+        )
+        available = set(df.index.get_level_values("ticker").unique())
+        asset_list = [ticker for ticker in configured_universe if ticker in available]
+    else:
+        asset_list = []
+    if not asset_list:
+        asset_list = get_asset_universe(
+            df,
+            top_n=top_n,
+            lookback_years=5,
+            as_of_date=universe_as_of_date,
+        )
     df = df[df.index.get_level_values("ticker").isin(asset_list)]
     return df, asset_list
 
@@ -269,6 +305,7 @@ def run_update(args):
     from pipeline.sentiment import update_sentiment
 
     logger.info("Fetching latest market data...")
+    cfg = _load_typed_config()
 
     # --expand_universe: use parquet + bootstrap to get the broadest possible universe
     explicit_universe = None
@@ -284,6 +321,7 @@ def run_update(args):
         save_dir=args.save_dir,
         force_full_refresh=args.force_refresh or getattr(args, "expand_universe", False),
         bootstrap_universe_size=_bootstrap_universe_size(_resolve_top_n(args)),
+        config=cfg,
     )
     if n_price:
         logger.info(f"Price data: {n_price} new rows added.")
@@ -292,11 +330,15 @@ def run_update(args):
 
     # Sentiment update — use expanded universe if requested, else checkpoint
     try:
-        from pipeline.updater import _load_trained_universe
-        if explicit_universe is not None:
-            universe = explicit_universe
-        else:
-            universe = _load_trained_universe(args.save_dir)
+        from pipeline.updater import get_live_universe
+
+        universe = explicit_universe
+        if universe is None:
+            universe = get_live_universe(
+                save_dir=args.save_dir,
+                target_size=_bootstrap_universe_size(_resolve_top_n(args)),
+                config=cfg,
+            )
         if universe is None:
             df, universe = _load_data_and_universe(_resolve_top_n(args))
         logger.info(f"Fetching news sentiment for {len(universe)} tickers...")
@@ -835,9 +877,12 @@ def run_schedule(args):
     from pipeline.scheduler import run_scheduler
     # Pass the universe so the scheduler knows what to update
     try:
-        from pipeline.data import load_master, get_asset_universe
-        df = load_master()
-        universe = get_asset_universe(df, top_n=args.top_n)
+        from pipeline.updater import get_live_universe
+
+        universe = get_live_universe(
+            target_size=_bootstrap_universe_size(_resolve_top_n(args)),
+            config=_load_typed_config(),
+        )
     except Exception:
         universe = None   # scheduler will infer from parquet
     run_scheduler(universe=universe)

@@ -388,3 +388,27 @@ def test_weights_to_rank_scores_keeps_zero_weight_assets_at_zero():
         np.array([0.0, 1.0, 0.5, 0.0]),
         atol=1e-8,
     )
+
+
+def test_audit_mode_exposes_raw_weight_normalized_weight_and_rank_pct():
+    import pipeline.rl_inference as rl_mod
+    rl_mod._MODEL_CACHE.clear()
+
+    asset_list = ["AAPL", "MSFT", "NVDA"]
+    df = _make_df_recent(asset_list, n_dates=25, seed=7)
+    ckpt_path = _make_checkpoint(asset_list, lookback=20)
+
+    audit = get_rl_targets(
+        df,
+        asset_list,
+        ckpt_path,
+        mode="audit",
+        device=torch.device("cpu"),
+        lookback=20,
+    )
+
+    assert list(audit.index) == asset_list
+    assert {"rl_raw_weight", "rl_weight", "rl_rank_pct", "insufficient_history"} <= set(audit.columns)
+    assert (audit["rl_weight"] >= 0.0).all()
+    assert (audit["rl_rank_pct"] >= 0.0).all()
+    assert (audit["rl_rank_pct"] <= 1.0).all()

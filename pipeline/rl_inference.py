@@ -72,6 +72,23 @@ def _weights_to_rank_scores(asset_weights: np.ndarray) -> np.ndarray:
     return scores
 
 
+def _normalize_asset_weights(asset_weights: np.ndarray) -> np.ndarray:
+    """
+    Normalize positive asset weights onto [0, 1] by total positive exposure.
+
+    Zero or non-finite weights remain at 0.0 so callers can distinguish names
+    that received no usable RL conviction.
+    """
+    weights = np.asarray(asset_weights, dtype=float)
+    normalized = np.zeros_like(weights, dtype=float)
+    positive_mask = np.isfinite(weights) & (weights > 0.0)
+    total_positive = float(weights[positive_mask].sum())
+    if total_positive <= 0.0:
+        return normalized
+    normalized[positive_mask] = weights[positive_mask] / total_positive
+    return normalized
+
+
 def _load_model(
     checkpoint_path: str,
     device: torch.device,
@@ -249,7 +266,7 @@ def get_rl_targets(
     mode: str = "rank",
     device: Optional[torch.device] = None,
     lookback: int = 20,
-) -> pd.Series:
+) -> pd.Series | pd.DataFrame:
     """
     Load the PortfolioTransformer checkpoint and run a forward pass.
 
@@ -351,12 +368,14 @@ def get_rl_targets(
         if ticker in asset_map:
             asset_weights[asset_map[ticker]] = 0.0
 
+    normalized_asset_weights = _normalize_asset_weights(asset_weights)
+    rank_scores = _weights_to_rank_scores(asset_weights)
+    insufficient_set = set(insufficient)
+
     if mode == "rank":
         # Use rank percentiles for entry/exit semantics so score meaning does
         # not shrink as the shortlist grows. Zero-weight assets stay at 0.0.
-        scores = _weights_to_rank_scores(asset_weights)
-
-        return pd.Series(scores, index=asset_list, name="rl_score", dtype=float)
+        return pd.Series(rank_scores, index=asset_list, name="rl_score", dtype=float)
 
     elif mode == "weights":
         # Full weight vector including CASH
@@ -381,8 +400,21 @@ def get_rl_targets(
 
         return result
 
+    elif mode == "audit":
+        return pd.DataFrame(
+            {
+                "rl_raw_weight": np.asarray(asset_weights, dtype=float),
+                "rl_weight": np.asarray(normalized_asset_weights, dtype=float),
+                "rl_rank_pct": np.asarray(rank_scores, dtype=float),
+                "insufficient_history": [
+                    ticker in insufficient_set for ticker in asset_list
+                ],
+            },
+            index=pd.Index(asset_list, name="ticker"),
+        )
+
     else:
-        raise ValueError(f"Unknown mode '{mode}'. Expected 'rank' or 'weights'.")
+        raise ValueError(f"Unknown mode '{mode}'. Expected 'rank', 'weights', or 'audit'.")
 
 
 # ── Phase 3 stub ──────────────────────────────────────────────────────────────

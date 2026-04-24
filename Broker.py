@@ -170,7 +170,8 @@ if __name__ == "__main__":
         try:
             from pipeline.maintenance import run_maintenance
             maintenance_context = run_maintenance(
-                initial_cash=float(config.get("cash", 10_000))
+                initial_cash=float(config.get("cash", 10_000)),
+                config=config,
             )
             # Reload config — maintenance may have updated it
             config = _load_config()
@@ -205,7 +206,7 @@ if __name__ == "__main__":
             from broker.shadows import run_shadow_cycle, get_shadow_summary
 
             logger.info("Loading data for shadow portfolios...")
-            df_features  = load_master(top_n=int(config.get("top_n", 500)))
+            df_features  = load_master(top_n=int(config.get("top_n", 500)), config=config)
             price_lookup = _build_price_lookup()
 
             run_shadow_cycle(

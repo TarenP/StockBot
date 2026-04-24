@@ -236,23 +236,9 @@ def _resolve_shadow_checkpoint(checkpoint_path: str | None) -> str | None:
     `rl_checkpoint_path=auto` the same way the live cycle does.
     Picks best by val_sharpe, not alphabetically.
     """
-    if not checkpoint_path or str(checkpoint_path).strip().lower() == "auto":
-        ckpts = sorted(Path("models").glob("best_fold*.pt"))
-        if not ckpts:
-            return None
-        import torch as _torch
-        best, best_sharpe = None, float("-inf")
-        for p in ckpts:
-            try:
-                meta = _torch.load(str(p), map_location="cpu", weights_only=False)
-                s = float(meta.get("val_sharpe", float("-inf")))
-                if s > best_sharpe:
-                    best_sharpe = s
-                    best = str(p)
-            except Exception:
-                pass
-        return best or str(ckpts[-1])
-    return checkpoint_path
+    from pipeline.checkpoints import resolve_checkpoint_path
+
+    return resolve_checkpoint_path(checkpoint_path=checkpoint_path, save_dir="models")
 
 
 def _is_current_validation(genome: dict) -> bool:

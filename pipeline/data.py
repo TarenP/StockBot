@@ -9,6 +9,14 @@ from pathlib import Path
 from tqdm import tqdm
 from pipeline.features import build_features
 from broker.sectors import get_cached_sector_map
+from pipeline.universe_resolver import (
+    filter_candidate_tickers,
+    get_universe_mode,
+    is_benchmark_constrained_mode,
+    load_typed_config,
+    normalize_tickers,
+    resolve_configured_universe,
+)
 
 
 DATA_DIR = Path("MasterDS")
@@ -129,6 +137,8 @@ def load_master(
     sentiment_lag_sessions: int = SENTIMENT_LAG_SESSIONS,
     use_snapshot_fundamentals: bool = False,
     universe_as_of_date: pd.Timestamp | None = None,
+    config: dict | None = None,
+    save_dir: str = "models",
 ) -> pd.DataFrame:
     """
     Load, merge, filter, and feature-engineer the master dataset.
@@ -176,11 +186,31 @@ def load_master(
         # ── 3. Universe pre-filter (BEFORE feature engineering) ──────────────
         pbar.set_description(f"Selecting universe")
         if universe is None:
-            universe = _select_universe_from_raw(
-                df_prices, top_n=top_n,
-                min_price=min_price, min_avg_volume=min_avg_volume,
-                as_of_date=universe_as_of_date,
-            )
+            cfg = config if config is not None else load_typed_config()
+            universe_mode = get_universe_mode(cfg)
+            if is_benchmark_constrained_mode(universe_mode):
+                universe = resolve_configured_universe(
+                    as_of_date=universe_as_of_date,
+                    save_dir=save_dir,
+                    config=cfg,
+                )
+            else:
+                eligible = filter_candidate_tickers(
+                    df_prices.index.get_level_values("ticker").unique().tolist(),
+                    config=cfg,
+                )
+                if eligible:
+                    df_prices = df_prices[
+                        df_prices.index.get_level_values("ticker").isin(eligible)
+                    ]
+                universe = _select_universe_from_raw(
+                    df_prices,
+                    top_n=top_n,
+                    min_price=min_price,
+                    min_avg_volume=min_avg_volume,
+                    as_of_date=universe_as_of_date,
+                )
+        universe = normalize_tickers(universe)
         df_prices = df_prices[df_prices.index.get_level_values("ticker").isin(universe)]
         tqdm.write(f"  Universe: {len(universe)} tickers "
                    f"({df_prices.index.get_level_values('date').nunique()} trading days)")

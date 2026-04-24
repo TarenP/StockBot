@@ -44,6 +44,9 @@ from broker.journal   import (
     log_cycle, print_report, print_recent_trades,
     daily_integrity_check, _fetch_current_spy_price,
 )
+from pipeline.checkpoints import resolve_checkpoint_path
+from pipeline.universe_resolver import get_investable_universe_filters
+from pipeline.universe_resolver import load_typed_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,23 +78,23 @@ def _resolve_checkpoint(path: str | None) -> str | None:
     Resolve 'auto' to the best available checkpoint in models/ by val_sharpe.
     Returns the path as-is for any other value.
     """
-    import glob, torch
-    if not path or str(path).strip().lower() == "auto":
-        ckpts = sorted(glob.glob("models/best_fold*.pt"))
-        if not ckpts:
-            return None
-        best, best_sharpe = None, float("-inf")
-        for p in ckpts:
-            try:
-                meta = torch.load(p, map_location="cpu", weights_only=False)
-                s = float(meta.get("val_sharpe", float("-inf")))
-                if s > best_sharpe:
-                    best_sharpe = s
-                    best = p
-            except Exception:
-                pass
-        return best or ckpts[-1]
-    return path
+    return resolve_checkpoint_path(checkpoint_path=path, save_dir="models")
+
+
+def _resolve_cycle_universe(
+    config: dict | None = None,
+    save_dir: str = "models",
+    as_of_date=None,
+) -> list[str]:
+    from pipeline.updater import get_live_universe
+
+    cfg = config if config is not None else load_typed_config()
+    return get_live_universe(
+        save_dir=save_dir,
+        config=cfg,
+        target_size=int(cfg.get("live_target_size", max(int(cfg.get("top_n", 500)) * 3, 1000))),
+        as_of_date=as_of_date,
+    )
 
 
 # ── Market hours check ────────────────────────────────────────────────────────
@@ -113,6 +116,7 @@ def run_cycle(
     top_n: int = 500,
     enforce_market_hours: bool = True,
     maintenance_context: dict | None = None,
+    config: dict | None = None,
 ):
     now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
     logger.info(f"{'='*55}")
@@ -131,13 +135,12 @@ def run_cycle(
     # ── Auto-update prices + sentiment ────────────────────────────────────────
     logger.info("Fetching latest market data and news...")
     try:
-        from pipeline.updater import update_parquet, _load_trained_universe
-        # Use checkpoint universe if available, otherwise use top_n from load_master
+        from pipeline.updater import update_parquet
         if prices_fresh_from_maintenance:
             logger.info("  Prices: already refreshed during maintenance")
         else:
-            universe = _load_trained_universe("models")
-            n_prices = update_parquet(universe=universe, save_dir="models")
+            universe = _resolve_cycle_universe(config=config, save_dir="models")
+            n_prices = update_parquet(universe=universe, save_dir="models", config=config)
             if n_prices:
                 logger.info(f"  Prices: {n_prices} new rows added")
             else:
@@ -146,13 +149,12 @@ def run_cycle(
         logger.warning(f"  Price update failed (continuing with cached data): {e}")
 
     try:
-        from pipeline.updater import _load_trained_universe
         from pipeline.sentiment import update_sentiment
         if sentiment_fresh_from_maintenance:
             logger.info("  Sentiment: already refreshed during maintenance")
             universe = []
         else:
-            universe = _load_trained_universe("models")
+            universe = _resolve_cycle_universe(config=config, save_dir="models")
         if not sentiment_fresh_from_maintenance and not universe:
             # No checkpoint yet — sentiment update will happen after first train
             logger.info("  Sentiment: skipping (no checkpoint yet — run --mode train first)")
@@ -183,12 +185,15 @@ def run_cycle(
     logger.info("Loading market data...")
     try:
         from pipeline.data import load_master
+        investable_filters = get_investable_universe_filters(config)
         df = load_master(
             top_n=top_n,
-            min_price=0.01,
-            min_avg_volume=5_000,
+            min_history_days=int(investable_filters["min_history_days"]),
+            min_price=float(investable_filters["min_price"]),
+            min_avg_volume=float(investable_filters["min_avg_volume"]),
             include_raw_cols=True,
             use_snapshot_fundamentals=True,
+            config=config,
         )
     except Exception as e:
         logger.error(f"Failed to load data: {e}")
@@ -228,10 +233,7 @@ def run_cycle(
                 # (stored as a cycle-level attribute set during run_cycle)
                 last_rl_scores = getattr(brain, "_last_rl_scores", None)
                 if last_rl_scores is not None and not last_rl_scores.empty:
-                    n = len(last_rl_scores)
-                    rank_pct = float(
-                        last_rl_scores.rank(method="average", ascending=True).get(d.ticker, 0) / n
-                    )
+                    rank_pct = float(last_rl_scores.get(d.ticker, d.score))
                 else:
                     rank_pct = float(d.score)  # fallback: use raw score as proxy
                 portfolio.positions[d.ticker]["rl_rank_pct_at_entry"] = rank_pct
@@ -241,6 +243,8 @@ def run_cycle(
 
         elif d.action == "SELL_PARTIAL":
             ok = portfolio.sell(d.ticker, d.shares, d.price, d.reason)
+            if ok and d.ticker in portfolio.positions:
+                portfolio.positions[d.ticker]["partial_taken"] = True
 
         elif d.action == "OPEN_OPTION":
             contract = getattr(d, "_option_contract", None)
@@ -418,6 +422,7 @@ def main(config: dict = None, maintenance_context: dict | None = None):
         top_n             = args.top_n,
         enforce_market_hours = not args.no_market_hours,
         maintenance_context = maintenance_context,
+        config = config,
     )
 
 

@@ -120,21 +120,9 @@ def _write_config_key(key: str, value: str, path: str = "broker.config") -> None
 
 
 def _best_checkpoint(save_dir: str = "models") -> str | None:
-    import torch as _torch
-    ckpts = sorted(glob.glob(f"{save_dir}/best_fold*.pt"))
-    if not ckpts:
-        return None
-    best, best_sharpe = None, float("-inf")
-    for p in ckpts:
-        try:
-            meta = _torch.load(p, map_location="cpu", weights_only=False)
-            s = float(meta.get("val_sharpe", float("-inf")))
-            if s > best_sharpe:
-                best_sharpe = s
-                best = p
-        except Exception:
-            pass
-    return best or ckpts[-1]
+    from pipeline.checkpoints import resolve_checkpoint_path
+
+    return resolve_checkpoint_path(save_dir=save_dir)
 
 
 def _split_replay_holdout(

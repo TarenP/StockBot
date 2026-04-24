@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from pipeline.universe_resolver import get_universe_mode, load_typed_config
+
 logger = logging.getLogger(__name__)
 
 _STATE_FILE = "broker/state/maintenance.json"
@@ -147,11 +149,34 @@ def _check_autotune(state: dict, initial_cash: float) -> bool:
         return False
 
 
+def _resolve_maintenance_universe(
+    save_dir: str = "models",
+    config: dict | None = None,
+    as_of_date=None,
+) -> list[str]:
+    from pipeline.updater import get_live_universe
+
+    cfg = config if config is not None else load_typed_config()
+    universe = get_live_universe(
+        save_dir=save_dir,
+        config=cfg,
+        target_size=int(cfg.get("live_target_size", max(int(cfg.get("top_n", 500)) * 3, 1000))),
+        as_of_date=as_of_date,
+    )
+    logger.info(
+        "Maintenance: resolved %d ticker(s) from configured universe mode=%s",
+        len(universe),
+        get_universe_mode(cfg),
+    )
+    return universe
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run_maintenance(
     initial_cash: float = 10_000.0,
     save_dir: str = "models",
+    config: dict | None = None,
 ) -> dict[str, object]:
     """
     Run all staleness checks. Called at the top of every Broker.py cycle.
@@ -163,24 +188,11 @@ def run_maintenance(
     logger.info("-" * 50)
     logger.info("Maintenance check: %s", datetime.now().strftime("%Y-%m-%d %H:%M"))
 
-    # Load universe for data updates
-    universe = None
+    universe: list[str] | None = None
     try:
-        from pipeline.updater import _load_trained_universe
-        universe = _load_trained_universe(save_dir)
-    except Exception:
-        pass
-
-    # If no checkpoint universe, use top liquid tickers from parquet
-    # to avoid updating all 11,500 tickers on first run
-    if not universe:
-        try:
-            from pipeline.data import load_master, get_asset_universe
-            df_raw = load_master(top_n=750)
-            universe = get_asset_universe(df_raw, top_n=750)
-            logger.info("Maintenance: using top-%d liquid tickers (no checkpoint yet)", len(universe))
-        except Exception:
-            pass
+        universe = _resolve_maintenance_universe(save_dir=save_dir, config=config)
+    except Exception as exc:
+        logger.warning("Maintenance: universe resolution failed: %s", exc)
 
     prices_ran = _check_prices(state, universe)
     sentiment_ran = _check_sentiment(state, universe)

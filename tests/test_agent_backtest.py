@@ -46,3 +46,33 @@ def test_run_backtest_mode_uses_rl_policy_path(monkeypatch):
     assert captured["asset_list"] == ["AAA"]
     assert captured["save_plot"] == "plots/backtest.png"
     assert captured["ckpt_n_features"] == 1
+
+
+def test_load_data_and_universe_uses_full_configured_universe(monkeypatch):
+    dates = pd.date_range("2024-01-01", periods=3, freq="B")
+    index = pd.MultiIndex.from_product(
+        [dates, ["AAA", "BBB", "CCC"]],
+        names=["date", "ticker"],
+    )
+    df = pd.DataFrame({"ret_1d": 0.0, "close": 10.0}, index=index)
+
+    import pipeline.data as data_module
+    import pipeline.universe_resolver as universe_module
+
+    monkeypatch.setattr(agent_module, "_load_typed_config", lambda path="broker.config": {"universe_mode": "sp500"})
+    monkeypatch.setattr(data_module, "load_master", lambda **kwargs: df)
+    monkeypatch.setattr(
+        data_module,
+        "get_asset_universe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("top_n ranking should not run")),
+    )
+    monkeypatch.setattr(
+        universe_module,
+        "resolve_configured_universe",
+        lambda **kwargs: ["CCC", "AAA", "DDD"],
+    )
+
+    filtered_df, asset_list = agent_module._load_data_and_universe(top_n=500)
+
+    assert asset_list == ["CCC", "AAA"]
+    assert sorted(filtered_df.index.get_level_values("ticker").unique().tolist()) == ["AAA", "CCC"]
