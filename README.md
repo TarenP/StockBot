@@ -113,7 +113,7 @@ python Agent.py --mode train --folds 10
 python Broker.py
 ```
 
-After step 3, just run `python Broker.py` every morning. Everything else is automatic — data updates, model finetuning, parameter optimisation, RL mode switching, and strategy evolution all happen on their own.
+After step 3, run `python Broker.py` every morning. The broker handles price updates, sentiment, and trade decisions automatically. Model finetuning, parameter optimisation, and RL mode switching also run on a schedule — but they depend on data quality. If data sources are degraded, new entries are blocked and the manifest records why. Check `logs/broker.log` after each run to see what happened.
 
 ---
 
@@ -435,29 +435,54 @@ automatically. Saves a 4-panel chart to `plots/backtest.png`.
 python Agent.py --mode replay
 ```
 Runs the broker over historical data using the same decision engine the live
-system uses. Replay now routes through `BrokerBrain.run_cycle()` with
-historical research, historical price fetching, sector allocation, stop/take-
-profit logic, risk-engine checks, and execution-cost-adjusted fills. This is
-the closest estimate of live broker behaviour in the repository.
+system uses — same screening, research, sector allocation, stop/take-profit
+logic, risk-engine checks, and execution-cost-adjusted fills.
+
+**Replay is deterministic by default.** Every replay run automatically freezes
+the universe to a dated snapshot file (`plots/live_universe_snapshot.json`)
+unless `freeze_universe_snapshot = true` is already set in `broker.config`.
+Re-running the same replay with the same snapshot and checkpoint produces the
+same trade log. The snapshot path is recorded in the manifest.
 
 ```bash
 python Agent.py --mode replay --replay_years 5     # use 5 years of history
 python Agent.py --mode replay --sensitivity        # also run sensitivity sweep
 ```
 
-The sensitivity sweep runs the replay across parameter combinations to
-test whether results are robust or collapse under parameter changes.
+**Friction sensitivity** is printed after every replay — three execution-cost
+regimes so you can see whether results depend on cost assumptions:
 
-**Replay determinism:** replay uses the same universe resolver as the live
-broker. For reproducible results, set `freeze_universe_snapshot = true` and
-`universe_snapshot_path = broker/state/universe_snapshot.json` in
-`broker.config` — this freezes the tradable universe to a dated snapshot so
-re-running the same replay always uses the same ticker set.
+```
+========================================================================
+  Friction Sensitivity (optimistic / base / stressed execution cost)
+========================================================================
+  Regime       Spread    Return    Sharpe     MaxDD
+  ------------------------------------------------------------
+  optimistic    0.02%    +18.4%     1.312    -14.2%
+  base          0.10%    +17.9%     1.287    -14.5%
+  stressed      0.30%    +16.8%     1.201    -15.1%
+========================================================================
+```
 
-**Friction sensitivity:** the replay reports results under three execution-cost
-regimes (optimistic / base / stressed). If the stressed Sharpe drops more than
-0.3 below the base Sharpe, a warning is logged — the strategy may be sensitive
-to cost assumptions. Run `run_friction_report()` directly for a full breakdown.
+If stressed Sharpe drops more than 0.3 below base, a warning is logged.
+
+**Replay invariants** are checked at the end of every run:
+```
+Replay invariants: all 5 checks passed.
+```
+Invariants checked: no fill before signal date, fills within replay window,
+no negative shares, no zero-price fills, all actions are known types.
+Any failure logs `INVARIANT FAIL` with details.
+
+**Replay manifest** (`plots/replay_manifest.json`) records:
+- `code_version` — git commit hash
+- `config_hash` — hash of broker.config at run time
+- `checkpoint_path` — which model was used
+- `resolved_universe_hash` — hash of the ticker set
+- `snapshot_path` — frozen universe file used
+- `benchmark.available` — whether SPY data was present
+- `friction` — execution cost assumptions
+- `watchlist_included` — whether watchlist tickers were included
 
 ### RL ablation study
 ```bash
@@ -497,7 +522,7 @@ Runs continuously in the background and handles everything automatically:
   - Runs the ablation gate — if `screener_rl` beats `heuristics_only` by the required margin, sets `rl_enabled = true` automatically; if not, sets it to `false`
   - Logs every decision with the data that drove it to `logs/autotuner.log`
 
-Once the scheduler is running, `broker.config` is a live file managed by the system. You don't need to edit it manually for performance parameters or RL mode — the system decides based on data.
+Once the scheduler is running, `broker.config` is a live file managed by the system. You don't need to edit it manually for performance parameters or RL mode — the system decides based on data. Note: the scheduler still depends on live data sources. If sources are degraded, the auto-tune pass may produce conservative parameters or skip RL mode. Check `logs/autotuner.log` to see what drove each decision.
 
 ---
 
@@ -551,60 +576,66 @@ make more than SPY on good days and lose less on bad days.
 Broker.py                     Run this to trade
 Agent.py                      Research, training, backtesting, screening
 broker.config                 Your persistent broker settings
-seed_portfolio.py             One-time portfolio seeder
 requirements.txt
 README.md
-AUDIT.md                      Full production readiness checklist
 
 pipeline/
   data.py                     Load parquet, filter universe, merge sentiment
-  features.py                 19 features: 10 technical + 9 sentiment
+  features.py                 29 features: technical + sentiment + market context + regime
   environment.py              RL training environment
   model.py                    Transformer policy (temporal + cross-asset attention)
   train.py                    PPO walk-forward training with resume support
   backtest.py                 RL agent backtest vs SPY
   benchmark.py                SPY benchmark metrics (beta, alpha, IR, capture)
-  screener.py                 Bidirectional GRU screener — cuts 11,500 tickers to ~50-100 candidates
-  rl_inference.py             RL inference wrapper (get_rl_targets, WeightAdapter stub)
+  screener.py                 Bidirectional GRU screener — cuts universe to ~50-100 candidates
+  rl_inference.py             RL inference wrapper (get_rl_targets, ensemble support)
   autotuner.py                Auto-tunes broker params and RL mode from replay data
-  maintenance.py              Staleness checks — runs updates automatically from Broker.py
+  maintenance.py              Staleness checks — runs from Broker.py on each cycle
   sentiment.py                News scraper + FinBERT scorer
-  updater.py                  yfinance price fetcher
+  updater.py                  yfinance price fetcher + universe resolver
+  universe_resolver.py        Shared universe resolution (tradable_us / sp500 / custom)
+  run_manifest.py             Replay/live manifest helpers and schema enforcement
+  checkpoints.py              Checkpoint resolution by val_sharpe
   scheduler.py                Daily/weekly automation
 
 broker/
-  broker.py                   Core broker logic
-  brain.py                    Decision engine (exits, sectors, buys, options)
+  broker.py                   Core broker logic + freshness gates + manifest emission
+  brain.py                    Decision engine (exits, sectors, buys, RL ranking)
   portfolio.py                Cash, positions, options book, P&L tracking
   analyst.py                  On-demand stock research (live price + news)
   options.py                  Options strategies, Greeks, cash-secured accounting
   risk.py                     Portfolio risk engine + startup validation
-  replay.py                   Broker replay backtest + sensitivity sweep + ablation
-  shadows.py                  Shadow portfolio engine — 5 parallel paper strategies
+  replay.py                   Broker replay + friction sensitivity + invariant checks
+  shadows.py                  Shadow portfolio engine — evolutionary parameter search
   sectors.py                  Dynamic sector scoring and allocation
   validator.py                Data quality cross-verification (30%+ move check)
-  universe.py                 New stock discovery (Finviz + Yahoo trending)
+  universe.py                 New stock discovery (disabled in benchmark-constrained modes)
   journal.py                  Trade log, equity curve, SPY benchmark tracking
 
 MasterDS/
-  stooq_panel.parquet         Historical OHLCV (26M rows, 1962-present)
+  stooq_panel.parquet         Historical OHLCV (broad U.S. equity universe)
 
 Sentiment/
-  analyst_ratings_with_sentiment.csv   FinBERT-scored headlines (1.5M+ rows, growing)
+  analyst_ratings_with_sentiment.csv   FinBERT-scored headlines
 
 models/
-  best_fold0-9.pt             Best Transformer checkpoint per training fold
+  best_fold*.pt               Best Transformer checkpoint per training fold
+  screener.pt                 Trained screener checkpoint
+  universe_snapshots/         Dated universe snapshots for replay determinism
 
 broker/state/                 Generated on first run — do not edit manually
   portfolio.json              Live portfolio (cash, positions, trade history)
   journal.jsonl               Full trade log with reasoning
   equity_curve.csv            Equity over time with SPY prices
-  sector_cache.json           Cached GICS sector classifications
   maintenance.json            Staleness timestamps for each auto-maintenance task
   shadows.json                Shadow portfolio state and standings
+  last_live_manifest.json     Most recent live cycle manifest
 
-plots/                        Charts saved here (backtest.png, replay.png, etc.)
-logs/                         broker.log, scheduler.log
+plots/                        Charts and manifests saved here
+  replay_manifest.json        Replay run manifest (universe hash, checkpoint, friction)
+  live_universe_snapshot.json Frozen universe snapshot for replay determinism
+logs/                         broker.log, autotuner.log, maintenance.log
+tests/                        191+ tests covering universe, replay, manifests, exits
 ```
 
 ---
@@ -615,7 +646,7 @@ logs/                         broker.log, scheduler.log
 ```bash
 python Broker.py
 ```
-That's it. One command. Data updates, model finetuning, parameter optimisation, RL mode switching, shadow strategy evolution — all automatic.
+One command. Price updates, sentiment, and trade decisions run automatically. Finetuning and parameter optimisation run on a weekly schedule. New entries are blocked if data quality falls below configured thresholds — check `logs/broker.log` to see what ran and why.
 
 **First time only:**
 ```bash
@@ -655,6 +686,8 @@ The manifest records: timestamp, code version (git commit), config hash, checkpo
 
 ---
 
+## Tips
+
 - The sentiment surprise signal is the strongest indicator — sudden positive
   news before price moves is what the model looks for most
 - High cash allocation in `--mode predict` means the model sees low
@@ -662,12 +695,37 @@ The manifest records: timestamp, code version (git commit), config hash, checkpo
 - If the broker makes no trades, it's usually because nothing scored above
   `min_score`. Lower it in `broker.config` or wait for better setups
 - When RL is enabled, `rl_min_score` controls the entry floor (default 0 = pure top-k ranking). `min_score` only applies to the heuristic path
-- AUDIT.md contains the full production readiness checklist — read it
-  before committing real money
 - Run in paper mode for at least 30-90 days before using real capital
 - The broker's backtest (`--mode replay`) and the RL agent's backtest
   (`--mode backtest`) measure different things — the replay is the honest
   number for what the broker actually does
+- After any replay, check `plots/replay_manifest.json` to confirm which
+  universe, checkpoint, and friction assumptions were used
+
+---
+
+## Testing
+
+```bash
+python -m pytest tests/ -q
+```
+
+191+ tests covering: universe resolution, replay determinism, manifest schema,
+freshness gates, exit deduplication, RL exit checks, replay invariants,
+friction sensitivity, and broker cycle behavior.
+
+Two pre-existing failures are known and unrelated to core broker logic:
+- `test_screener.py::test_build_samples_uses_raw_close_forward_returns`
+- `test_regime_classifier.py::test_regime_broadcast_consistency`
+
+Key test files by purpose:
+- `tests/test_manifest_schema.py` — manifest required fields and schema enforcement
+- `tests/test_freshness_gates.py` — adversarial freshness gate behavior
+- `tests/test_replay_determinism.py` — replay produces identical results on same inputs
+- `tests/test_replay_invariants.py` — impossible states (fill before signal, zero prices, etc.)
+- `tests/test_tier2_tier3_audit.py` — live/replay parity, friction sensitivity, stale-state contamination
+- `tests/test_rl_exit_checks.py` — rank-percentile exit logic
+- `tests/test_exit_deduplication.py` — one exit action per ticker per cycle
 
 ---
 
