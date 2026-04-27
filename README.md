@@ -287,6 +287,18 @@ scores into target allocations using a softmax with a quadratic
 diversification penalty — the more concentrated you already are in a sector,
 the harder it becomes to add more. The `max_sector` config sets a hard cap.
 
+### Theme and price-bucket controls
+Sector labels are not the only concentration check. The broker also tags
+candidates with a `theme_bucket` such as `consumer_credit_finance`,
+`precious_metals_miners`, or `speculative_growth_turnaround`. `theme_max_pct`
+caps any one economic theme, and `low_price_max_pct` caps aggregate sub-$10
+exposure. The score audit records pre-cap, post-cap, and final weights so
+rank-to-weight inversions can be traced after each rebalance.
+
+Sentiment policy is explicit in `broker.config`: `sentiment_policy =
+informational` means sentiment is logged and available to the scorer, but it
+is not a standalone buy veto.
+
 ### Candidate selection and sizing
 1. Screens 1000 stocks using the trained screener (or rule-based fallback)
 2. Skips any stock within `avoid_earnings` days of earnings
@@ -294,7 +306,7 @@ the harder it becomes to add more. The `max_sector` config sets a hard cap.
 4. Scores each on 19 signals → composite score 0–1
 5. Skips anything below `min_score`
 6. Sizes position by conviction: higher score = larger allocation
-7. Applies sector budget, penny cap, cash floor, and volatility scaling
+7. Applies sector, theme, low-price, penny, cash-floor, and volatility controls
 8. Applies execution cost estimate (spread model) before buying
 
 ### RL integration (opt-in)

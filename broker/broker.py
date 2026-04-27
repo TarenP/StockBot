@@ -382,6 +382,8 @@ def parse_args(config: dict = None):
     p.add_argument("--penny_pct",      type=float, default=cfg.get("penny_pct",      0.03))
     p.add_argument("--max_sector",     type=float, default=cfg.get("max_sector",     0.25))
     p.add_argument("--max_correlation",type=float, default=cfg.get("max_correlation", 0.80))
+    p.add_argument("--theme_max_pct",  type=float, default=cfg.get("theme_max_pct",  1.00))
+    p.add_argument("--low_price_max_pct", type=float, default=cfg.get("low_price_max_pct", 1.00))
     p.add_argument("--avoid_earnings", type=int,   default=cfg.get("avoid_earnings", 5))
     p.add_argument("--top_n",          type=int,   default=cfg.get("top_n",          500))
     p.add_argument("--max_daily_loss", type=float, default=cfg.get("max_daily_loss", 0.025))
@@ -450,6 +452,8 @@ def main(config: dict = None, maintenance_context: dict | None = None):
         penny_max_pct       = args.penny_pct,
         max_sector_pct      = args.max_sector,
         max_pair_correlation = args.max_correlation,
+        theme_max_pct       = args.theme_max_pct,
+        low_price_max_pct   = args.low_price_max_pct,
         avoid_earnings_days = args.avoid_earnings,
         device              = DEVICE,
         rl_enabled          = args.rl_enabled,

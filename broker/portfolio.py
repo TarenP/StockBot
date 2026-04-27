@@ -9,6 +9,13 @@ import logging
 from datetime import date, datetime
 from pathlib import Path
 
+from broker.exposure import (
+    effective_bet_count,
+    exposure_weights,
+    portfolio_low_price_values,
+    portfolio_theme_values,
+)
+
 logger = logging.getLogger(__name__)
 
 STATE_PATH = Path("broker/state/portfolio.json")
@@ -271,6 +278,37 @@ class Portfolio:
                 lines.append(
                     "  Note: holdings are still marked at entry prices; unrealised P&L updates after the next price refresh."
                 )
+            try:
+                from broker.sectors import get_cached_sector_map
+
+                sector_map = get_cached_sector_map(list(self.positions.keys()))
+                theme_weights = exposure_weights(
+                    portfolio_theme_values(self.positions, sector_map)
+                )
+                low_price_weights = exposure_weights(
+                    portfolio_low_price_values(self.positions)
+                )
+                if theme_weights:
+                    lines.append(f"  {'-'*52}")
+                    lines.append(
+                        f"  Effective theme bets: {effective_bet_count(theme_weights):.2f}"
+                    )
+                    top_themes = sorted(
+                        theme_weights.items(),
+                        key=lambda item: item[1],
+                        reverse=True,
+                    )[:3]
+                    theme_text = ", ".join(
+                        f"{bucket} {weight:.0%}" for bucket, weight in top_themes
+                    )
+                    lines.append(f"  Top themes: {theme_text}")
+                low_price_share = (
+                    low_price_weights.get("sub_5", 0.0)
+                    + low_price_weights.get("5_to_10", 0.0)
+                )
+                lines.append(f"  Sub-$10 exposure: {low_price_share:.0%}")
+            except Exception:
+                pass
         else:
             lines.append("  No stock positions")
         lines += self.options.summary_lines()

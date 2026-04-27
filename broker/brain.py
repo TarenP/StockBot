@@ -26,6 +26,14 @@ from broker.sectors   import (
     get_sectors_bulk, score_sectors, compute_target_allocations,
     get_portfolio_sector_weights,
 )
+from broker.exposure import (
+    effective_bet_count,
+    exposure_weights,
+    low_price_bucket,
+    portfolio_low_price_values,
+    portfolio_theme_values,
+    theme_bucket,
+)
 from broker.validator import validate_portfolio_prices
 from pipeline.rl_inference import get_rl_targets
 
@@ -111,6 +119,8 @@ class BrokerBrain:
         max_sector_pct:       float = 0.40,   # hard cap per sector
         max_pair_correlation: float = 0.80,
         correlation_lookback_days: int = 60,
+        theme_max_pct:       float = 1.00,
+        low_price_max_pct:   float = 1.00,
         avoid_earnings_days:  int   = 3,       # skip stocks within N days of earnings
         device=None,
         rl_enabled:           bool  = False,
@@ -140,6 +150,8 @@ class BrokerBrain:
         self.max_sector_pct       = max_sector_pct
         self.max_pair_correlation = max_pair_correlation
         self.correlation_lookback_days = correlation_lookback_days
+        self.theme_max_pct       = theme_max_pct
+        self.low_price_max_pct   = low_price_max_pct
         self.avoid_earnings_days  = avoid_earnings_days
         self.device               = device
         self.rl_enabled           = rl_enabled
@@ -638,6 +650,7 @@ class BrokerBrain:
                         continue
 
                 report["sector"] = self._sector_map.get(ticker.upper(), "Unknown")
+                report["theme_bucket"] = theme_bucket(ticker, report["sector"])
                 if rl_score_val is not None:
                     report["rl_score"] = rl_score_val
                     report["rl_rank_pct"] = rl_score_val
@@ -661,6 +674,11 @@ class BrokerBrain:
                             float(rl_raw_weight_val) if rl_raw_weight_val is not None else np.nan
                         ),
                         "sector": report["sector"],
+                        "theme_bucket": report["theme_bucket"],
+                        "low_price_bucket": low_price_bucket(
+                            float(report.get("price", np.nan)),
+                            self.penny_threshold,
+                        ),
                     }
                 )
 
@@ -738,6 +756,15 @@ class BrokerBrain:
 
             # Track sector spend this cycle to respect targets
             sector_spent: dict[str, float] = {}
+            theme_spent: dict[str, float] = {}
+            low_price_spent: dict[str, float] = {}
+            theme_values = portfolio_theme_values(self.portfolio.positions, self._sector_map)
+            low_price_values = portfolio_low_price_values(
+                self.portfolio.positions,
+                self.penny_threshold,
+            )
+            theme_weights = exposure_weights(theme_values)
+            theme_effective_bets = effective_bet_count(theme_weights)
 
             for report in researched[:n_slots]:
                 ticker        = report["ticker"]
@@ -748,7 +775,9 @@ class BrokerBrain:
                 rl_weight_val = report.get("rl_weight")
                 rl_raw_weight_val = report.get("rl_raw_weight")
                 sector        = report.get("sector", "Unknown")
+                theme         = report.get("theme_bucket") or theme_bucket(ticker, sector)
                 is_penny      = price < self.penny_threshold
+                price_bucket  = low_price_bucket(price, self.penny_threshold)
 
                 # Conviction score: use rl_score when RL enabled, else composite
                 score = rl_score_val if (self.rl_enabled and rl_score_val is not None) else composite
@@ -817,13 +846,55 @@ class BrokerBrain:
                 alloc_pct   = effective_max_position_pct * conviction
                 alloc_pct   = np.clip(alloc_pct, 0.01, effective_max_position_pct)
                 alloc_value = equity * alloc_pct
+                target_weight_pre_caps = float(alloc_value / equity) if equity > 0 else np.nan
+                model_suggested_weight = (
+                    float(rl_weight_val)
+                    if rl_weight_val is not None and np.isfinite(float(rl_weight_val))
+                    else float(score)
+                )
+                allocation_steps = {
+                    "model_suggested_weight": model_suggested_weight,
+                    "target_weight_pre_caps": target_weight_pre_caps,
+                    "post_vol_weight": np.nan,
+                    "post_sector_weight": np.nan,
+                    "post_theme_weight": np.nan,
+                    "post_correlation_weight": np.nan,
+                    "post_low_price_weight": np.nan,
+                    "target_weight_post_caps": np.nan,
+                    "final_weight": np.nan,
+                    "major_downweight_reason": "none",
+                }
 
                 # Volatility scaling
                 if risk_engine is not None:
                     alloc_value = risk_engine.vol_scale_allocation(alloc_value)
+                allocation_steps["post_vol_weight"] = (
+                    float(alloc_value / equity) if equity > 0 else np.nan
+                )
 
                 # Constrain by sector budget
                 alloc_value = min(alloc_value, sector_budget)
+                allocation_steps["post_sector_weight"] = (
+                    float(alloc_value / equity) if equity > 0 else np.nan
+                )
+
+                current_theme_val = (
+                    theme_values.get(theme, 0.0) + theme_spent.get(theme, 0.0)
+                )
+                theme_budget = equity * self.theme_max_pct - current_theme_val
+                if theme_budget <= equity * 0.01:
+                    logger.debug(
+                        "Theme budget exhausted for %s (cap=%.1f%%), skipping %s",
+                        theme,
+                        self.theme_max_pct * 100,
+                        ticker,
+                    )
+                    sector_budget_skips += 1
+                    continue
+                alloc_value = min(alloc_value, max(0.0, theme_budget))
+                allocation_steps["post_theme_weight"] = (
+                    float(alloc_value / equity) if equity > 0 else np.nan
+                )
 
                 if corr_stats is not None:
                     diversification_scale = np.clip(
@@ -832,10 +903,37 @@ class BrokerBrain:
                         1.0,
                     )
                     alloc_value *= diversification_scale
+                allocation_steps["post_correlation_weight"] = (
+                    float(alloc_value / equity) if equity > 0 else np.nan
+                )
 
                 # Constrain by penny budget
                 if is_penny:
                     alloc_value = min(alloc_value, penny_budget)
+
+                if price < 10.0:
+                    current_low_price_val = (
+                        low_price_values.get("sub_5", 0.0)
+                        + low_price_values.get("5_to_10", 0.0)
+                        + low_price_spent.get("sub_5", 0.0)
+                        + low_price_spent.get("5_to_10", 0.0)
+                    )
+                    low_price_budget = equity * self.low_price_max_pct - current_low_price_val
+                    if low_price_budget <= equity * 0.01:
+                        logger.debug(
+                            "Low-price budget exhausted (cap=%.1f%%), skipping %s",
+                            self.low_price_max_pct * 100,
+                            ticker,
+                        )
+                        penny_budget_skips += 1
+                        continue
+                    alloc_value = min(alloc_value, max(0.0, low_price_budget))
+                allocation_steps["post_low_price_weight"] = (
+                    float(alloc_value / equity) if equity > 0 else np.nan
+                )
+                allocation_steps["target_weight_post_caps"] = (
+                    float(alloc_value / equity) if equity > 0 else np.nan
+                )
 
                 # Never spend more than 95% of remaining cash
                 alloc_value = min(alloc_value, self.portfolio.cash * 0.95)
@@ -855,6 +953,27 @@ class BrokerBrain:
                         )
                         max_spend = self.portfolio.cash - equity * effective_cash_floor
                         alloc_value = min(alloc_value, max(0.0, max_spend))
+
+                final_weight = float(alloc_value / equity) if equity > 0 else np.nan
+                allocation_steps["final_weight"] = final_weight
+                prev_weight = target_weight_pre_caps
+                drops = []
+                for reason_name, key in [
+                    ("volatility", "post_vol_weight"),
+                    ("sector_cap", "post_sector_weight"),
+                    ("theme_cap", "post_theme_weight"),
+                    ("correlation_scale", "post_correlation_weight"),
+                    ("low_price_or_penny_cap", "post_low_price_weight"),
+                    ("cash_or_risk_cap", "final_weight"),
+                ]:
+                    cur_weight = allocation_steps[key]
+                    if np.isfinite(prev_weight) and np.isfinite(cur_weight):
+                        drops.append((prev_weight - cur_weight, reason_name))
+                    if np.isfinite(cur_weight):
+                        prev_weight = cur_weight
+                material_drops = [drop for drop in drops if drop[0] > 0.0025]
+                if material_drops:
+                    allocation_steps["major_downweight_reason"] = max(material_drops)[1]
 
                 shares = alloc_value / price if price > 0 else 0
                 if shares < 0.001 or alloc_value < 1.0:
@@ -881,8 +1000,12 @@ class BrokerBrain:
                         f"rl_weight={float(rl_weight_val or 0.0):.4f} | "
                         f"rl_raw_weight={float(rl_raw_weight_val or 0.0):.6f} | "
                         f"composite_score={composite:.4f} | score_source=rl_rank_pct | "
+                        f"target_weight_pre_caps={target_weight_pre_caps:.4f} | "
+                        f"target_weight_post_caps={allocation_steps['target_weight_post_caps']:.4f} | "
+                        f"final_weight={final_weight:.4f} | "
+                        f"downweight_reason={allocation_steps['major_downweight_reason']} | "
                         f"rl_mode=true | Sector={sector} "
-                        f"(target={target_alloc:.0%}) | "
+                        f"(target={target_alloc:.0%}) | Theme={theme} | "
                         f"Sentiment={sent_label}{earnings_note}{corr_note} | "
                         f"{'PENNY ' if is_penny else ''}"
                         f"{(report.get('headlines') or [''])[0][:50]}"
@@ -893,8 +1016,12 @@ class BrokerBrain:
                         corr_note = f" | MaxCorr={corr_stats['max_abs_corr']:.2f}"
                     reason = (
                         f"logged_score={score:.4f} | composite_score={composite:.4f} | "
+                        f"target_weight_pre_caps={target_weight_pre_caps:.4f} | "
+                        f"target_weight_post_caps={allocation_steps['target_weight_post_caps']:.4f} | "
+                        f"final_weight={final_weight:.4f} | "
+                        f"downweight_reason={allocation_steps['major_downweight_reason']} | "
                         f"score_source=composite | Sector={sector} "
-                        f"(target={target_alloc:.0%}) | "
+                        f"(target={target_alloc:.0%}) | Theme={theme} | "
                         f"Sentiment={sent_label}{earnings_note}{corr_note} | "
                         f"{'PENNY ' if is_penny else ''}"
                         f"{(report.get('headlines') or [''])[0][:50]}"
@@ -907,6 +1034,8 @@ class BrokerBrain:
                 ))
 
                 sector_spent[sector] = sector_spent.get(sector, 0.0) + alloc_value
+                theme_spent[theme] = theme_spent.get(theme, 0.0) + alloc_value
+                low_price_spent[price_bucket] = low_price_spent.get(price_bucket, 0.0) + alloc_value
                 if is_penny:
                     penny_value += alloc_value
                 buyable_count += 1
@@ -920,11 +1049,26 @@ class BrokerBrain:
                         "rl_weight": float(rl_weight_val) if rl_weight_val is not None else np.nan,
                         "rl_raw_weight": float(rl_raw_weight_val) if rl_raw_weight_val is not None else np.nan,
                         "sector": sector,
+                        "theme_bucket": theme,
+                        "low_price_bucket": price_bucket,
                         "alloc_value": float(alloc_value),
                         "alloc_pct": float(alloc_value / equity) if equity > 0 else np.nan,
                         "shares": float(shares),
                         "target_sector_alloc": float(target_alloc),
                         "max_position_pct": float(effective_max_position_pct),
+                        "model_suggested_weight": allocation_steps["model_suggested_weight"],
+                        "target_weight_pre_caps": allocation_steps["target_weight_pre_caps"],
+                        "post_vol_weight": allocation_steps["post_vol_weight"],
+                        "post_sector_weight": allocation_steps["post_sector_weight"],
+                        "post_theme_weight": allocation_steps["post_theme_weight"],
+                        "post_correlation_weight": allocation_steps["post_correlation_weight"],
+                        "post_low_price_weight": allocation_steps["post_low_price_weight"],
+                        "target_weight_post_caps": allocation_steps["target_weight_post_caps"],
+                        "final_weight": allocation_steps["final_weight"],
+                        "major_downweight_reason": allocation_steps["major_downweight_reason"],
+                        "theme_effective_bet_count": float(theme_effective_bets),
+                        "theme_cap": float(self.theme_max_pct),
+                        "low_price_cap": float(self.low_price_max_pct),
                     }
                 )
 

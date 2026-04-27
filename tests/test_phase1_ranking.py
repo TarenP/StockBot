@@ -245,6 +245,21 @@ class TestPhase1RLRanking(unittest.TestCase):
         self.assertIn("rl_score=", reason)
         self.assertIn("composite_score=", reason)
         self.assertIn("rl_mode=true", reason)
+        self.assertIn("target_weight_pre_caps=", reason)
+        self.assertIn("target_weight_post_caps=", reason)
+        self.assertIn("downweight_reason=", reason)
+
+        audit = brain._last_cycle_audit
+        selected = audit[
+            (audit["candidate_status"] == "buy_selected")
+            & (audit["ticker"] == "AAA")
+        ].iloc[0]
+        self.assertIn("theme_bucket", audit.columns)
+        self.assertIn("low_price_bucket", audit.columns)
+        self.assertIn("target_weight_pre_caps", audit.columns)
+        self.assertIn("target_weight_post_caps", audit.columns)
+        self.assertIn("major_downweight_reason", audit.columns)
+        self.assertEqual(selected["theme_bucket"], "sector_unknown")
 
     def test_rl_enabled_skips_zero_rank_scores_even_with_zero_floor(self):
         """Zero RL score means unranked/no-conviction and should not generate a BUY."""
