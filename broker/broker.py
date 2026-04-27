@@ -40,6 +40,15 @@ Path("broker/state").mkdir(parents=True, exist_ok=True)
 from broker.portfolio import CASH_YIELD_ANNUAL_RATE, Portfolio
 from broker.brain     import BrokerBrain
 from broker.risk      import PortfolioRiskEngine, validate_startup
+from broker.paper_diagnostics import (
+    CAP_IMPACT_SUMMARY_PATH,
+    PARITY_REPORT_PATH,
+    PERFORMANCE_ATTRIBUTION_PATH,
+    build_replay_live_parity_report,
+    summarize_cap_impact_history,
+    summarize_performance_attribution,
+    write_json,
+)
 from broker.journal   import (
     log_cycle, print_report, print_recent_trades,
     daily_integrity_check, _fetch_current_spy_price,
@@ -114,6 +123,24 @@ def _is_market_hours() -> bool:
     return MARKET_OPEN <= t < MARKET_CLOSE
 
 
+def _paper_execution_cost(
+    price: float,
+    shares: float,
+    *,
+    is_penny: bool = False,
+    base_spread: float = 0.001,
+) -> tuple[float, float, str]:
+    """Estimate paper execution drag as an explicit cash cost."""
+    price = max(float(price or 0.0), 0.0)
+    shares = max(float(shares or 0.0), 0.0)
+    if price <= 0 or shares <= 0:
+        return 0.0, 0.0, "paper_spread:none"
+
+    tiered_spread = 0.02 if is_penny else (0.005 if price < 20.0 else 0.001)
+    spread = max(float(base_spread or 0.0), tiered_spread)
+    return shares * price * spread, spread, f"paper_spread:{spread:.4f}"
+
+
 # ── One-shot cycle ────────────────────────────────────────────────────────────
 
 def run_cycle(
@@ -124,13 +151,19 @@ def run_cycle(
     enforce_market_hours: bool = True,
     maintenance_context: dict | None = None,
     config: dict | None = None,
+    execution_spread: float | None = None,
 ):
+    cfg = config or {}
+    base_execution_spread = float(
+        execution_spread if execution_spread is not None else cfg.get("execution_spread", 0.001)
+    )
     run_manifest: dict[str, object] = {
         "mode": "live",
-        "config_hash": hash_config(config or {}),
+        "config_hash": hash_config(cfg),
         "code_version": get_code_version(),
-        "snapshot_path": str((config or {}).get("universe_snapshot_path", "")),
-        "watchlist_included": bool((config or {}).get("include_watchlist_in_universe", False)),
+        "snapshot_path": str(cfg.get("universe_snapshot_path", "")),
+        "watchlist_included": bool(cfg.get("include_watchlist_in_universe", False)),
+        "friction": {"execution_spread": base_execution_spread},
         "benchmark_status": {"symbol": "SPY", "available": None},  # updated after data load
     }
     now_et = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
@@ -266,9 +299,21 @@ def run_cycle(
     for d in decisions:
         if d.action == "BUY":
             is_penny  = d.price < 5.0
-            adj_value = risk.apply_execution_cost(d.shares * d.price, d.price, is_penny)
-            adj_shares = adj_value / d.price if d.price > 0 else 0
-            ok = portfolio.buy(d.ticker, adj_shares, d.price, d.reason)
+            execution_cost, _spread, execution_model = _paper_execution_cost(
+                d.price,
+                d.shares,
+                is_penny=is_penny,
+                base_spread=base_execution_spread,
+            )
+            ok = portfolio.buy(
+                d.ticker,
+                d.shares,
+                d.price,
+                d.reason,
+                execution_cost=execution_cost,
+                decision_price=d.price,
+                execution_model=execution_model,
+            )
             # Store rl_score_at_entry and rl_rank_pct_at_entry in position metadata.
             # rank_pct is the rank percentile within the shortlist at entry time —
             # used by _rl_exit_checks() for stable threshold comparisons.
@@ -284,10 +329,44 @@ def run_cycle(
                 portfolio.positions[d.ticker]["rl_rank_pct_at_entry"] = rank_pct
 
         elif d.action == "SELL":
-            ok = portfolio.sell_all(d.ticker, d.price, d.reason)
+            shares_to_sell = float(
+                portfolio.positions.get(d.ticker, {}).get("shares", d.shares)
+            )
+            execution_cost, _spread, execution_model = _paper_execution_cost(
+                d.price,
+                shares_to_sell,
+                is_penny=d.price < 5.0,
+                base_spread=base_execution_spread,
+            )
+            ok = portfolio.sell_all(
+                d.ticker,
+                d.price,
+                d.reason,
+                execution_cost=execution_cost,
+                decision_price=d.price,
+                execution_model=execution_model,
+            )
 
         elif d.action == "SELL_PARTIAL":
-            ok = portfolio.sell(d.ticker, d.shares, d.price, d.reason)
+            shares_to_sell = min(
+                float(d.shares),
+                float(portfolio.positions.get(d.ticker, {}).get("shares", d.shares)),
+            )
+            execution_cost, _spread, execution_model = _paper_execution_cost(
+                d.price,
+                shares_to_sell,
+                is_penny=d.price < 5.0,
+                base_spread=base_execution_spread,
+            )
+            ok = portfolio.sell(
+                d.ticker,
+                d.shares,
+                d.price,
+                d.reason,
+                execution_cost=execution_cost,
+                decision_price=d.price,
+                execution_model=execution_model,
+            )
             if ok and d.ticker in portfolio.positions:
                 portfolio.positions[d.ticker]["partial_taken"] = True
 
@@ -317,6 +396,36 @@ def run_cycle(
 
     # ── SPY tracking + save ───────────────────────────────────────────────────
     spy_price = _fetch_current_spy_price()
+    allocation_summary = getattr(brain, "_last_allocation_summary", {}) or {}
+    try:
+        snapshot = portfolio.record_snapshot(
+            allocation_summary=allocation_summary,
+            spy_price=spy_price,
+            extra={
+                "executed_count": len(executed),
+                "config_hash": run_manifest["config_hash"],
+            },
+        )
+        run_manifest["portfolio_snapshot"] = {
+            "path": "broker/state/portfolio_history.jsonl",
+            "equity": snapshot.get("equity"),
+            "top_1_concentration": snapshot.get("top_1_concentration"),
+            "top_3_concentration": snapshot.get("top_3_concentration"),
+        }
+        cap_summary = summarize_cap_impact_history()
+        write_json(CAP_IMPACT_SUMMARY_PATH, cap_summary)
+        attribution = summarize_performance_attribution(portfolio)
+        write_json(PERFORMANCE_ATTRIBUTION_PATH, attribution)
+        parity_report = build_replay_live_parity_report(cfg, brain=brain)
+        write_json(PARITY_REPORT_PATH, parity_report)
+        run_manifest["diagnostics"] = {
+            "cap_impact_summary_path": str(CAP_IMPACT_SUMMARY_PATH),
+            "performance_attribution_path": str(PERFORMANCE_ATTRIBUTION_PATH),
+            "replay_live_parity_path": str(PARITY_REPORT_PATH),
+            "replay_live_parity_compatible": parity_report.get("compatible"),
+        }
+    except Exception as exc:
+        logger.warning("Could not write paper diagnostics: %s", exc)
     portfolio.save()
     log_cycle(executed, portfolio.equity, portfolio.cash, spy_price=spy_price)
 
@@ -384,6 +493,9 @@ def parse_args(config: dict = None):
     p.add_argument("--max_correlation",type=float, default=cfg.get("max_correlation", 0.80))
     p.add_argument("--theme_max_pct",  type=float, default=cfg.get("theme_max_pct",  1.00))
     p.add_argument("--low_price_max_pct", type=float, default=cfg.get("low_price_max_pct", 1.00))
+    p.add_argument("--sentiment_policy", type=str, default=cfg.get("sentiment_policy", "informational"))
+    p.add_argument("--sentiment_negative_weight_mult", type=float, default=cfg.get("sentiment_negative_weight_mult", 0.80))
+    p.add_argument("--sentiment_veto_composite_floor", type=float, default=cfg.get("sentiment_veto_composite_floor", 0.50))
     p.add_argument("--avoid_earnings", type=int,   default=cfg.get("avoid_earnings", 5))
     p.add_argument("--top_n",          type=int,   default=cfg.get("top_n",          500))
     p.add_argument("--max_daily_loss", type=float, default=cfg.get("max_daily_loss", 0.025))
@@ -391,6 +503,7 @@ def parse_args(config: dict = None):
     p.add_argument("--max_gross_exposure", type=float, default=cfg.get("max_gross_exposure", 0.95))
     p.add_argument("--cash_floor",     type=float, default=cfg.get("cash_floor",     0.05))
     p.add_argument("--target_volatility", type=float, default=cfg.get("target_volatility", 0.15))
+    p.add_argument("--execution_spread", type=float, default=cfg.get("execution_spread", 0.001))
     p.add_argument("--vol_lookback",   type=int,   default=cfg.get("vol_lookback",   20))
     p.add_argument("--no_options",        action="store_true", default=cfg.get("no_options", True))
     p.add_argument("--no_market_hours",   action="store_true", default=False)
@@ -454,6 +567,9 @@ def main(config: dict = None, maintenance_context: dict | None = None):
         max_pair_correlation = args.max_correlation,
         theme_max_pct       = args.theme_max_pct,
         low_price_max_pct   = args.low_price_max_pct,
+        sentiment_policy    = args.sentiment_policy,
+        sentiment_negative_weight_mult = args.sentiment_negative_weight_mult,
+        sentiment_veto_composite_floor = args.sentiment_veto_composite_floor,
         avoid_earnings_days = args.avoid_earnings,
         device              = DEVICE,
         rl_enabled          = args.rl_enabled,
@@ -482,6 +598,7 @@ def main(config: dict = None, maintenance_context: dict | None = None):
         enforce_market_hours = not args.no_market_hours,
         maintenance_context = maintenance_context,
         config = config,
+        execution_spread = args.execution_spread,
     )
 
 

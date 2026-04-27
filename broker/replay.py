@@ -268,6 +268,7 @@ def _execute_replay_decisions(
             if fill_price <= 0 or target_value <= 0:
                 continue
             fill_shares = target_value / fill_price
+            execution_cost = fill_shares * fill_price * float(execution_spread)
             _adj_value, adj_shares = _apply_execution_cost(fill_price, fill_shares, execution_spread)
             ok = portfolio.buy(d.ticker, adj_shares, fill_price, d.reason)
             traded_shares = float(adj_shares)
@@ -276,6 +277,7 @@ def _execute_replay_decisions(
         elif d.action == "SELL":
             if d.ticker in portfolio.positions:
                 traded_shares = float(portfolio.positions[d.ticker]["shares"])
+            execution_cost = traded_shares * fill_price * float(execution_spread)
             execution_price = _apply_sell_execution_cost(fill_price, execution_spread)
             ok = portfolio.sell_all(d.ticker, execution_price, d.reason)
             fill_price = execution_price
@@ -284,6 +286,7 @@ def _execute_replay_decisions(
                 traded_shares = float(
                     min(float(d.shares), float(portfolio.positions[d.ticker]["shares"]))
                 )
+            execution_cost = traded_shares * fill_price * float(execution_spread)
             execution_price = _apply_sell_execution_cost(fill_price, execution_spread)
             ok = portfolio.sell(d.ticker, d.shares, execution_price, d.reason)
             fill_price = execution_price
@@ -291,6 +294,7 @@ def _execute_replay_decisions(
                 portfolio.positions[d.ticker]["partial_taken"] = True
         else:
             ok = True
+            execution_cost = 0.0
 
         if ok and d.action in ("BUY", "SELL", "SELL_PARTIAL"):
             trade_log.append({
@@ -302,6 +306,8 @@ def _execute_replay_decisions(
                 "shares": traded_shares,
                 "price": fill_price,
                 "decision_price": float(d.price),
+                "execution_cost": float(execution_cost),
+                "execution_model": f"replay_spread:{float(execution_spread):.4f}",
                 "score": getattr(d, "score", 0.0),
                 "reason": d.reason,
             })

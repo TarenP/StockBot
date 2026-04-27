@@ -19,6 +19,7 @@ from broker.exposure import (
 logger = logging.getLogger(__name__)
 
 STATE_PATH = Path("broker/state/portfolio.json")
+HISTORY_PATH = Path("broker/state/portfolio_history.jsonl")
 CASH_YIELD_ANNUAL_RATE = 0.03
 DAYS_PER_YEAR = 365.25
 
@@ -142,18 +143,35 @@ class Portfolio:
 
     # ── Trade execution ───────────────────────────────────────────────────────
 
-    def buy(self, ticker: str, shares: float, price: float, reason: str = "") -> bool:
+    def buy(
+        self,
+        ticker: str,
+        shares: float,
+        price: float,
+        reason: str = "",
+        *,
+        execution_cost: float = 0.0,
+        decision_price: float | None = None,
+        execution_model: str | None = None,
+    ) -> bool:
         cost = shares * price
-        if cost > self.cash:
-            shares = self.cash / price   # buy as many as we can afford
-            cost   = shares * price
+        execution_cost = max(0.0, float(execution_cost or 0.0))
+        total_cost = cost + execution_cost
+        if total_cost > self.cash and total_cost > 0:
+            scale = self.cash / total_cost
+            shares *= scale
+            cost *= scale
+            execution_cost *= scale
+            total_cost = cost + execution_cost
         if shares < 0.001:
             return False
 
         if ticker in self.positions:
             pos = self.positions[ticker]
             total_shares = pos["shares"] + shares
-            pos["avg_cost"] = (pos["shares"] * pos["avg_cost"] + cost) / total_shares
+            pos["avg_cost"] = (
+                pos["shares"] * pos["avg_cost"] + cost + execution_cost
+            ) / total_shares
             pos["shares"]   = total_shares
             pos["last_price"] = price
             pos["peak_price"] = max(float(pos.get("peak_price", price)), float(price))
@@ -161,18 +179,38 @@ class Portfolio:
         else:
             self.positions[ticker] = {
                 "shares":        shares,
-                "avg_cost":      price,
+                "avg_cost":      (cost + execution_cost) / shares,
                 "last_price":    price,
                 "partial_taken": False,   # tracks whether partial profit was taken
                 "peak_price":    price,
                 "weak_signal_streak": 0,
             }
 
-        self.cash -= cost
-        self._log("BUY", ticker, shares, price, reason)
+        self.cash -= total_cost
+        self._log(
+            "BUY",
+            ticker,
+            shares,
+            price,
+            reason,
+            execution_cost=execution_cost,
+            decision_price=decision_price,
+            execution_model=execution_model,
+            net_cash_flow=-total_cost,
+        )
         return True
 
-    def sell(self, ticker: str, shares: float, price: float, reason: str = "") -> bool:
+    def sell(
+        self,
+        ticker: str,
+        shares: float,
+        price: float,
+        reason: str = "",
+        *,
+        execution_cost: float = 0.0,
+        decision_price: float | None = None,
+        execution_model: str | None = None,
+    ) -> bool:
         if ticker not in self.positions:
             return False
         pos = self.positions[ticker]
@@ -180,20 +218,34 @@ class Portfolio:
         if shares < 0.001:
             return False
 
-        proceeds = shares * price
+        gross_proceeds = shares * price
+        execution_cost = min(max(0.0, float(execution_cost or 0.0)), gross_proceeds)
+        proceeds = gross_proceeds - execution_cost
+        realized_pnl = (price - float(pos.get("avg_cost", price))) * shares - execution_cost
         self.cash += proceeds
         pos["shares"] -= shares
 
         if pos["shares"] < 0.001:
             del self.positions[ticker]
 
-        self._log("SELL", ticker, shares, price, reason)
+        self._log(
+            "SELL",
+            ticker,
+            shares,
+            price,
+            reason,
+            execution_cost=execution_cost,
+            decision_price=decision_price,
+            execution_model=execution_model,
+            realized_pnl=realized_pnl,
+            net_cash_flow=proceeds,
+        )
         return True
 
-    def sell_all(self, ticker: str, price: float, reason: str = "") -> bool:
+    def sell_all(self, ticker: str, price: float, reason: str = "", **kwargs) -> bool:
         if ticker not in self.positions:
             return False
-        return self.sell(ticker, self.positions[ticker]["shares"], price, reason)
+        return self.sell(ticker, self.positions[ticker]["shares"], price, reason, **kwargs)
 
     def update_prices(self, prices: dict[str, float]):
         """Update last_price for all held positions."""
@@ -229,7 +281,100 @@ class Portfolio:
         pos = self.positions[ticker]
         return (pos["last_price"] - pos["avg_cost"]) * pos["shares"]
 
-    def _log(self, action, ticker, shares, price, reason):
+    def build_snapshot(
+        self,
+        allocation_summary: dict | None = None,
+        spy_price: float | None = None,
+        extra: dict | None = None,
+    ) -> dict:
+        equity = float(self.equity)
+        position_values = self.position_values
+        position_weights = {
+            ticker: float(value / equity) if equity > 0 else 0.0
+            for ticker, value in position_values.items()
+        }
+        top_positions = [
+            {"ticker": ticker, "weight": float(weight)}
+            for ticker, weight in sorted(
+                position_weights.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:5]
+        ]
+
+        sector_map = {}
+        try:
+            from broker.sectors import get_cached_sector_map
+
+            sector_map = get_cached_sector_map(list(self.positions.keys()))
+        except Exception:
+            sector_map = {}
+
+        theme_weights = exposure_weights(portfolio_theme_values(self.positions, sector_map))
+        low_price_weights = exposure_weights(portfolio_low_price_values(self.positions))
+        total_execution_cost = sum(
+            float(t.get("execution_cost", 0.0) or 0.0)
+            for t in self.trade_log
+        )
+
+        snapshot = {
+            "time": datetime.now().isoformat(),
+            "equity": round(equity, 2),
+            "cash": round(float(self.cash), 2),
+            "cash_weight": float(self.cash / equity) if equity > 0 else 0.0,
+            "n_positions": len(self.positions),
+            "position_weights": position_weights,
+            "top_positions": top_positions,
+            "top_1_concentration": top_positions[0]["weight"] if top_positions else 0.0,
+            "top_3_concentration": float(
+                sum(item["weight"] for item in top_positions[:3])
+            ),
+            "theme_exposure": theme_weights,
+            "theme_effective_bet_count": effective_bet_count(theme_weights),
+            "low_price_exposure": (
+                low_price_weights.get("sub_5", 0.0)
+                + low_price_weights.get("5_to_10", 0.0)
+            ),
+            "total_execution_cost": total_execution_cost,
+            "spy_price": spy_price,
+            "allocation_summary": allocation_summary or {},
+        }
+        if extra:
+            snapshot["extra"] = extra
+        return snapshot
+
+    def record_snapshot(
+        self,
+        allocation_summary: dict | None = None,
+        spy_price: float | None = None,
+        extra: dict | None = None,
+        path: Path | str = HISTORY_PATH,
+    ) -> dict:
+        snapshot = self.build_snapshot(
+            allocation_summary=allocation_summary,
+            spy_price=spy_price,
+            extra=extra,
+        )
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
+            fh.write(json.dumps(snapshot) + "\n")
+        return snapshot
+
+    def _log(
+        self,
+        action,
+        ticker,
+        shares,
+        price,
+        reason,
+        *,
+        execution_cost: float = 0.0,
+        decision_price: float | None = None,
+        execution_model: str | None = None,
+        realized_pnl: float | None = None,
+        net_cash_flow: float | None = None,
+    ):
         entry = {
             "time":   datetime.now().isoformat(),
             "action": action,
@@ -237,6 +382,14 @@ class Portfolio:
             "shares": round(shares, 4),
             "price":  round(price, 4),
             "value":  round(shares * price, 2),
+            "decision_price": (
+                round(float(decision_price), 4)
+                if decision_price is not None else round(price, 4)
+            ),
+            "execution_cost": round(float(execution_cost or 0.0), 4),
+            "execution_model": execution_model or "none",
+            "net_cash_flow": round(float(net_cash_flow), 2) if net_cash_flow is not None else None,
+            "realized_pnl": round(float(realized_pnl), 2) if realized_pnl is not None else None,
             "reason": reason,
             "equity": round(self.equity, 2),
         }

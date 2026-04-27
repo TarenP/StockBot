@@ -121,6 +121,9 @@ class BrokerBrain:
         correlation_lookback_days: int = 60,
         theme_max_pct:       float = 1.00,
         low_price_max_pct:   float = 1.00,
+        sentiment_policy:    str   = "informational",
+        sentiment_negative_weight_mult: float = 0.80,
+        sentiment_veto_composite_floor: float = 0.50,
         avoid_earnings_days:  int   = 3,       # skip stocks within N days of earnings
         device=None,
         rl_enabled:           bool  = False,
@@ -152,6 +155,9 @@ class BrokerBrain:
         self.correlation_lookback_days = correlation_lookback_days
         self.theme_max_pct       = theme_max_pct
         self.low_price_max_pct   = low_price_max_pct
+        self.sentiment_policy    = str(sentiment_policy or "informational").strip().lower()
+        self.sentiment_negative_weight_mult = sentiment_negative_weight_mult
+        self.sentiment_veto_composite_floor = sentiment_veto_composite_floor
         self.avoid_earnings_days  = avoid_earnings_days
         self.device               = device
         self.rl_enabled           = rl_enabled
@@ -169,6 +175,7 @@ class BrokerBrain:
         self._last_rl_scores: pd.Series = pd.Series(dtype=float)
         self._last_rl_audit: pd.DataFrame = pd.DataFrame()
         self._last_cycle_audit: pd.DataFrame = pd.DataFrame()
+        self._last_allocation_summary: dict = {}
 
     def _current_market_regime(self, df_features: pd.DataFrame) -> int | None:
         regime_cols = [f"regime_{i}" for i in range(4) if f"regime_{i}" in df_features.columns]
@@ -510,6 +517,7 @@ class BrokerBrain:
         self._last_rl_scores = pd.Series(dtype=float)
         self._last_rl_audit = pd.DataFrame()
         self._last_cycle_audit = pd.DataFrame()
+        self._last_allocation_summary = {}
         if self.rl_enabled and candidates:
             try:
                 rl_score_table = get_rl_targets(
@@ -584,6 +592,7 @@ class BrokerBrain:
         sector_budget_skips = 0
         correlation_blocked_skips = 0
         risk_blocked_skips = 0
+        sentiment_blocked_skips = 0
         tiny_alloc_skips = 0
         buyable_count = 0
         cycle_audit_rows: list[dict] = []
@@ -617,6 +626,7 @@ class BrokerBrain:
                     continue
 
                 composite = report["composite_score"]
+                sentiment_label = self._sentiment_label(report)
                 rl_score_val = float(rl_scores.get(ticker, 0.0)) if rl_scores is not None else None
                 rl_weight_val = None
                 rl_raw_weight_val = None
@@ -649,8 +659,41 @@ class BrokerBrain:
                         threshold_skips += 1
                         continue
 
+                if self._sentiment_vetoes_entry(sentiment_label, composite):
+                    sentiment_blocked_skips += 1
+                    cycle_audit_rows.append(
+                        {
+                            "ticker": ticker,
+                            "candidate_status": "sentiment_blocked",
+                            "logged_score": (
+                                float(rl_score_val)
+                                if rl_score_val is not None else float(composite)
+                            ),
+                            "composite_score": float(composite),
+                            "rl_rank_pct": float(rl_score_val) if rl_score_val is not None else np.nan,
+                            "rl_weight": float(rl_weight_val) if rl_weight_val is not None else np.nan,
+                            "rl_raw_weight": (
+                                float(rl_raw_weight_val) if rl_raw_weight_val is not None else np.nan
+                            ),
+                            "sector": self._sector_map.get(ticker.upper(), "Unknown"),
+                            "theme_bucket": theme_bucket(
+                                ticker,
+                                self._sector_map.get(ticker.upper(), "Unknown"),
+                            ),
+                            "low_price_bucket": low_price_bucket(
+                                float(report.get("price", np.nan)),
+                                self.penny_threshold,
+                            ),
+                            "sentiment_label": sentiment_label,
+                            "sentiment_policy": self.sentiment_policy,
+                            "sentiment_veto_floor": float(self.sentiment_veto_composite_floor),
+                        }
+                    )
+                    continue
+
                 report["sector"] = self._sector_map.get(ticker.upper(), "Unknown")
                 report["theme_bucket"] = theme_bucket(ticker, report["sector"])
+                report["sentiment_label"] = sentiment_label
                 if rl_score_val is not None:
                     report["rl_score"] = rl_score_val
                     report["rl_rank_pct"] = rl_score_val
@@ -679,6 +722,8 @@ class BrokerBrain:
                             float(report.get("price", np.nan)),
                             self.penny_threshold,
                         ),
+                        "sentiment_label": sentiment_label,
+                        "sentiment_policy": self.sentiment_policy,
                     }
                 )
 
@@ -721,7 +766,7 @@ class BrokerBrain:
                     )
                 logger.info(
                     "RL filter counts: shortlisted=%d considered=%d researched=%d "
-                    "held=%d earnings=%d no_research=%d threshold=%d",
+                    "held=%d earnings=%d no_research=%d threshold=%d sentiment_blocked=%d",
                     n_scored,
                     shortlist_considered,
                     len(researched),
@@ -729,17 +774,19 @@ class BrokerBrain:
                     earnings_skips,
                     research_none_skips,
                     threshold_skips,
+                    sentiment_blocked_skips,
                 )
             else:
                 logger.debug(
                     "Heuristic filter counts: considered=%d researched=%d "
-                    "held=%d earnings=%d no_research=%d threshold=%d",
+                    "held=%d earnings=%d no_research=%d threshold=%d sentiment_blocked=%d",
                     shortlist_considered,
                     len(researched),
                     already_held_skips,
                     earnings_skips,
                     research_none_skips,
                     threshold_skips,
+                    sentiment_blocked_skips,
                 )
 
             if local_research_fallbacks:
@@ -855,6 +902,7 @@ class BrokerBrain:
                 allocation_steps = {
                     "model_suggested_weight": model_suggested_weight,
                     "target_weight_pre_caps": target_weight_pre_caps,
+                    "post_sentiment_weight": np.nan,
                     "post_vol_weight": np.nan,
                     "post_sector_weight": np.nan,
                     "post_theme_weight": np.nan,
@@ -864,6 +912,13 @@ class BrokerBrain:
                     "final_weight": np.nan,
                     "major_downweight_reason": "none",
                 }
+
+                sentiment_label = report.get("sentiment_label", self._sentiment_label(report))
+                sentiment_scale = self._sentiment_weight_scale(sentiment_label)
+                alloc_value *= sentiment_scale
+                allocation_steps["post_sentiment_weight"] = (
+                    float(alloc_value / equity) if equity > 0 else np.nan
+                )
 
                 # Volatility scaling
                 if risk_engine is not None:
@@ -959,6 +1014,7 @@ class BrokerBrain:
                 prev_weight = target_weight_pre_caps
                 drops = []
                 for reason_name, key in [
+                    ("sentiment_policy", "post_sentiment_weight"),
                     ("volatility", "post_vol_weight"),
                     ("sector_cap", "post_sector_weight"),
                     ("theme_cap", "post_theme_weight"),
@@ -974,6 +1030,43 @@ class BrokerBrain:
                 material_drops = [drop for drop in drops if drop[0] > 0.0025]
                 if material_drops:
                     allocation_steps["major_downweight_reason"] = max(material_drops)[1]
+                def _impact(before: float, after: float) -> float:
+                    if not (np.isfinite(before) and np.isfinite(after)):
+                        return 0.0
+                    return float(max(0.0, before - after))
+
+                allocation_steps["sentiment_cap_impact"] = _impact(
+                    target_weight_pre_caps,
+                    allocation_steps["post_sentiment_weight"],
+                )
+                allocation_steps["volatility_cap_impact"] = _impact(
+                    allocation_steps["post_sentiment_weight"],
+                    allocation_steps["post_vol_weight"],
+                )
+                allocation_steps["sector_cap_impact"] = _impact(
+                    allocation_steps["post_vol_weight"],
+                    allocation_steps["post_sector_weight"],
+                )
+                allocation_steps["theme_cap_impact"] = _impact(
+                    allocation_steps["post_sector_weight"],
+                    allocation_steps["post_theme_weight"],
+                )
+                allocation_steps["correlation_cap_impact"] = _impact(
+                    allocation_steps["post_theme_weight"],
+                    allocation_steps["post_correlation_weight"],
+                )
+                allocation_steps["low_price_cap_impact"] = _impact(
+                    allocation_steps["post_correlation_weight"],
+                    allocation_steps["post_low_price_weight"],
+                )
+                allocation_steps["cash_or_risk_cap_impact"] = _impact(
+                    allocation_steps["target_weight_post_caps"],
+                    allocation_steps["final_weight"],
+                )
+                allocation_steps["total_cap_impact"] = _impact(
+                    target_weight_pre_caps,
+                    allocation_steps["final_weight"],
+                )
 
                 shares = alloc_value / price if price > 0 else 0
                 if shares < 0.001 or alloc_value < 1.0:
@@ -981,9 +1074,7 @@ class BrokerBrain:
                     continue
 
                 # Build reason
-                sent_label = report.get("sentiment", {})
-                if isinstance(sent_label, dict):
-                    sent_label = sent_label.get("sentiment", "neutral")
+                sent_label = sentiment_label
                 earnings_note = ""
                 next_earnings = _get_next_earnings_date(ticker)
                 if next_earnings:
@@ -1006,7 +1097,8 @@ class BrokerBrain:
                         f"downweight_reason={allocation_steps['major_downweight_reason']} | "
                         f"rl_mode=true | Sector={sector} "
                         f"(target={target_alloc:.0%}) | Theme={theme} | "
-                        f"Sentiment={sent_label}{earnings_note}{corr_note} | "
+                        f"Sentiment={sent_label}({self.sentiment_policy},scale={sentiment_scale:.2f})"
+                        f"{earnings_note}{corr_note} | "
                         f"{'PENNY ' if is_penny else ''}"
                         f"{(report.get('headlines') or [''])[0][:50]}"
                     )
@@ -1022,7 +1114,8 @@ class BrokerBrain:
                         f"downweight_reason={allocation_steps['major_downweight_reason']} | "
                         f"score_source=composite | Sector={sector} "
                         f"(target={target_alloc:.0%}) | Theme={theme} | "
-                        f"Sentiment={sent_label}{earnings_note}{corr_note} | "
+                        f"Sentiment={sent_label}({self.sentiment_policy},scale={sentiment_scale:.2f})"
+                        f"{earnings_note}{corr_note} | "
                         f"{'PENNY ' if is_penny else ''}"
                         f"{(report.get('headlines') or [''])[0][:50]}"
                     )
@@ -1058,6 +1151,7 @@ class BrokerBrain:
                         "max_position_pct": float(effective_max_position_pct),
                         "model_suggested_weight": allocation_steps["model_suggested_weight"],
                         "target_weight_pre_caps": allocation_steps["target_weight_pre_caps"],
+                        "post_sentiment_weight": allocation_steps["post_sentiment_weight"],
                         "post_vol_weight": allocation_steps["post_vol_weight"],
                         "post_sector_weight": allocation_steps["post_sector_weight"],
                         "post_theme_weight": allocation_steps["post_theme_weight"],
@@ -1069,6 +1163,17 @@ class BrokerBrain:
                         "theme_effective_bet_count": float(theme_effective_bets),
                         "theme_cap": float(self.theme_max_pct),
                         "low_price_cap": float(self.low_price_max_pct),
+                        "sentiment_label": sentiment_label,
+                        "sentiment_policy": self.sentiment_policy,
+                        "sentiment_weight_scale": float(sentiment_scale),
+                        "sentiment_cap_impact": allocation_steps["sentiment_cap_impact"],
+                        "volatility_cap_impact": allocation_steps["volatility_cap_impact"],
+                        "sector_cap_impact": allocation_steps["sector_cap_impact"],
+                        "theme_cap_impact": allocation_steps["theme_cap_impact"],
+                        "correlation_cap_impact": allocation_steps["correlation_cap_impact"],
+                        "low_price_cap_impact": allocation_steps["low_price_cap_impact"],
+                        "cash_or_risk_cap_impact": allocation_steps["cash_or_risk_cap_impact"],
+                        "total_cap_impact": allocation_steps["total_cap_impact"],
                     }
                 )
 
@@ -1087,7 +1192,7 @@ class BrokerBrain:
             if buyable_count == 0:
                 logger.info(
                     "Buy funnel: researched=%d slots=%d buys=%d held=%d earnings=%d "
-                    "no_research=%d threshold=%d penny_blocked=%d sector_blocked=%d "
+                    "no_research=%d threshold=%d sentiment_blocked=%d penny_blocked=%d sector_blocked=%d "
                     "corr_blocked=%d risk_blocked=%d tiny_alloc=%d",
                     len(researched),
                     n_slots,
@@ -1096,6 +1201,7 @@ class BrokerBrain:
                     earnings_skips,
                     research_none_skips,
                     threshold_skips,
+                    sentiment_blocked_skips,
                     penny_budget_skips,
                     sector_budget_skips,
                     correlation_blocked_skips,
@@ -1107,6 +1213,9 @@ class BrokerBrain:
                     ["candidate_status", "logged_score", "composite_score", "ticker"],
                     ascending=[True, False, False, True],
                 ).reset_index(drop=True)
+                self._last_cycle_audit = self._finalize_allocation_audit(
+                    self._last_cycle_audit
+                )
 
         # ── 8. Options decisions (suppressed when RL enabled) ─────────────────
         if not self.rl_enabled:
@@ -1131,6 +1240,226 @@ class BrokerBrain:
 
         fallback = research_from_features(df_features, ticker)
         return fallback, fallback is not None
+
+    def _sentiment_label(self, report: dict) -> str:
+        sent = report.get("sentiment", {})
+        if isinstance(sent, dict):
+            sent = sent.get("sentiment", "neutral")
+        label = str(sent or "neutral").strip().lower()
+        if label not in {"positive", "negative", "neutral"}:
+            return "neutral"
+        return label
+
+    def _sentiment_weight_scale(self, label: str) -> float:
+        if self.sentiment_policy in {"penalize", "penalize_negative"} and label == "negative":
+            return float(np.clip(self.sentiment_negative_weight_mult, 0.0, 1.0))
+        return 1.0
+
+    def _sentiment_vetoes_entry(self, label: str, composite_score: float) -> bool:
+        if self.sentiment_policy not in {"veto", "veto_negative"}:
+            return False
+        return label == "negative" and float(composite_score) < float(
+            self.sentiment_veto_composite_floor
+        )
+
+    def _finalize_allocation_audit(self, audit_df: pd.DataFrame) -> pd.DataFrame:
+        if audit_df.empty or "candidate_status" not in audit_df.columns:
+            self._last_allocation_summary = {}
+            return audit_df
+
+        selected_mask = audit_df["candidate_status"].eq("buy_selected")
+        selected = audit_df[selected_mask].copy()
+        if selected.empty:
+            self._last_allocation_summary = {}
+            return audit_df
+
+        signal_col = "rl_rank_pct" if "rl_rank_pct" in selected.columns else "logged_score"
+        selected["signal_rank"] = selected[signal_col].rank(
+            method="first",
+            ascending=False,
+        )
+        selected["final_weight_rank"] = selected["final_weight"].rank(
+            method="first",
+            ascending=False,
+        )
+        selected["rank_weight_delta"] = selected["final_weight_rank"] - selected["signal_rank"]
+
+        for idx, row in selected.iterrows():
+            audit_df.at[idx, "signal_rank"] = float(row["signal_rank"])
+            audit_df.at[idx, "final_weight_rank"] = float(row["final_weight_rank"])
+            audit_df.at[idx, "rank_weight_delta"] = float(row["rank_weight_delta"])
+            audit_df.at[idx, "rank_weight_mismatch"] = bool(abs(row["rank_weight_delta"]) >= 2)
+
+        summary: dict[str, object] = {}
+        selected["final_weight"] = selected["final_weight"].fillna(0.0).astype(float)
+        selected["target_weight_pre_caps"] = selected[
+            "target_weight_pre_caps"
+        ].fillna(0.0).astype(float)
+
+        final_weight_by_ticker = selected.set_index("ticker")["final_weight"].sort_values(
+            ascending=False
+        )
+        top_positions = [
+            {"ticker": str(ticker), "weight": float(weight)}
+            for ticker, weight in final_weight_by_ticker.head(5).items()
+        ]
+        summary["top_positions"] = top_positions
+        summary["largest_position"] = top_positions[0] if top_positions else None
+        summary["top_1_concentration"] = (
+            float(final_weight_by_ticker.iloc[0]) if not final_weight_by_ticker.empty else 0.0
+        )
+        summary["top_3_concentration"] = float(final_weight_by_ticker.head(3).sum())
+        summary["effective_position_bet_count"] = effective_bet_count(
+            exposure_weights({str(k): float(v) for k, v in final_weight_by_ticker.items()})
+        )
+
+        if "theme_bucket" in selected.columns:
+            pre_cap_theme_exposure = (
+                selected.groupby("theme_bucket")["target_weight_pre_caps"]
+                .sum()
+                .sort_values(ascending=False)
+            )
+            theme_exposure = (
+                selected.groupby("theme_bucket")["final_weight"].sum().sort_values(ascending=False)
+            )
+            summary["pre_cap_theme_exposure"] = {
+                str(k): float(v) for k, v in pre_cap_theme_exposure.items()
+            }
+            summary["theme_exposure"] = {
+                str(k): float(v) for k, v in theme_exposure.items()
+            }
+            summary["theme_effective_bet_count"] = effective_bet_count(
+                exposure_weights(summary["theme_exposure"])
+            )
+            summary["largest_theme"] = (
+                {
+                    "theme": str(theme_exposure.index[0]),
+                    "weight": float(theme_exposure.iloc[0]),
+                }
+                if not theme_exposure.empty
+                else None
+            )
+            summary["top_theme_concentration"] = (
+                float(theme_exposure.iloc[0]) if not theme_exposure.empty else 0.0
+            )
+            summary["theme_overloads"] = {
+                str(k): float(v)
+                for k, v in theme_exposure.items()
+                if float(v) > float(self.theme_max_pct) + 1e-9
+            }
+
+        if "sector" in selected.columns:
+            pre_cap_sector_exposure = (
+                selected.groupby("sector")["target_weight_pre_caps"]
+                .sum()
+                .sort_values(ascending=False)
+            )
+            sector_exposure = (
+                selected.groupby("sector")["final_weight"].sum().sort_values(ascending=False)
+            )
+            summary["pre_cap_sector_exposure"] = {
+                str(k): float(v) for k, v in pre_cap_sector_exposure.items()
+            }
+            summary["sector_exposure"] = {
+                str(k): float(v) for k, v in sector_exposure.items()
+            }
+            summary["sector_effective_bet_count"] = effective_bet_count(
+                exposure_weights(summary["sector_exposure"])
+            )
+
+        low_price_exposure = selected.loc[
+            selected.get("low_price_bucket", pd.Series(index=selected.index)).isin(
+                ["sub_5", "5_to_10"]
+            ),
+            "final_weight",
+        ].sum()
+        summary["low_price_exposure"] = float(low_price_exposure)
+
+        cap_impact_cols = [
+            "volatility_cap_impact",
+            "sector_cap_impact",
+            "theme_cap_impact",
+            "correlation_cap_impact",
+            "low_price_cap_impact",
+            "cash_or_risk_cap_impact",
+            "sentiment_cap_impact",
+            "total_cap_impact",
+        ]
+        cap_impact = {}
+        cap_counts = {}
+        for col in cap_impact_cols:
+            if col in selected.columns:
+                impacts = selected[col].fillna(0.0).astype(float)
+                cap_impact[col] = float(impacts.sum())
+                cap_counts[col] = int((impacts > 0.0025).sum())
+        summary["cap_impact"] = cap_impact
+        summary["cap_intervention_counts"] = cap_counts
+
+        per_cap_cols = [col for col in cap_impact_cols if col != "total_cap_impact"]
+        top_interventions = []
+        for _, row in selected.iterrows():
+            impacts = {
+                col: float(row.get(col, 0.0) or 0.0)
+                for col in per_cap_cols
+            }
+            if not impacts:
+                continue
+            cap_class, impact = max(impacts.items(), key=lambda item: item[1])
+            if impact <= 0.0025:
+                continue
+            top_interventions.append(
+                {
+                    "ticker": str(row["ticker"]),
+                    "cap_class": cap_class.replace("_impact", ""),
+                    "impact": float(impact),
+                    "pre_cap_weight": float(row["target_weight_pre_caps"]),
+                    "final_weight": float(row["final_weight"]),
+                    "major_downweight_reason": str(row.get("major_downweight_reason", "none")),
+                }
+            )
+        summary["top_cap_interventions"] = sorted(
+            top_interventions,
+            key=lambda item: item["impact"],
+            reverse=True,
+        )[:5]
+
+        mismatches = selected.reindex(
+            selected["rank_weight_delta"].abs().sort_values(ascending=False).index
+        ).head(5)
+        summary["rank_weight_mismatches"] = [
+            {
+                "ticker": str(row["ticker"]),
+                "signal_rank": float(row["signal_rank"]),
+                "final_weight_rank": float(row["final_weight_rank"]),
+                "rank_weight_delta": float(row["rank_weight_delta"]),
+                "final_weight": float(row["final_weight"]),
+            }
+            for _, row in mismatches.iterrows()
+            if abs(float(row["rank_weight_delta"])) >= 1
+        ]
+
+        self._last_allocation_summary = summary
+        logger.info(
+            "Allocation exposure summary: themes=%s low_price=%.1f%% "
+            "top1=%.1f%% top3=%.1f%% top_theme=%.1f%% "
+            "effective_theme_bets=%.2f effective_position_bets=%.2f cap_impact=%s",
+            summary.get("theme_exposure", {}),
+            float(summary.get("low_price_exposure", 0.0)) * 100,
+            float(summary.get("top_1_concentration", 0.0)) * 100,
+            float(summary.get("top_3_concentration", 0.0)) * 100,
+            float(summary.get("top_theme_concentration", 0.0)) * 100,
+            float(summary.get("theme_effective_bet_count", 0.0)),
+            float(summary.get("effective_position_bet_count", 0.0)),
+            summary.get("cap_impact", {}),
+        )
+        if summary.get("top_cap_interventions"):
+            logger.info("Top cap interventions: %s", summary["top_cap_interventions"])
+        if summary.get("rank_weight_mismatches"):
+            logger.info("Rank/weight mismatches: %s", summary["rank_weight_mismatches"])
+        if summary.get("theme_overloads"):
+            logger.warning("Theme exposure exceeds cap: %s", summary["theme_overloads"])
+
+        return audit_df
 
     def _get_stop_loss_pct(self, ticker: str, pos: dict) -> float:
         """

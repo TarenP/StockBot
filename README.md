@@ -154,6 +154,7 @@ max_correlation = 0.80     # blocks adding names too correlated with held positi
 avoid_earnings = 4         # skip stocks within N days of earnings
 max_daily_loss = 0.025     # 2.5% daily halt
 max_drawdown   = 0.12      # 12% circuit breaker
+execution_spread = 0.001   # base paper execution cost; low-price tiers can be higher
 no_options     = true      # disabled until stock-side edge is proven
 
 # RL integration
@@ -293,11 +294,31 @@ candidates with a `theme_bucket` such as `consumer_credit_finance`,
 `precious_metals_miners`, or `speculative_growth_turnaround`. `theme_max_pct`
 caps any one economic theme, and `low_price_max_pct` caps aggregate sub-$10
 exposure. The score audit records pre-cap, post-cap, and final weights so
-rank-to-weight inversions can be traced after each rebalance.
+rank-to-weight inversions can be traced after each rebalance. Each cycle also
+logs aggregate pre-cap and final theme/sector exposure, effective theme and
+position bet counts, top-name/top-theme concentration, cap-impact totals and
+counts by class, the largest cap interventions, and the largest rank-to-weight
+mismatches.
 
-Sentiment policy is explicit in `broker.config`: `sentiment_policy =
+### Paper diagnostics
+Each completed paper cycle appends `broker/state/portfolio_history.jsonl` with
+cash, holdings, top-name concentration, theme exposure, low-price exposure,
+execution drag, and the latest allocation summary. It also writes:
+
+- `broker/state/cap_impact_summary.json` - rolling cap-impact totals and counts
+- `broker/state/performance_attribution.json` - realized/unrealized P&L and execution drag
+- `broker/state/replay_live_parity.json` - live settings compared with replay settings
+
+Paper fills charge an explicit spread/slippage cost in cash and record it on
+each trade. The trade log keeps both decision price and execution cost so P&L
+does not silently assume free execution.
+
+Sentiment policy is explicit in `broker.config`. `sentiment_policy =
 informational` means sentiment is logged and available to the scorer, but it
-is not a standalone buy veto.
+is not a standalone buy veto. `penalize_negative` haircuts negative-sentiment
+position sizes by `sentiment_negative_weight_mult`, while `veto_negative`
+blocks negative-sentiment entries whose composite score is below
+`sentiment_veto_composite_floor`.
 
 ### Candidate selection and sizing
 1. Screens 1000 stocks using the trained screener (or rule-based fallback)

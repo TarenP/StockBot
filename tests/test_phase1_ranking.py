@@ -259,7 +259,120 @@ class TestPhase1RLRanking(unittest.TestCase):
         self.assertIn("target_weight_pre_caps", audit.columns)
         self.assertIn("target_weight_post_caps", audit.columns)
         self.assertIn("major_downweight_reason", audit.columns)
+        self.assertIn("total_cap_impact", audit.columns)
+        self.assertIn("signal_rank", audit.columns)
+        self.assertIn("rank_weight_mismatch", audit.columns)
+        self.assertIn("sentiment_policy", audit.columns)
         self.assertEqual(selected["theme_bucket"], "sector_unknown")
+        self.assertEqual(selected["sentiment_policy"], "informational")
+        self.assertIsInstance(brain._last_allocation_summary, dict)
+        self.assertIn("cap_impact", brain._last_allocation_summary)
+        self.assertIn("top_1_concentration", brain._last_allocation_summary)
+        self.assertIn("top_3_concentration", brain._last_allocation_summary)
+        self.assertIn("effective_position_bet_count", brain._last_allocation_summary)
+        self.assertIn("cap_intervention_counts", brain._last_allocation_summary)
+        self.assertIn("top_cap_interventions", brain._last_allocation_summary)
+
+    def test_allocation_summary_reports_concentration_and_cap_interventions(self):
+        brain = _make_brain(rl_enabled=True)
+        audit = pd.DataFrame(
+            [
+                {
+                    "ticker": "AAA",
+                    "candidate_status": "buy_selected",
+                    "logged_score": 0.90,
+                    "rl_rank_pct": 0.90,
+                    "final_weight": 0.20,
+                    "target_weight_pre_caps": 0.25,
+                    "theme_bucket": "theme_a",
+                    "sector": "Financials",
+                    "low_price_bucket": "over_10",
+                    "sector_cap_impact": 0.00,
+                    "theme_cap_impact": 0.05,
+                    "low_price_cap_impact": 0.00,
+                    "volatility_cap_impact": 0.00,
+                    "correlation_cap_impact": 0.00,
+                    "cash_or_risk_cap_impact": 0.00,
+                    "sentiment_cap_impact": 0.00,
+                    "total_cap_impact": 0.05,
+                    "major_downweight_reason": "theme_cap",
+                },
+                {
+                    "ticker": "BBB",
+                    "candidate_status": "buy_selected",
+                    "logged_score": 0.80,
+                    "rl_rank_pct": 0.80,
+                    "final_weight": 0.15,
+                    "target_weight_pre_caps": 0.22,
+                    "theme_bucket": "theme_a",
+                    "sector": "Financials",
+                    "low_price_bucket": "over_10",
+                    "sector_cap_impact": 0.07,
+                    "theme_cap_impact": 0.00,
+                    "low_price_cap_impact": 0.00,
+                    "volatility_cap_impact": 0.00,
+                    "correlation_cap_impact": 0.00,
+                    "cash_or_risk_cap_impact": 0.00,
+                    "sentiment_cap_impact": 0.00,
+                    "total_cap_impact": 0.07,
+                    "major_downweight_reason": "sector_cap",
+                },
+                {
+                    "ticker": "CCC",
+                    "candidate_status": "buy_selected",
+                    "logged_score": 0.70,
+                    "rl_rank_pct": 0.70,
+                    "final_weight": 0.10,
+                    "target_weight_pre_caps": 0.10,
+                    "theme_bucket": "theme_b",
+                    "sector": "Materials",
+                    "low_price_bucket": "5_to_10",
+                    "sector_cap_impact": 0.00,
+                    "theme_cap_impact": 0.00,
+                    "low_price_cap_impact": 0.00,
+                    "volatility_cap_impact": 0.00,
+                    "correlation_cap_impact": 0.00,
+                    "cash_or_risk_cap_impact": 0.00,
+                    "sentiment_cap_impact": 0.00,
+                    "total_cap_impact": 0.00,
+                    "major_downweight_reason": "none",
+                },
+            ]
+        )
+
+        finalized = brain._finalize_allocation_audit(audit)
+        summary = brain._last_allocation_summary
+
+        self.assertIn("rank_weight_delta", finalized.columns)
+        self.assertAlmostEqual(summary["top_1_concentration"], 0.20)
+        self.assertAlmostEqual(summary["top_3_concentration"], 0.45)
+        self.assertAlmostEqual(summary["top_theme_concentration"], 0.35)
+        self.assertAlmostEqual(summary["pre_cap_theme_exposure"]["theme_a"], 0.47)
+        self.assertAlmostEqual(summary["theme_exposure"]["theme_a"], 0.35)
+        self.assertAlmostEqual(summary["pre_cap_sector_exposure"]["Financials"], 0.47)
+        self.assertAlmostEqual(summary["sector_exposure"]["Financials"], 0.35)
+        self.assertEqual(summary["cap_intervention_counts"]["theme_cap_impact"], 1)
+        self.assertEqual(summary["cap_intervention_counts"]["sector_cap_impact"], 1)
+        self.assertEqual(summary["top_cap_interventions"][0]["ticker"], "BBB")
+        self.assertEqual(summary["top_cap_interventions"][0]["cap_class"], "sector_cap")
+
+    def test_sentiment_policy_helpers_are_explicit(self):
+        brain = _make_brain(rl_enabled=True)
+
+        brain.sentiment_policy = "informational"
+        self.assertFalse(brain._sentiment_vetoes_entry("negative", 0.10))
+        self.assertEqual(brain._sentiment_weight_scale("negative"), 1.0)
+
+        brain.sentiment_policy = "penalize_negative"
+        brain.sentiment_negative_weight_mult = 0.75
+        self.assertEqual(brain._sentiment_weight_scale("negative"), 0.75)
+        self.assertEqual(brain._sentiment_weight_scale("positive"), 1.0)
+
+        brain.sentiment_policy = "veto_negative"
+        brain.sentiment_veto_composite_floor = 0.50
+        self.assertTrue(brain._sentiment_vetoes_entry("negative", 0.49))
+        self.assertFalse(brain._sentiment_vetoes_entry("negative", 0.50))
+        self.assertFalse(brain._sentiment_vetoes_entry("positive", 0.10))
 
     def test_rl_enabled_skips_zero_rank_scores_even_with_zero_floor(self):
         """Zero RL score means unranked/no-conviction and should not generate a BUY."""
