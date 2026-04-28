@@ -224,6 +224,13 @@ def summarize_performance_attribution(portfolio) -> dict:
         * _safe_float(pos.get("shares"))
         for pos in positions.values()
     )
+    dividend_income = _safe_float(getattr(portfolio, "dividend_cash_total", 0.0))
+    if dividend_income <= 0:
+        dividend_income = sum(
+            _safe_float(t.get("net_cash_flow"))
+            for t in trade_log
+            if str(t.get("action", "")).upper() == "DIVIDEND"
+        )
     total_execution_cost = sum(_safe_float(t.get("execution_cost")) for t in trade_log)
     gross_traded_value = sum(
         _safe_float(t.get("shares")) * _safe_float(t.get("price"))
@@ -250,7 +257,8 @@ def summarize_performance_attribution(portfolio) -> dict:
         "realized_gross_pnl": realized_gross_pnl,
         "realized_net_pnl": realized_net_pnl,
         "unrealized_pnl": unrealized_pnl,
-        "total_pnl": realized_net_pnl + unrealized_pnl,
+        "dividend_income": dividend_income,
+        "total_pnl": realized_net_pnl + unrealized_pnl + dividend_income,
         "total_execution_cost": total_execution_cost,
         "gross_traded_value": gross_traded_value,
         "win_rate": len(wins) / len(closed) if closed else None,

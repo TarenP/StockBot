@@ -4,7 +4,9 @@ Autonomous Broker
 Run once daily. Everything else is automatic.
 
     python Broker.py              # full cycle — data, decisions, shadows, maintenance
-    python Broker.py --status     # show portfolio + shadow standings, no trading
+    python Broker.py --status     # fetch holding prices, update portfolio status, no trading
+    python Broker.py --status --refresh-prices  # refresh broader price cache too
+    python Broker.py --snapshot   # same as --status
     python Broker.py --trades     # show recent trade history
 
 What happens on every run:
@@ -101,7 +103,9 @@ if __name__ == "__main__":
     import argparse
 
     p = argparse.ArgumentParser(description="Autonomous broker — run once daily.")
-    p.add_argument("--status",          action="store_true", help="Show portfolio, no trading")
+    p.add_argument("--status",          action="store_true", help="Fetch holding prices and update portfolio status, no trading")
+    p.add_argument("--snapshot",        action="store_true", help="Alias for --status")
+    p.add_argument("--refresh-prices",  action="store_true", help="Refresh cached prices before status/snapshot")
     p.add_argument("--trades",          action="store_true", help="Show recent trade history")
     p.add_argument("--no_shadows",      action="store_true", help="Skip shadow portfolio step")
     p.add_argument("--no_maintenance",  action="store_true", help="Skip staleness checks")
@@ -113,7 +117,7 @@ if __name__ == "__main__":
     config = _load_config()
 
     # ── Duplicate run prevention ──────────────────────────────────────────────
-    if not (args.status or args.trades):
+    if not (args.status or args.snapshot or args.trades):
         today_str = date.today().isoformat()
         import json as _json
         prev = {}
@@ -146,16 +150,27 @@ if __name__ == "__main__":
         _write_run_state("startup")
 
     # ── Status / trades — no trading ──────────────────────────────────────────
-    if args.status or args.trades:
+    if args.status or args.snapshot or args.trades:
+        if (args.status or args.snapshot) and args.refresh_prices:
+            try:
+                from broker.broker import _resolve_cycle_universe
+                from pipeline.updater import update_parquet
+
+                universe = _resolve_cycle_universe(config=config, save_dir="models")
+                n_prices = update_parquet(universe=universe, save_dir="models", config=config)
+                logger.info("Status price refresh complete: %s new row(s)", n_prices)
+            except Exception as exc:
+                logger.warning("Status price refresh failed; using cached prices: %s", exc)
+
         from broker.broker import main as broker_main
-        if args.status:
+        if args.status or args.snapshot:
             sys.argv = [sys.argv[0], "--status"]
         else:
             sys.argv = [sys.argv[0], "--trades"]
         broker_main(config)
 
         # Show shadow standings alongside status
-        if args.status:
+        if args.status or args.snapshot:
             try:
                 from broker.shadows import get_shadow_summary
                 print(get_shadow_summary())

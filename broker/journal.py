@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 JOURNAL_PATH  = Path("broker/state/journal.jsonl")
 EQUITY_PATH   = Path("broker/state/equity_curve.csv")
 SPY_PATH      = Path("broker/state/spy_curve.csv")
+PORTFOLIO_HISTORY_PATH = Path("broker/state/portfolio_history.jsonl")
+CAP_IMPACT_SUMMARY_PATH = Path("broker/state/cap_impact_summary.json")
+PERFORMANCE_ATTRIBUTION_PATH = Path("broker/state/performance_attribution.json")
+PARITY_REPORT_PATH = Path("broker/state/replay_live_parity.json")
 
 
 # ── Cycle logging ─────────────────────────────────────────────────────────────
@@ -117,15 +121,197 @@ def _align_equity_and_spy_returns(eq: pd.DataFrame) -> tuple[np.ndarray, np.ndar
 
 # ── Performance reporting ─────────────────────────────────────────────────────
 
+def _load_json_file(path: Path) -> dict:
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _latest_jsonl_row(path: Path) -> dict:
+    try:
+        if not path.exists():
+            return {}
+        last = ""
+        with path.open() as fh:
+            for line in fh:
+                if line.strip():
+                    last = line
+        return json.loads(last) if last else {}
+    except Exception:
+        return {}
+
+
+def _latest_eod_status(eq: pd.DataFrame | None) -> dict:
+    if eq is None or eq.empty:
+        return {}
+
+    frame = eq.copy()
+    frame["time"] = pd.to_datetime(frame["time"], utc=True, errors="coerce").dt.tz_convert(None)
+    frame = frame.dropna(subset=["time"]).sort_values("time")
+    if frame.empty:
+        return {}
+
+    frame["date"] = frame["time"].dt.date
+    eod = (
+        frame.groupby("date", sort=True)
+        .tail(1)
+        .sort_values("time")
+        .reset_index(drop=True)
+    )
+    latest = eod.iloc[-1]
+    previous = eod.iloc[-2] if len(eod) >= 2 else None
+    eod_return = None
+    if previous is not None:
+        prev_equity = float(previous["equity"])
+        if prev_equity > 0:
+            eod_return = float(float(latest["equity"]) / prev_equity - 1.0)
+
+    same_day = frame[frame["date"] == latest["date"]]
+    intraday_return = None
+    if len(same_day) >= 2:
+        first_equity = float(same_day.iloc[0]["equity"])
+        if first_equity > 0:
+            intraday_return = float(float(same_day.iloc[-1]["equity"]) / first_equity - 1.0)
+
+    return {
+        "latest_time": latest["time"],
+        "latest_date": latest["date"],
+        "latest_equity": float(latest["equity"]),
+        "latest_cash": float(latest.get("cash", 0.0)),
+        "previous_eod_equity": (
+            float(previous["equity"]) if previous is not None else None
+        ),
+        "eod_return": eod_return,
+        "intraday_return": intraday_return,
+        "n_eod_points": int(len(eod)),
+    }
+
+
+def _fmt_pct(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):+.2%}"
+
+
+def _fmt_weight(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):.2%}"
+
+
+def _print_status_snapshot(portfolio, eq: pd.DataFrame | None) -> None:
+    eod = _latest_eod_status(eq)
+    mark_info = getattr(portfolio, "_last_mark_to_market", {}) or {}
+    dividend_info = getattr(portfolio, "_last_dividend_accrual", {}) or {}
+    history = _latest_jsonl_row(PORTFOLIO_HISTORY_PATH)
+    cap_summary = _load_json_file(CAP_IMPACT_SUMMARY_PATH)
+    attribution = _load_json_file(PERFORMANCE_ATTRIBUTION_PATH)
+    parity = _load_json_file(PARITY_REPORT_PATH)
+
+    print(f"\n  {'-'*55}")
+    print("  Current Status")
+    print(f"  {'-'*55}")
+
+    if eod:
+        print(f"  Latest snapshot: {eod['latest_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  Latest equity:   ${eod['latest_equity']:,.2f}")
+        print(f"  Latest cash:     ${eod['latest_cash']:,.2f}")
+        print(f"  EOD return:      {_fmt_pct(eod['eod_return'])}")
+        if eod["intraday_return"] is not None:
+            print(f"  Today change:    {_fmt_pct(eod['intraday_return'])}")
+    else:
+        print(f"  Current equity:  ${portfolio.equity:,.2f}")
+        print(f"  Current cash:    ${portfolio.cash:,.2f}")
+        print("  EOD return:      n/a (no equity curve yet)")
+
+    if mark_info:
+        updated = mark_info.get("updated") or {}
+        sources = mark_info.get("sources") or {}
+        missing = mark_info.get("missing") or []
+        latest_date = mark_info.get("latest_date") or "unknown"
+        live_count = sum(1 for source in sources.values() if source == "live")
+        cache_count = sum(1 for source in sources.values() if source == "cache")
+        print(
+            "  Prices updated:  "
+            f"{latest_date} ({len(updated)}/{len(portfolio.positions)} holdings; "
+            f"live={live_count}, cache={cache_count})"
+        )
+        if missing:
+            print(f"  Missing prices:  {', '.join(missing[:8])}")
+        if mark_info.get("error"):
+            print(f"  Price mark note: {mark_info['error']}")
+        if mark_info.get("errors"):
+            error_keys = ", ".join(sorted(mark_info["errors"])[:5])
+            print(f"  Price notes:     {len(mark_info['errors'])} issue(s): {error_keys}")
+        print(f"  Marked equity:   ${portfolio.equity:,.2f}")
+        print(f"  Marked return:   {_fmt_pct(portfolio.total_return)}")
+        prev_eod = eod.get("previous_eod_equity") if eod else None
+        if prev_eod:
+            print(f"  Marked EOD ret:  {_fmt_pct(portfolio.equity / prev_eod - 1.0)}")
+
+    if dividend_info:
+        dividend_total = float(dividend_info.get("total", 0.0) or 0.0)
+        credited = dividend_info.get("credited") or []
+        if dividend_total > 0:
+            print(
+                "  Dividends:       "
+                f"${dividend_total:,.2f} credited ({len(credited)} event(s))"
+            )
+        if dividend_info.get("errors"):
+            error_keys = ", ".join(sorted(dividend_info["errors"])[:5])
+            print(
+                "  Dividend notes:  "
+                f"{len(dividend_info['errors'])} issue(s): {error_keys}"
+            )
+
+    if history:
+        print(
+            "  Concentration:   "
+            f"top1={_fmt_weight(history.get('top_1_concentration'))} "
+            f"top3={_fmt_weight(history.get('top_3_concentration'))} "
+            f"theme_bets={float(history.get('theme_effective_bet_count', 0.0)):.2f}"
+        )
+        print(f"  Low-price exp.:  {_fmt_weight(history.get('low_price_exposure'))}")
+
+    if attribution:
+        total_cost = float(attribution.get("total_execution_cost", 0.0) or 0.0)
+        realized = float(attribution.get("realized_net_pnl", 0.0) or 0.0)
+        unrealized = float(attribution.get("unrealized_pnl", 0.0) or 0.0)
+        dividends = float(attribution.get("dividend_income", 0.0) or 0.0)
+        print(
+            "  P&L attribution: "
+            f"realized=${realized:,.2f} unrealized=${unrealized:,.2f} "
+            f"dividends=${dividends:,.2f} exec_cost=${total_cost:,.2f}"
+        )
+
+    if cap_summary:
+        print(
+            "  Cap history:     "
+            f"{int(cap_summary.get('cycles', 0))} cycle(s), "
+            f"{int(cap_summary.get('cycles_with_cap_interventions', 0))} with caps"
+        )
+
+    if parity:
+        status = "OK" if parity.get("compatible") else "CHECK"
+        print(f"  Replay parity:   {status}")
+
+    print("  Command:         python Broker.py --status")
+
+
 def print_report(portfolio, show_benchmark: bool = True):
     """Print full performance report including SPY benchmark."""
     print(portfolio.summary())
 
     if not EQUITY_PATH.exists():
+        _print_status_snapshot(portfolio, None)
         return
 
     eq = pd.read_csv(EQUITY_PATH, parse_dates=["time"])
     if len(eq) < 2:
+        _print_status_snapshot(portfolio, eq)
         return
 
     eq["time"] = pd.to_datetime(eq["time"], utc=True, errors="coerce").dt.tz_convert(None)
@@ -140,6 +326,7 @@ def print_report(portfolio, show_benchmark: bool = True):
     print(f"  Peak equity:  ${peak:,.2f}")
     print(f"  Max drawdown: {dd:.2%}")
     print(f"  Total return: {(current/initial - 1):.2%}")
+    _print_status_snapshot(portfolio, eq)
 
     if not show_benchmark:
         return

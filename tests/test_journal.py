@@ -7,6 +7,17 @@ import broker.journal as journal_module
 
 
 class _DummyPortfolio:
+    cash = 106.0
+    positions = {}
+
+    @property
+    def equity(self) -> float:
+        return 106.0
+
+    @property
+    def total_return(self) -> float:
+        return 0.06
+
     def summary(self) -> str:
         return "Portfolio summary"
 
@@ -101,3 +112,68 @@ def test_print_report_aligns_benchmark_by_timestamp(monkeypatch):
         assert np.allclose(captured["relative_spy"], [0.02, 0.00980392])
     finally:
         eq_path.unlink(missing_ok=True)
+
+
+def test_print_report_includes_current_status_snapshot(monkeypatch, capsys):
+    base = Path("tests") / "_journal_status"
+    base.mkdir(exist_ok=True)
+    eq_path = base / "equity.csv"
+    history_path = base / "portfolio_history.jsonl"
+    cap_path = base / "cap.json"
+    attribution_path = base / "attribution.json"
+    parity_path = base / "parity.json"
+
+    pd.DataFrame(
+        {
+            "time": [
+                "2024-01-02T16:00:00",
+                "2024-01-03T10:00:00",
+                "2024-01-03T16:00:00",
+            ],
+            "equity": [100.0, 102.0, 106.0],
+            "cash": [100.0, 50.0, 40.0],
+            "spy_price": [100.0, 101.0, 102.0],
+        }
+    ).to_csv(eq_path, index=False)
+    history_path.write_text(
+        '{"top_1_concentration": 0.25, "top_3_concentration": 0.60, '
+        '"theme_effective_bet_count": 2.5, "low_price_exposure": 0.10}\n'
+    )
+    cap_path.write_text('{"cycles": 3, "cycles_with_cap_interventions": 2}')
+    attribution_path.write_text(
+        '{"realized_net_pnl": 12.5, "unrealized_pnl": 4.0, "total_execution_cost": 1.25}'
+    )
+    parity_path.write_text('{"compatible": true}')
+
+    try:
+        monkeypatch.setattr(journal_module, "EQUITY_PATH", eq_path)
+        monkeypatch.setattr(journal_module, "PORTFOLIO_HISTORY_PATH", history_path)
+        monkeypatch.setattr(journal_module, "CAP_IMPACT_SUMMARY_PATH", cap_path)
+        monkeypatch.setattr(journal_module, "PERFORMANCE_ATTRIBUTION_PATH", attribution_path)
+        monkeypatch.setattr(journal_module, "PARITY_REPORT_PATH", parity_path)
+
+        portfolio = _DummyPortfolio()
+        portfolio.positions = {"AAA": {"shares": 1.0}}
+        portfolio._last_mark_to_market = {
+            "updated": {"AAA": 106.0},
+            "sources": {"AAA": "live"},
+            "missing": [],
+            "latest_date": "2024-01-03",
+        }
+
+        journal_module.print_report(portfolio, show_benchmark=False)
+        output = capsys.readouterr().out
+
+        assert "Current Status" in output
+        assert "EOD return:      +6.00%" in output
+        assert "Today change:    +3.92%" in output
+        assert "Prices updated:  2024-01-03 (1/1 holdings; live=1, cache=0)" in output
+        assert "Marked return:   +6.00%" in output
+        assert "top1=25.00%" in output
+        assert "exec_cost=$1.25" in output
+        assert "Replay parity:   OK" in output
+        assert "python Broker.py --status" in output
+    finally:
+        for path in [eq_path, history_path, cap_path, attribution_path, parity_path]:
+            path.unlink(missing_ok=True)
+        base.rmdir()

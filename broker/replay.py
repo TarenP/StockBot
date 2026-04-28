@@ -1002,7 +1002,7 @@ def _check_replay_invariants(trade_log: list, dates: list) -> dict[str, bool]:
         )
 
     # 5. All actions are known types
-    known_actions = {"BUY", "SELL", "SELL_PARTIAL"}
+    known_actions = {"BUY", "SELL", "SELL_PARTIAL", "DIVIDEND"}
     unknown_actions = [t for t in trade_log if t.get("action") not in known_actions]
     results["all_actions_known"] = len(unknown_actions) == 0
     if unknown_actions:

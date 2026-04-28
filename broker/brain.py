@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from broker.analyst   import research, fetch_ticker_data, research_from_features
-from broker.portfolio import Portfolio
+from broker.portfolio import Portfolio, fetch_latest_market_price
 from broker.sectors   import (
     get_sectors_bulk, score_sectors, compute_target_allocations,
     get_portfolio_sector_weights,
@@ -1815,6 +1815,10 @@ class BrokerBrain:
     def _get_current_prices(self, tickers: list[str]) -> dict[str, float]:
         prices = {}
         for ticker in tickers:
+            quote = fetch_latest_market_price(ticker)
+            if quote.get("price"):
+                prices[ticker] = float(quote["price"])
+                continue
             data = fetch_ticker_data(ticker, days=5)
             if data is not None and not data.empty:
                 prices[ticker] = float(data["close"].iloc[-1])

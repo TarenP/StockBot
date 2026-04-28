@@ -1,8 +1,10 @@
 import json
+from datetime import date
 from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
+import pandas as pd
 
 from broker.broker import _paper_execution_cost
 from broker.paper_diagnostics import (
@@ -29,6 +31,8 @@ def _portfolio() -> Portfolio:
     portfolio.positions = {}
     portfolio.trade_log = []
     portfolio.cash_yield_last_date = None
+    portfolio.dividend_last_ex_date = {}
+    portfolio.dividend_cash_total = 0.0
     portfolio.options = _EmptyOptions()
     return portfolio
 
@@ -71,6 +75,132 @@ def test_portfolio_buy_records_execution_cost_and_snapshot():
         assert saved["allocation_summary"]["cap_impact"]["theme_cap_impact"] == 0.05
     finally:
         path.unlink(missing_ok=True)
+
+
+def test_portfolio_status_marks_to_latest_cached_close():
+    portfolio = _portfolio()
+    portfolio.positions = {
+        "AAA": {"shares": 2.0, "avg_cost": 10.0, "last_price": 10.0},
+        "BBB": {"shares": 1.0, "avg_cost": 20.0, "last_price": 20.0},
+    }
+    price_path = Path("tests/_tmp") / f"price_cache_{uuid4().hex}.parquet"
+    price_path.parent.mkdir(parents=True, exist_ok=True)
+    idx = pd.MultiIndex.from_tuples(
+        [
+            (pd.Timestamp("2024-01-02"), "AAA"),
+            (pd.Timestamp("2024-01-03"), "AAA"),
+            (pd.Timestamp("2024-01-02"), "BBB"),
+        ],
+        names=["date", "ticker"],
+    )
+    prices = pd.DataFrame({"close": [11.0, 12.5, 19.0], "volume": [1, 1, 1]}, index=idx)
+
+    try:
+        prices.to_parquet(price_path)
+        mark = portfolio.mark_to_latest_cached_prices(price_path)
+
+        assert mark["latest_date"] == "2024-01-03"
+        assert mark["updated"] == {"AAA": 12.5, "BBB": 19.0}
+        assert portfolio.positions["AAA"]["last_price"] == 12.5
+        assert portfolio.positions["BBB"]["last_price"] == 19.0
+    finally:
+        price_path.unlink(missing_ok=True)
+
+
+def test_portfolio_status_refreshes_live_prices_with_cache_fallback(monkeypatch):
+    import broker.analyst as analyst_module
+    import broker.portfolio as portfolio_module
+    import broker.validator as validator_module
+
+    portfolio = _portfolio()
+    portfolio.positions = {
+        "AAA": {"shares": 2.0, "avg_cost": 10.0, "last_price": 10.0},
+        "BBB": {"shares": 1.0, "avg_cost": 20.0, "last_price": 20.0},
+    }
+    price_path = Path("tests/_tmp") / f"price_cache_{uuid4().hex}.parquet"
+    price_path.parent.mkdir(parents=True, exist_ok=True)
+    idx = pd.MultiIndex.from_tuples(
+        [(pd.Timestamp("2024-01-03"), "BBB")],
+        names=["date", "ticker"],
+    )
+    pd.DataFrame({"close": [19.0], "volume": [1]}, index=idx).to_parquet(price_path)
+
+    def fake_quote(ticker: str):
+        if ticker == "AAA":
+            return {"price": 11.5, "date": "2024-01-04", "source": "intraday", "error": None}
+        return {"price": None, "date": None, "source": None, "error": None}
+
+    def fake_fetch(ticker: str, days: int = 90):
+        return None
+
+    try:
+        monkeypatch.setattr(portfolio_module, "fetch_latest_market_price", fake_quote)
+        monkeypatch.setattr(analyst_module, "fetch_ticker_data", fake_fetch)
+        monkeypatch.setattr(
+            validator_module,
+            "validate_portfolio_prices",
+            lambda positions, prices: prices,
+        )
+
+        mark = portfolio.refresh_latest_holding_prices(price_path)
+
+        assert mark["latest_date"] == "2024-01-04"
+        assert mark["updated"] == {"AAA": 11.5, "BBB": 19.0}
+        assert mark["sources"] == {"AAA": "live", "BBB": "cache"}
+        assert mark["missing"] == []
+        assert portfolio.positions["AAA"]["last_price"] == 11.5
+        assert portfolio.positions["BBB"]["last_price"] == 19.0
+    finally:
+        price_path.unlink(missing_ok=True)
+
+
+def test_portfolio_accrues_dividend_cash_once():
+    portfolio = _portfolio()
+    portfolio.cash = 100.0
+    portfolio.positions = {
+        "AAA": {"shares": 10.0, "avg_cost": 10.0, "last_price": 10.0},
+    }
+    portfolio.trade_log = [
+        {
+            "time": "2024-01-01T10:00:00",
+            "action": "BUY",
+            "ticker": "AAA",
+            "shares": 10.0,
+            "price": 10.0,
+        }
+    ]
+    dividends = pd.Series(
+        [0.50],
+        index=[pd.Timestamp("2024-01-10")],
+        name="Dividends",
+    )
+
+    def fetcher(ticker, start, end):
+        assert ticker == "AAA"
+        return dividends
+
+    accrual = portfolio.accrue_dividends(
+        date(2024, 1, 15),
+        fetcher=fetcher,
+    )
+    second = portfolio.accrue_dividends(
+        date(2024, 1, 15),
+        fetcher=fetcher,
+    )
+
+    assert accrual["total"] == 5.0
+    assert accrual["by_ticker"] == {"AAA": 5.0}
+    assert portfolio.cash == 105.0
+    assert portfolio.dividend_cash_total == 5.0
+    assert portfolio.dividend_last_ex_date["AAA"] == "2024-01-10"
+    assert portfolio.trade_log[-1]["action"] == "DIVIDEND"
+    assert portfolio.trade_log[-1]["net_cash_flow"] == 5.0
+    assert second["total"] == 0.0
+    assert sum(1 for rec in portfolio.trade_log if rec["action"] == "DIVIDEND") == 1
+
+    attribution = summarize_performance_attribution(portfolio)
+    assert attribution["dividend_income"] == 5.0
+    assert attribution["total_pnl"] == 5.0
 
 
 def test_cap_impact_history_summarizes_over_time():

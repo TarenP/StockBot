@@ -239,8 +239,18 @@ compare your real results to its recommendations over time.
 ### Check portfolio without trading
 ```bash
 python Broker.py --status
+# or
+python Broker.py --snapshot
+# refresh the broader local price cache too, still no trading
+python Broker.py --status --refresh-prices
 ```
-Shows portfolio summary, SPY benchmark, and current shadow portfolio standings.
+Shows current holdings, cash, EOD return, drawdown, SPY benchmark, concentration,
+paper execution drag, cap-history status, replay/live parity, and current shadow
+portfolio standings. This command fetches the latest price for each current
+holding, validates the marks, credits known cash dividends for held shares,
+updates `broker/state/portfolio.json`, records a no-trade equity snapshot, and
+prints the refreshed status. It does not buy or sell. Add `--refresh-prices`
+when you also want it to update the broader local price cache before printing.
 
 ### See trade history
 ```bash

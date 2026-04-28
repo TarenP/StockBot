@@ -394,6 +394,18 @@ def run_cycle(
         if ok:
             executed.append(d)
 
+    try:
+        portfolio._last_mark_to_market = portfolio.refresh_latest_holding_prices()
+        mark = portfolio._last_mark_to_market or {}
+        logger.info(
+            "Marked holdings before reporting: %d/%d updated (latest=%s)",
+            len(mark.get("updated") or {}),
+            len(portfolio.positions),
+            mark.get("latest_date") or "unknown",
+        )
+    except Exception as exc:
+        logger.warning("Could not refresh holding prices before reporting: %s", exc)
+
     # ── SPY tracking + save ───────────────────────────────────────────────────
     spy_price = _fetch_current_spy_price()
     allocation_summary = getattr(brain, "_last_allocation_summary", {}) or {}
@@ -524,23 +536,43 @@ def main(config: dict = None, maintenance_context: dict | None = None):
     args = parse_args(config)
 
     portfolio = Portfolio(initial_cash=args.cash)
-    cash_yield = portfolio.accrue_cash_yield(_today_et())
-    if cash_yield > 0:
-        logger.info(
-            "Accrued cash yield: $%.2f at %.2f%% annualized",
-            cash_yield,
-            CASH_YIELD_ANNUAL_RATE * 100,
-        )
-        portfolio.save()
-
     # Status / trades — no trading, just reporting
     if args.status:
+        portfolio._last_mark_to_market = portfolio.refresh_latest_holding_prices()
+        portfolio._last_dividend_accrual = portfolio.accrue_dividends(_today_et())
+        portfolio.save()
+        spy_price = _fetch_current_spy_price()
+        portfolio.record_snapshot(
+            spy_price=spy_price,
+            extra={"status_refresh": True},
+        )
+        try:
+            attribution = summarize_performance_attribution(portfolio)
+            write_json(PERFORMANCE_ATTRIBUTION_PATH, attribution)
+        except Exception as exc:
+            logger.warning("Could not update status attribution: %s", exc)
+        log_cycle([], portfolio.equity, portfolio.cash, spy_price=spy_price)
         print_report(portfolio)
         return
 
     if args.trades:
         print_recent_trades(n=30)
         return
+
+    today = _today_et()
+    cash_yield = portfolio.accrue_cash_yield(today)
+    portfolio._last_dividend_accrual = portfolio.accrue_dividends(today)
+    dividend_cash = float(portfolio._last_dividend_accrual.get("total", 0.0) or 0.0)
+    if cash_yield > 0:
+        logger.info(
+            "Accrued cash yield: $%.2f at %.2f%% annualized",
+            cash_yield,
+            CASH_YIELD_ANNUAL_RATE * 100,
+        )
+    if dividend_cash > 0:
+        logger.info("Credited dividends: $%.2f", dividend_cash)
+    if cash_yield > 0 or portfolio._last_dividend_accrual.get("state_changed"):
+        portfolio.save()
 
     # Startup validation before any trading
     errors = validate_startup(portfolio)

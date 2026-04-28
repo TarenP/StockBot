@@ -23,6 +23,12 @@ class _DummyPortfolio:
         self.cash = 10_000.0
         self.positions = {}
         self.options = _DummyOptions()
+        self.accrued = False
+        self.dividends_accrued = False
+        self.marked = False
+        self.refreshed_count = 0
+        self.saved = False
+        self.snapshot_recorded = False
 
     @property
     def equity(self) -> float:
@@ -33,10 +39,31 @@ class _DummyPortfolio:
         return 0.0
 
     def save(self) -> None:
-        pass
+        self.saved = True
 
     def summary(self) -> str:
         return "summary"
+
+    def accrue_cash_yield(self, *args, **kwargs) -> float:
+        self.accrued = True
+        return 1.0
+
+    def accrue_dividends(self, *args, **kwargs) -> dict:
+        self.dividends_accrued = True
+        return {"credited": [], "total": 0.0, "by_ticker": {}, "state_changed": False}
+
+    def mark_to_latest_cached_prices(self, *args, **kwargs) -> dict:
+        self.marked = True
+        return {"updated": {}, "missing": [], "latest_date": None}
+
+    def refresh_latest_holding_prices(self, *args, **kwargs) -> dict:
+        self.marked = True
+        self.refreshed_count += 1
+        return {"updated": {}, "sources": {}, "missing": [], "latest_date": None}
+
+    def record_snapshot(self, *args, **kwargs) -> dict:
+        self.snapshot_recorded = True
+        return {}
 
 
 class _DummyBrain:
@@ -94,6 +121,41 @@ def test_run_cycle_skips_duplicate_refresh_after_maintenance(monkeypatch):
     assert calls["sentiment"] == 0
 
 
+def test_status_command_refreshes_marks_without_accruing_cash(monkeypatch):
+    portfolio = _DummyPortfolio()
+    printed = {}
+
+    class _Args:
+        cash = 10_000.0
+        status = True
+        trades = False
+
+    monkeypatch.setattr(broker_module, "parse_args", lambda config=None: _Args())
+    monkeypatch.setattr(broker_module, "Portfolio", lambda initial_cash=10_000.0: portfolio)
+    monkeypatch.setattr(
+        broker_module,
+        "print_report",
+        lambda p: printed.__setitem__("portfolio", p),
+    )
+    monkeypatch.setattr(broker_module, "_fetch_current_spy_price", lambda: 123.0)
+    monkeypatch.setattr(broker_module, "log_cycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        broker_module,
+        "summarize_performance_attribution",
+        lambda portfolio: {"total_pnl": 0.0},
+    )
+    monkeypatch.setattr(broker_module, "write_json", lambda *args, **kwargs: None)
+
+    broker_module.main({})
+
+    assert printed["portfolio"] is portfolio
+    assert portfolio.accrued is False
+    assert portfolio.dividends_accrued is True
+    assert portfolio.marked is True
+    assert portfolio.saved is True
+    assert portfolio.snapshot_recorded is True
+
+
 def test_run_cycle_prints_summary_only_via_report(monkeypatch):
     printed: list[str] = []
 
@@ -119,6 +181,35 @@ def test_run_cycle_prints_summary_only_via_report(monkeypatch):
     )
 
     assert "summary" not in printed
+
+
+def test_run_cycle_refreshes_holding_prices_before_briefing(monkeypatch):
+    portfolio = _DummyPortfolio()
+    portfolio.positions = {"AAA": {"shares": 1.0, "avg_cost": 10.0, "last_price": 10.0}}
+    captured = {}
+
+    monkeypatch.setattr(broker_module, "_is_market_hours", lambda: True)
+    monkeypatch.setattr(broker_module, "_resolve_cycle_universe", lambda **kwargs: ["AAA"])
+    monkeypatch.setattr(updater_module, "update_parquet", lambda **kwargs: 0)
+    monkeypatch.setattr(sentiment_module, "update_sentiment", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(data_module, "load_master", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(broker_module, "log_cycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(broker_module, "daily_integrity_check", lambda portfolio: {})
+    monkeypatch.setattr(broker_module, "_fetch_current_spy_price", lambda: None)
+    monkeypatch.setattr(journal_module, "plot_live_performance", lambda *args, **kwargs: None)
+
+    def fake_briefing(decisions, briefing_portfolio, executed):
+        captured["refreshed_count"] = briefing_portfolio.refreshed_count
+
+    monkeypatch.setattr(briefing_module, "print_daily_briefing", fake_briefing)
+
+    broker_module.run_cycle(
+        portfolio=portfolio,
+        brain=_DummyBrain(),
+        risk=_DummyRisk(),
+    )
+
+    assert captured["refreshed_count"] >= 1
 
 
 def test_run_cycle_loads_raw_cols_for_local_research_fallback(monkeypatch):

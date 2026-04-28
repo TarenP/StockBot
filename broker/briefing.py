@@ -120,7 +120,7 @@ def print_daily_briefing(
     print(f"  {'-'*58}")
 
     if no_action:
-        print("  No trades today — portfolio unchanged.")
+        print("  No trades today — holdings unchanged.")
         print("  (Nothing cleared the signal threshold or triggered an exit)")
     else:
         for d in sells:
