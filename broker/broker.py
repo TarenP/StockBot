@@ -527,6 +527,8 @@ def parse_args(config: dict = None):
     p.add_argument("--rl_exit_threshold", type=float, default=cfg.get("rl_exit_threshold", 0.30))
     p.add_argument("--rl_conviction_drop",type=float, default=cfg.get("rl_conviction_drop", 0.20))
     p.add_argument("--rl_min_score",      type=float, default=cfg.get("rl_min_score",      0.0))
+    p.add_argument("--dead_money_days",   type=int,   default=cfg.get("dead_money_days",   0))
+    p.add_argument("--dead_money_min_return", type=float, default=cfg.get("dead_money_min_return", 0.02))
     return p.parse_args()
 
 
@@ -610,6 +612,8 @@ def main(config: dict = None, maintenance_context: dict | None = None):
         rl_exit_threshold   = args.rl_exit_threshold,
         rl_conviction_drop  = args.rl_conviction_drop,
         rl_min_score        = args.rl_min_score,
+        dead_money_days     = int(getattr(args, "dead_money_days", 0)),
+        dead_money_min_return = float(getattr(args, "dead_money_min_return", 0.02)),
     )
     brain._base_min_score = args.min_score
 

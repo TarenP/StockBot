@@ -132,6 +132,8 @@ class BrokerBrain:
         rl_exit_threshold:    float = 0.30,
         rl_conviction_drop:   float = 0.20,
         rl_min_score:         float = 0.0,   # separate threshold for RL rank percentiles (0 = top-k only)
+        dead_money_days:      int   = 0,     # exit positions with no progress after N days (0 = disabled)
+        dead_money_min_return: float = 0.02, # "no progress" = return below this threshold
     ):
         self.portfolio            = portfolio
         self.max_positions        = max_positions
@@ -166,6 +168,8 @@ class BrokerBrain:
         self.rl_exit_threshold    = rl_exit_threshold
         self.rl_conviction_drop   = rl_conviction_drop
         self.rl_min_score         = rl_min_score
+        self.dead_money_days      = dead_money_days
+        self.dead_money_min_return = dead_money_min_return
 
         # Cache sector map across cycles (refreshed weekly)
         self._sector_map:   dict[str, str]   = {}
@@ -474,6 +478,26 @@ class BrokerBrain:
                     continue
             else:
                 pos["weak_signal_streak"] = 0
+
+            # Dead-money exit — rotate out of positions making no progress
+            if (
+                self.dead_money_days > 0
+                and days_held >= self.dead_money_days
+                and pnl_pct < self.dead_money_min_return
+            ):
+                logger.info(
+                    "Dead-money exit %s: held %d days, return %.1f%% < %.1f%% threshold",
+                    ticker, days_held, pnl_pct * 100, self.dead_money_min_return * 100,
+                )
+                decisions.append(Decision(
+                    action="SELL", ticker=ticker,
+                    shares=pos["shares"], price=price, score=0.1,
+                    reason=(
+                        f"Dead-money exit: held {days_held}d, "
+                        f"return={pnl_pct:.1%} < {self.dead_money_min_return:.1%} threshold"
+                    ),
+                ))
+                continue
 
             # Delisted / halted ticker check — only for positions held 5+ days
             # with no price movement. Avoids false positives on newly opened positions

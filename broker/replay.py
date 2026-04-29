@@ -492,14 +492,14 @@ def run_replay(
     rl_exit_threshold: float = 0.30,
     rl_conviction_drop: float = 0.20,
     rl_min_score: float = 0.0,
+    dead_money_days: int = 0,
+    dead_money_min_return: float = 0.02,
     label: str | None = None,
 ) -> tuple[np.ndarray, list]:
     """
     Run the broker decision logic over historical data.
     Delegates to _run_replay_v2 which uses the full BrokerBrain pipeline.
     """
-    # _run_replay_v2 is the full implementation with BrokerBrain, RL, sector
-    # logic, earnings avoidance, etc. run_replay is kept as the public API.
     return _run_replay_v2(
         df_features=df_features,
         price_lookup=price_lookup,
@@ -533,6 +533,8 @@ def run_replay(
         rl_exit_threshold=rl_exit_threshold,
         rl_conviction_drop=rl_conviction_drop,
         rl_min_score=rl_min_score,
+        dead_money_days=dead_money_days,
+        dead_money_min_return=dead_money_min_return,
         label=label,
     )
 
@@ -572,6 +574,8 @@ def _run_replay_v2(
     rl_exit_threshold: float = 0.30,
     rl_conviction_drop: float = 0.20,
     rl_min_score: float = 0.0,
+    dead_money_days: int = 0,
+    dead_money_min_return: float = 0.02,
     label: str | None = None,
 ) -> tuple[np.ndarray, list]:
     global _LAST_REPLAY_SCORE_AUDIT
@@ -850,6 +854,8 @@ def _run_replay_v2(
         rl_exit_threshold=rl_exit_threshold,
         rl_conviction_drop=rl_conviction_drop,
         rl_min_score=rl_min_score,
+        dead_money_days=dead_money_days,
+        dead_money_min_return=dead_money_min_return,
     )
     brain._base_min_score = min_score
     brain._sector_map = sector_map.copy()
@@ -1068,6 +1074,8 @@ def _replay_kwargs_from_live_config(live_config: dict | None = None) -> dict:
         "rl_exit_threshold": float(live_config.get("rl_exit_threshold", 0.30)),
         "rl_conviction_drop": float(live_config.get("rl_conviction_drop", 0.20)),
         "rl_min_score": float(live_config.get("rl_min_score", 0.0)),
+        "dead_money_days": int(live_config.get("dead_money_days", 0)),
+        "dead_money_min_return": float(live_config.get("dead_money_min_return", 0.02)),
     }
 
 
