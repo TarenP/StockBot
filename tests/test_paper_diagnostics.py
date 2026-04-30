@@ -229,7 +229,24 @@ def test_cap_impact_history_summarizes_over_time():
     try:
         path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
 
-        summary = summarize_cap_impact_history(path)
+        trade_log = [
+            {
+                "action": "BUY",
+                "ticker": "AAA",
+                "reason": "score=1 | downweight_reason=theme_cap | Theme=test_theme |",
+            },
+            {
+                "action": "BUY",
+                "ticker": "BBB",
+                "reason": "score=1 | downweight_reason=low_price_or_penny_cap | Theme=test_theme |",
+            },
+            {
+                "action": "BUY",
+                "ticker": "CCC",
+                "reason": "score=1 | downweight_reason=none |",
+            },
+        ]
+        summary = summarize_cap_impact_history(path, trade_log=trade_log)
 
         assert summary["cycles"] == 2
         assert summary["cycles_with_cap_interventions"] == 2
@@ -237,14 +254,26 @@ def test_cap_impact_history_summarizes_over_time():
         assert summary["total_impact"]["sector_cap_impact"] == 0.03
         assert summary["intervention_counts"]["theme_cap_impact"] == 1
         assert summary["top_interventions"][0]["ticker"] == "AAA"
+        assert summary["entry_cap_interventions"]["buy_trades_with_caps"] == 2
+        assert summary["entry_cap_interventions"]["by_reason"]["theme_cap"] == 1
+        assert (
+            summary["entry_cap_interventions"]["intervention_counts"]["low_price_cap_impact"]
+            == 1
+        )
     finally:
         path.unlink(missing_ok=True)
 
 
 def test_performance_attribution_includes_execution_cost():
     portfolio = _portfolio()
-    assert portfolio.buy("AAA", 10.0, 100.0, "entry", execution_cost=1.0)
-    assert portfolio.sell_all("AAA", 110.0, "exit", execution_cost=1.1)
+    assert portfolio.buy(
+        "AAA",
+        10.0,
+        100.0,
+        "entry | Theme=consumer_credit_finance |",
+        execution_cost=1.0,
+    )
+    assert portfolio.sell_all("AAA", 110.0, "Trailing stop (test)", execution_cost=1.1)
 
     attribution = summarize_performance_attribution(portfolio)
 
@@ -253,6 +282,42 @@ def test_performance_attribution_includes_execution_cost():
     assert np.isclose(attribution["realized_net_pnl"], 97.9)
     assert np.isclose(attribution["total_execution_cost"], 2.1)
     assert attribution["win_rate"] == 1.0
+    assert attribution["exit_reason_counts"] == {"trailing_stop": 1}
+    assert attribution["by_theme"][0]["theme"] == "consumer_credit_finance"
+    assert attribution["by_theme"][0]["closed_trades"] == 1
+    assert attribution["by_theme"][0]["stop_out_rate"] == 0.0
+    assert attribution["by_price_bucket"][0]["price_bucket"] == "over_10"
+
+
+def test_performance_attribution_groups_open_and_closed_by_theme_and_price_bucket():
+    portfolio = _portfolio()
+    assert portfolio.buy(
+        "UWMC",
+        100.0,
+        4.0,
+        "entry | downweight_reason=low_price_or_penny_cap | Theme=consumer_credit_finance |",
+        execution_cost=1.0,
+    )
+    assert portfolio.sell_all("UWMC", 3.5, "Stop-loss (-12.5% vs -8.0% ATR-adjusted)", execution_cost=0.5)
+    assert portfolio.buy(
+        "SSRM",
+        10.0,
+        30.0,
+        "entry | Theme=precious_metals_miners |",
+    )
+    portfolio.positions["SSRM"]["last_price"] = 28.0
+
+    attribution = summarize_performance_attribution(portfolio)
+    by_theme = {row["theme"]: row for row in attribution["by_theme"]}
+    by_bucket = {row["price_bucket"]: row for row in attribution["by_price_bucket"]}
+
+    assert attribution["exit_reason_counts"] == {"stop_loss": 1}
+    assert by_theme["consumer_credit_finance"]["closed_trades"] == 1
+    assert by_theme["consumer_credit_finance"]["stop_out_rate"] == 1.0
+    assert by_theme["precious_metals_miners"]["open_positions"] == 1
+    assert np.isclose(by_theme["precious_metals_miners"]["unrealized_pnl"], -20.0)
+    assert by_bucket["sub_5"]["closed_trades"] == 1
+    assert by_bucket["over_10"]["open_positions"] == 1
 
 
 def test_paper_execution_cost_uses_tiered_or_configured_spread():

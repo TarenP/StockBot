@@ -424,7 +424,7 @@ def run_cycle(
             "top_1_concentration": snapshot.get("top_1_concentration"),
             "top_3_concentration": snapshot.get("top_3_concentration"),
         }
-        cap_summary = summarize_cap_impact_history()
+        cap_summary = summarize_cap_impact_history(trade_log=portfolio.trade_log)
         write_json(CAP_IMPACT_SUMMARY_PATH, cap_summary)
         attribution = summarize_performance_attribution(portfolio)
         write_json(PERFORMANCE_ATTRIBUTION_PATH, attribution)
@@ -549,10 +549,12 @@ def main(config: dict = None, maintenance_context: dict | None = None):
             extra={"status_refresh": True},
         )
         try:
+            cap_summary = summarize_cap_impact_history(trade_log=portfolio.trade_log)
+            write_json(CAP_IMPACT_SUMMARY_PATH, cap_summary)
             attribution = summarize_performance_attribution(portfolio)
             write_json(PERFORMANCE_ATTRIBUTION_PATH, attribution)
         except Exception as exc:
-            logger.warning("Could not update status attribution: %s", exc)
+            logger.warning("Could not update status diagnostics: %s", exc)
         log_cycle([], portfolio.equity, portfolio.cash, spy_price=spy_price)
         print_report(portfolio)
         return

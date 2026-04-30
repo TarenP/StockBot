@@ -202,6 +202,19 @@ def _fmt_weight(value: float | None) -> str:
     return f"{float(value):.2%}"
 
 
+def _fmt_optional_pct(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):.1%}"
+
+
+def _format_top_counts(counts: dict, limit: int = 4) -> str:
+    if not counts:
+        return "none"
+    items = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:limit]
+    return ", ".join(f"{key}={int(value)}" for key, value in items)
+
+
 def _print_status_snapshot(portfolio, eq: pd.DataFrame | None) -> None:
     eod = _latest_eod_status(eq)
     mark_info = getattr(portfolio, "_last_mark_to_market", {}) or {}
@@ -286,13 +299,38 @@ def _print_status_snapshot(portfolio, eq: pd.DataFrame | None) -> None:
             f"realized=${realized:,.2f} unrealized=${unrealized:,.2f} "
             f"dividends=${dividends:,.2f} exec_cost=${total_cost:,.2f}"
         )
+        exit_counts = attribution.get("exit_reason_counts") or {}
+        if exit_counts:
+            print(f"  Exit reasons:    {_format_top_counts(exit_counts)}")
+        by_theme = attribution.get("by_theme") or []
+        if by_theme:
+            top_theme = by_theme[0]
+            print(
+                "  Theme P&L:       "
+                f"{top_theme.get('theme', 'unknown')} "
+                f"total=${float(top_theme.get('total_pnl', 0.0) or 0.0):,.2f} "
+                f"stop_out={_fmt_optional_pct(top_theme.get('stop_out_rate'))}"
+            )
+        by_price = attribution.get("by_price_bucket") or []
+        if by_price:
+            bucket_text = ", ".join(
+                f"{row.get('price_bucket', 'unknown')}="
+                f"${float(row.get('total_pnl', 0.0) or 0.0):,.2f}"
+                for row in by_price[:3]
+            )
+            print(f"  Price buckets:   {bucket_text}")
 
     if cap_summary:
+        entry_caps = cap_summary.get("entry_cap_interventions") or {}
         print(
             "  Cap history:     "
             f"{int(cap_summary.get('cycles', 0))} cycle(s), "
-            f"{int(cap_summary.get('cycles_with_cap_interventions', 0))} with caps"
+            f"{int(cap_summary.get('cycles_with_cap_interventions', 0))} with cycle caps; "
+            f"{int(entry_caps.get('buy_trades_with_caps', 0))} entry cap(s)"
         )
+        by_reason = entry_caps.get("by_reason") or {}
+        if by_reason:
+            print(f"  Entry cap types: {_format_top_counts(by_reason)}")
 
     if parity:
         status = "OK" if parity.get("compatible") else "CHECK"

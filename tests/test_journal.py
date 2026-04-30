@@ -139,9 +139,18 @@ def test_print_report_includes_current_status_snapshot(monkeypatch, capsys):
         '{"top_1_concentration": 0.25, "top_3_concentration": 0.60, '
         '"theme_effective_bet_count": 2.5, "low_price_exposure": 0.10}\n'
     )
-    cap_path.write_text('{"cycles": 3, "cycles_with_cap_interventions": 2}')
+    cap_path.write_text(
+        '{"cycles": 3, "cycles_with_cap_interventions": 2, '
+        '"entry_cap_interventions": {"buy_trades_with_caps": 4, '
+        '"by_reason": {"theme_cap": 2, "sector_cap": 1, "low_price_or_penny_cap": 1}}}'
+    )
     attribution_path.write_text(
-        '{"realized_net_pnl": 12.5, "unrealized_pnl": 4.0, "total_execution_cost": 1.25}'
+        '{"realized_net_pnl": 12.5, "unrealized_pnl": 4.0, '
+        '"total_execution_cost": 1.25, '
+        '"exit_reason_counts": {"stop_loss": 1}, '
+        '"by_theme": [{"theme": "consumer_credit_finance", "total_pnl": -3.0, '
+        '"stop_out_rate": 1.0}], '
+        '"by_price_bucket": [{"price_bucket": "5_to_10", "total_pnl": -2.0}]}'
     )
     parity_path.write_text('{"compatible": true}')
 
@@ -171,6 +180,11 @@ def test_print_report_includes_current_status_snapshot(monkeypatch, capsys):
         assert "Marked return:   +6.00%" in output
         assert "top1=25.00%" in output
         assert "exec_cost=$1.25" in output
+        assert "Exit reasons:    stop_loss=1" in output
+        assert "Theme P&L:       consumer_credit_finance total=$-3.00 stop_out=100.0%" in output
+        assert "Price buckets:   5_to_10=$-2.00" in output
+        assert "3 cycle(s), 2 with cycle caps; 4 entry cap(s)" in output
+        assert "Entry cap types: theme_cap=2" in output
         assert "Replay parity:   OK" in output
         assert "python Broker.py --status" in output
     finally:
