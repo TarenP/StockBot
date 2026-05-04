@@ -44,6 +44,7 @@ CAP_IMPACT_KEYS = [
     "volatility_cap_impact",
     "sector_cap_impact",
     "theme_cap_impact",
+    "weak_sleeve_cap_impact",
     "correlation_cap_impact",
     "low_price_cap_impact",
     "cash_or_risk_cap_impact",
@@ -55,6 +56,7 @@ CAP_REASON_TO_IMPACT_KEY = {
     "volatility_cap": "volatility_cap_impact",
     "sector_cap": "sector_cap_impact",
     "theme_cap": "theme_cap_impact",
+    "weak_sleeve": "weak_sleeve_cap_impact",
     "correlation_cap": "correlation_cap_impact",
     "low_price_or_penny_cap": "low_price_cap_impact",
     "penny_cap": "low_price_cap_impact",
@@ -79,6 +81,16 @@ def _parse_reason_field(reason: str, field: str) -> str | None:
         return None
     value = match.group(1).strip()
     return value or None
+
+
+def _parse_reason_float(reason: str, field: str, default: float = 0.0) -> float:
+    value = _parse_reason_field(reason, field)
+    if value is None:
+        return default
+    try:
+        return float(str(value).split()[0])
+    except Exception:
+        return default
 
 
 def _parse_downweight_reason(reason: str) -> str:
@@ -256,6 +268,7 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
     positions = getattr(portfolio, "positions", {}) or {}
     pending_losses: list[dict[str, Any]] = []
     replacements: list[dict[str, Any]] = []
+    replacement_trade_ids: set[int] = set()
 
     for rec in trade_log:
         action = str(rec.get("action", "")).upper()
@@ -322,6 +335,7 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
                     ),
                 }
             )
+            replacement_trade_ids.add(id(rec))
             loss["remaining_cash"] -= attributed_value
             break
 
@@ -331,12 +345,40 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
         for row in open_replacements
     ]
     open_returns = [value for value in open_returns if np.isfinite(value)]
+    fresh_returns = []
+    fresh_entries = 0
+    for rec in trade_log:
+        if id(rec) in replacement_trade_ids:
+            continue
+        if str(rec.get("action", "")).upper() != "BUY":
+            continue
+        ticker = str(rec.get("ticker", "")).upper()
+        pos = positions.get(ticker)
+        if not pos:
+            continue
+        avg_cost = _safe_float(pos.get("avg_cost"), _safe_float(rec.get("price")))
+        last_price = _safe_float(pos.get("last_price"), avg_cost)
+        if avg_cost <= 0:
+            continue
+        fresh_entries += 1
+        fresh_returns.append((last_price - avg_cost) / avg_cost)
+
+    fresh_avg = sum(fresh_returns) / len(fresh_returns) if fresh_returns else None
+    replacement_avg = sum(open_returns) / len(open_returns) if open_returns else None
 
     return {
         "generated_at": datetime.now().isoformat(),
         "redeploy_window_days": int(redeploy_window_days),
         "realized_loss_events": len(pending_losses),
         "replacement_entries": len(replacements),
+        "open_replacement_entries": len(open_replacements),
+        "fresh_open_entries": fresh_entries,
+        "sample_size": {
+            "replacement_entries": len(replacements),
+            "open_replacement_entries": len(open_replacements),
+            "fresh_open_entries": fresh_entries,
+        },
+        "small_sample": len(open_replacements) < 10,
         "redeployed_value": sum(_safe_float(row.get("attributed_value")) for row in replacements),
         "avg_replacement_entry_value": (
             sum(_safe_float(row.get("entry_value")) for row in replacements) / len(replacements)
@@ -346,10 +388,84 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
             _safe_float(row.get("replacement_unrealized_pnl"))
             for row in open_replacements
         ),
-        "avg_open_replacement_return_pct": (
-            sum(open_returns) / len(open_returns) if open_returns else None
+        "avg_open_replacement_return_pct": replacement_avg,
+        "avg_fresh_open_return_pct": fresh_avg,
+        "replacement_vs_fresh_open_return_delta": (
+            replacement_avg - fresh_avg
+            if replacement_avg is not None and fresh_avg is not None else None
+        ),
+        "confidence_note": (
+            "small_sample" if len(open_replacements) < 10 else "normal_sample"
         ),
         "replacement_entries_detail": replacements[-20:],
+    }
+
+
+def summarize_low_price_signal_suppression(
+    trade_log: list[dict],
+    high_rank_floor: float = 0.80,
+    token_weight_ceiling: float = 0.05,
+) -> dict:
+    rows = []
+    for rec in trade_log or []:
+        if str(rec.get("action", "")).upper() != "BUY":
+            continue
+        reason = str(rec.get("reason", "") or "")
+        price = _safe_float(rec.get("price"))
+        signal = _parse_reason_float(
+            reason,
+            "rl_rank_pct",
+            _parse_reason_float(reason, "logged_score", 0.0),
+        )
+        pre_weight = _parse_reason_float(reason, "target_weight_pre_caps", 0.0)
+        final_weight = _parse_reason_float(reason, "final_weight", 0.0)
+        downweight = _parse_downweight_reason(reason)
+        is_low_price = price < 10.0
+        is_high_rank = signal >= float(high_rank_floor)
+        is_tokenized = final_weight <= float(token_weight_ceiling)
+        if not is_low_price and not (is_high_rank and downweight == "low_price_or_penny_cap"):
+            continue
+        rows.append(
+            {
+                "ticker": str(rec.get("ticker", "")).upper(),
+                "price": price,
+                "signal": signal,
+                "target_weight_pre_caps": pre_weight,
+                "final_weight": final_weight,
+                "suppression": max(0.0, pre_weight - final_weight),
+                "downweight_reason": downweight,
+                "high_rank": is_high_rank,
+                "tokenized": is_tokenized,
+            }
+        )
+
+    high_rank_low_price = [row for row in rows if row["high_rank"]]
+    tokenized_high_rank = [
+        row for row in high_rank_low_price
+        if row["tokenized"] or row["downweight_reason"] == "low_price_or_penny_cap"
+    ]
+    avg_suppression = (
+        sum(row["suppression"] for row in tokenized_high_rank) / len(tokenized_high_rank)
+        if tokenized_high_rank else 0.0
+    )
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "high_rank_floor": float(high_rank_floor),
+        "token_weight_ceiling": float(token_weight_ceiling),
+        "low_price_buy_entries": len(rows),
+        "high_rank_low_price_entries": len(high_rank_low_price),
+        "tokenized_high_rank_low_price_entries": len(tokenized_high_rank),
+        "tokenized_high_rank_low_price_rate": (
+            len(tokenized_high_rank) / len(high_rank_low_price)
+            if high_rank_low_price else None
+        ),
+        "avg_tokenized_high_rank_suppression": avg_suppression,
+        "small_sample": len(high_rank_low_price) < 10,
+        "examples": sorted(
+            tokenized_high_rank,
+            key=lambda row: row["suppression"],
+            reverse=True,
+        )[:10],
     }
 
 
@@ -712,6 +828,11 @@ def summarize_performance_attribution(portfolio) -> dict:
                 _safe_float(item.get("unrealized_pnl")) / open_cost
                 if open_cost > 0 else None
             )
+            item["sample_size"] = {
+                "closed_trades": closed_count,
+                "open_positions": open_count,
+            }
+            item["small_sample"] = (closed_count + open_count) < 10
             item["total_pnl"] = (
                 _safe_float(item.get("realized_net_pnl"))
                 + _safe_float(item.get("unrealized_pnl"))
@@ -725,6 +846,7 @@ def summarize_performance_attribution(portfolio) -> dict:
 
     price_sanity = summarize_price_sanity(portfolio)
     redeployment = summarize_redeployment_quality(portfolio)
+    low_price_suppression = summarize_low_price_signal_suppression(trade_log)
 
     return {
         "generated_at": datetime.now().isoformat(),
@@ -750,6 +872,7 @@ def summarize_performance_attribution(portfolio) -> dict:
         ),
         "price_sanity": price_sanity,
         "redeployment_quality": redeployment,
+        "low_price_signal_suppression": low_price_suppression,
         "closed_trade_sample": closed[-20:],
     }
 
@@ -772,6 +895,9 @@ def build_replay_live_parity_report(config: dict | None = None, brain=None) -> d
         "penny_pct": "penny_max_pct",
         "max_sector_pct": "max_sector_pct",
         "max_pair_correlation": "max_pair_correlation",
+        "weak_theme_min_positions": "weak_theme_min_positions",
+        "weak_theme_return_threshold": "weak_theme_return_threshold",
+        "weak_theme_penalty_mult": "weak_theme_penalty_mult",
         "avoid_earnings_days": "avoid_earnings_days",
         "rl_phase": "rl_phase",
         "rl_exit_threshold": "rl_exit_threshold",

@@ -11,6 +11,7 @@ from broker.paper_diagnostics import (
     build_replay_live_parity_report,
     summarize_price_sanity,
     summarize_cap_impact_history,
+    summarize_low_price_signal_suppression,
     summarize_performance_attribution,
     summarize_redeployment_quality,
 )
@@ -322,6 +323,8 @@ def test_performance_attribution_groups_open_and_closed_by_theme_and_price_bucke
     assert by_bucket["over_10"]["open_positions"] == 1
     assert by_theme["precious_metals_miners"]["weak_open_positions"] == 1
     assert np.isclose(by_theme["precious_metals_miners"]["avg_open_return_pct"], -2.0 / 30.0)
+    assert by_theme["precious_metals_miners"]["sample_size"]["open_positions"] == 1
+    assert by_theme["precious_metals_miners"]["small_sample"] is True
 
 
 def test_price_sanity_explains_post_split_bkng_scale():
@@ -366,10 +369,43 @@ def test_redeployment_quality_tracks_stop_loss_recycling():
 
     assert report["realized_loss_events"] == 1
     assert report["replacement_entries"] == 1
+    assert report["sample_size"]["open_replacement_entries"] == 1
+    assert report["small_sample"] is True
     assert report["replacement_entries_detail"][0]["source_exit_ticker"] == "HOOD"
     assert report["replacement_entries_detail"][0]["replacement_ticker"] == "STX"
     assert report["replacement_entries_detail"][0]["downweight_reason"] == "cash_or_risk_cap"
     assert np.isclose(report["avg_open_replacement_return_pct"], 0.10)
+
+
+def test_low_price_signal_suppression_quantifies_tokenized_top_rank_names():
+    trade_log = [
+        {
+            "action": "BUY",
+            "ticker": "UWMC",
+            "price": 4.0,
+            "reason": (
+                "rl_rank_pct=1.0000 | target_weight_pre_caps=0.2200 | "
+                "final_weight=0.0300 | downweight_reason=low_price_or_penny_cap |"
+            ),
+        },
+        {
+            "action": "BUY",
+            "ticker": "SNAP",
+            "price": 6.0,
+            "reason": (
+                "rl_rank_pct=0.6000 | target_weight_pre_caps=0.1200 | "
+                "final_weight=0.1200 | downweight_reason=none |"
+            ),
+        },
+    ]
+
+    report = summarize_low_price_signal_suppression(trade_log)
+
+    assert report["low_price_buy_entries"] == 2
+    assert report["high_rank_low_price_entries"] == 1
+    assert report["tokenized_high_rank_low_price_entries"] == 1
+    assert np.isclose(report["avg_tokenized_high_rank_suppression"], 0.19)
+    assert report["examples"][0]["ticker"] == "UWMC"
 
 
 def test_paper_execution_cost_uses_tiered_or_configured_spread():

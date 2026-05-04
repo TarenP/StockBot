@@ -508,6 +508,9 @@ def parse_args(config: dict = None):
     p.add_argument("--sentiment_policy", type=str, default=cfg.get("sentiment_policy", "informational"))
     p.add_argument("--sentiment_negative_weight_mult", type=float, default=cfg.get("sentiment_negative_weight_mult", 0.80))
     p.add_argument("--sentiment_veto_composite_floor", type=float, default=cfg.get("sentiment_veto_composite_floor", 0.50))
+    p.add_argument("--weak_theme_min_positions", type=int, default=cfg.get("weak_theme_min_positions", 2))
+    p.add_argument("--weak_theme_return_threshold", type=float, default=cfg.get("weak_theme_return_threshold", -0.03))
+    p.add_argument("--weak_theme_penalty_mult", type=float, default=cfg.get("weak_theme_penalty_mult", 0.50))
     p.add_argument("--avoid_earnings", type=int,   default=cfg.get("avoid_earnings", 5))
     p.add_argument("--top_n",          type=int,   default=cfg.get("top_n",          500))
     p.add_argument("--max_daily_loss", type=float, default=cfg.get("max_daily_loss", 0.025))
@@ -606,6 +609,9 @@ def main(config: dict = None, maintenance_context: dict | None = None):
         sentiment_policy    = args.sentiment_policy,
         sentiment_negative_weight_mult = args.sentiment_negative_weight_mult,
         sentiment_veto_composite_floor = args.sentiment_veto_composite_floor,
+        weak_theme_min_positions = args.weak_theme_min_positions,
+        weak_theme_return_threshold = args.weak_theme_return_threshold,
+        weak_theme_penalty_mult = args.weak_theme_penalty_mult,
         avoid_earnings_days = args.avoid_earnings,
         device              = DEVICE,
         rl_enabled          = args.rl_enabled,

@@ -356,6 +356,24 @@ class TestPhase1RLRanking(unittest.TestCase):
         self.assertEqual(summary["top_cap_interventions"][0]["ticker"], "BBB")
         self.assertEqual(summary["top_cap_interventions"][0]["cap_class"], "sector_cap")
 
+    def test_theme_health_scale_penalizes_weak_correlated_sleeve(self):
+        brain = _make_brain(rl_enabled=True)
+        brain.weak_theme_min_positions = 2
+        brain.weak_theme_return_threshold = -0.03
+        brain.weak_theme_penalty_mult = 0.50
+        brain._sector_map = {"SSRM": "Materials", "HL": "Materials"}
+        brain.portfolio.positions = {
+            "SSRM": {"shares": 1.0, "avg_cost": 30.0, "last_price": 27.0},
+            "HL": {"shares": 1.0, "avg_cost": 18.0, "last_price": 17.0},
+        }
+
+        scale, detail = brain._theme_health_scale("precious_metals_miners")
+
+        self.assertEqual(scale, 0.50)
+        self.assertEqual(detail["open_positions"], 2)
+        self.assertEqual(detail["weak_open_positions"], 2)
+        self.assertLess(detail["avg_open_return_pct"], -0.03)
+
     def test_sentiment_policy_helpers_are_explicit(self):
         brain = _make_brain(rl_enabled=True)
 

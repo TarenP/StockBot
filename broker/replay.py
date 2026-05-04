@@ -486,6 +486,9 @@ def run_replay(
     max_sector_pct: float = 0.40,
     max_pair_correlation: float = 0.80,
     correlation_lookback_days: int = 60,
+    weak_theme_min_positions: int = 2,
+    weak_theme_return_threshold: float = -0.03,
+    weak_theme_penalty_mult: float = 0.50,
     avoid_earnings_days: int = 3,
     execution_spread: float = 0.001,
     rl_phase: int = 1,
@@ -527,6 +530,9 @@ def run_replay(
         max_sector_pct=max_sector_pct,
         max_pair_correlation=max_pair_correlation,
         correlation_lookback_days=correlation_lookback_days,
+        weak_theme_min_positions=weak_theme_min_positions,
+        weak_theme_return_threshold=weak_theme_return_threshold,
+        weak_theme_penalty_mult=weak_theme_penalty_mult,
         avoid_earnings_days=avoid_earnings_days,
         execution_spread=execution_spread,
         rl_phase=rl_phase,
@@ -568,6 +574,9 @@ def _run_replay_v2(
     max_sector_pct: float = 0.40,
     max_pair_correlation: float = 0.80,
     correlation_lookback_days: int = 60,
+    weak_theme_min_positions: int = 2,
+    weak_theme_return_threshold: float = -0.03,
+    weak_theme_penalty_mult: float = 0.50,
     avoid_earnings_days: int = 3,
     execution_spread: float = 0.001,
     rl_phase: int = 1,
@@ -846,6 +855,9 @@ def _run_replay_v2(
         max_sector_pct=max_sector_pct,
         max_pair_correlation=max_pair_correlation,
         correlation_lookback_days=correlation_lookback_days,
+        weak_theme_min_positions=weak_theme_min_positions,
+        weak_theme_return_threshold=weak_theme_return_threshold,
+        weak_theme_penalty_mult=weak_theme_penalty_mult,
         avoid_earnings_days=avoid_earnings_days,
         device=None,
         rl_enabled=(strategy == "screener_rl"),
@@ -1068,6 +1080,9 @@ def _replay_kwargs_from_live_config(live_config: dict | None = None) -> dict:
         "penny_pct": float(live_config.get("penny_pct", 0.20)),
         "max_sector_pct": float(live_config.get("max_sector", 0.40)),
         "max_pair_correlation": float(live_config.get("max_correlation", 0.80)),
+        "weak_theme_min_positions": int(live_config.get("weak_theme_min_positions", 2)),
+        "weak_theme_return_threshold": float(live_config.get("weak_theme_return_threshold", -0.03)),
+        "weak_theme_penalty_mult": float(live_config.get("weak_theme_penalty_mult", 0.50)),
         "avoid_earnings_days": int(live_config.get("avoid_earnings", 3)),
         "execution_spread": float(live_config.get("execution_spread", 0.001)),
         "rl_phase": int(live_config.get("rl_phase", 1)),
@@ -1306,12 +1321,13 @@ def run_full_replay(
         end=(replay_dates[-1] + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
     )
     spy_series = benchmark_bundle["returns"]
-    if getattr(spy_series, "empty", True):
-        spy_series = fetch_spy_returns(
+    if getattr(spy_series, "empty", True) or benchmark_bundle.get("status") != "present":
+        compat_spy_series = fetch_spy_returns(
             start=(replay_dates[0] - pd.Timedelta(days=5)).strftime("%Y-%m-%d"),
             end=(replay_dates[-1] + pd.Timedelta(days=2)).strftime("%Y-%m-%d"),
         )
-        if spy_series is not None and len(spy_series) > 0:
+        if compat_spy_series is not None and len(compat_spy_series) > 0:
+            spy_series = compat_spy_series
             benchmark_bundle = {
                 "returns": spy_series,
                 "status": "present",
@@ -1958,6 +1974,9 @@ def run_ablation(
     penny_pct: float = 0.20,
     max_sector_pct: float = 0.40,
     max_pair_correlation: float = 0.80,
+    weak_theme_min_positions: int = 2,
+    weak_theme_return_threshold: float = -0.03,
+    weak_theme_penalty_mult: float = 0.50,
     avoid_earnings_days: int = 3,
     rl_phase: int = 1,
     rl_exit_threshold: float = 0.30,
@@ -2060,6 +2079,9 @@ def run_ablation(
             penny_pct=penny_pct,
             max_sector_pct=max_sector_pct,
             max_pair_correlation=max_pair_correlation,
+            weak_theme_min_positions=weak_theme_min_positions,
+            weak_theme_return_threshold=weak_theme_return_threshold,
+            weak_theme_penalty_mult=weak_theme_penalty_mult,
             avoid_earnings_days=avoid_earnings_days,
             rl_phase=rl_phase,
             rl_exit_threshold=rl_exit_threshold,

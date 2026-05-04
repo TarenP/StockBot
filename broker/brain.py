@@ -124,6 +124,9 @@ class BrokerBrain:
         sentiment_policy:    str   = "informational",
         sentiment_negative_weight_mult: float = 0.80,
         sentiment_veto_composite_floor: float = 0.50,
+        weak_theme_min_positions: int = 2,
+        weak_theme_return_threshold: float = -0.03,
+        weak_theme_penalty_mult: float = 0.50,
         avoid_earnings_days:  int   = 3,       # skip stocks within N days of earnings
         device=None,
         rl_enabled:           bool  = False,
@@ -160,6 +163,9 @@ class BrokerBrain:
         self.sentiment_policy    = str(sentiment_policy or "informational").strip().lower()
         self.sentiment_negative_weight_mult = sentiment_negative_weight_mult
         self.sentiment_veto_composite_floor = sentiment_veto_composite_floor
+        self.weak_theme_min_positions = weak_theme_min_positions
+        self.weak_theme_return_threshold = weak_theme_return_threshold
+        self.weak_theme_penalty_mult = weak_theme_penalty_mult
         self.avoid_earnings_days  = avoid_earnings_days
         self.device               = device
         self.rl_enabled           = rl_enabled
@@ -930,6 +936,7 @@ class BrokerBrain:
                     "post_vol_weight": np.nan,
                     "post_sector_weight": np.nan,
                     "post_theme_weight": np.nan,
+                    "post_weak_sleeve_weight": np.nan,
                     "post_correlation_weight": np.nan,
                     "post_low_price_weight": np.nan,
                     "target_weight_post_caps": np.nan,
@@ -972,6 +979,12 @@ class BrokerBrain:
                     continue
                 alloc_value = min(alloc_value, max(0.0, theme_budget))
                 allocation_steps["post_theme_weight"] = (
+                    float(alloc_value / equity) if equity > 0 else np.nan
+                )
+
+                weak_theme_scale, weak_theme_detail = self._theme_health_scale(theme)
+                alloc_value *= weak_theme_scale
+                allocation_steps["post_weak_sleeve_weight"] = (
                     float(alloc_value / equity) if equity > 0 else np.nan
                 )
 
@@ -1042,6 +1055,7 @@ class BrokerBrain:
                     ("volatility", "post_vol_weight"),
                     ("sector_cap", "post_sector_weight"),
                     ("theme_cap", "post_theme_weight"),
+                    ("weak_sleeve", "post_weak_sleeve_weight"),
                     ("correlation_scale", "post_correlation_weight"),
                     ("low_price_or_penny_cap", "post_low_price_weight"),
                     ("cash_or_risk_cap", "final_weight"),
@@ -1076,8 +1090,12 @@ class BrokerBrain:
                     allocation_steps["post_theme_weight"],
                 )
                 allocation_steps["correlation_cap_impact"] = _impact(
-                    allocation_steps["post_theme_weight"],
+                    allocation_steps["post_weak_sleeve_weight"],
                     allocation_steps["post_correlation_weight"],
+                )
+                allocation_steps["weak_sleeve_cap_impact"] = _impact(
+                    allocation_steps["post_theme_weight"],
+                    allocation_steps["post_weak_sleeve_weight"],
                 )
                 allocation_steps["low_price_cap_impact"] = _impact(
                     allocation_steps["post_correlation_weight"],
@@ -1109,6 +1127,14 @@ class BrokerBrain:
                     corr_note = ""
                     if corr_stats is not None:
                         corr_note = f" | MaxCorr={corr_stats['max_abs_corr']:.2f}"
+                    weak_note = ""
+                    if weak_theme_scale < 1.0:
+                        weak_note = (
+                            f" | WeakSleeve={weak_theme_detail['weak_open_positions']}/"
+                            f"{weak_theme_detail['open_positions']}"
+                            f" avg={weak_theme_detail['avg_open_return_pct']:.1%}"
+                            f" scale={weak_theme_scale:.2f}"
+                        )
                     reason = (
                         f"logged_score={score:.4f} | rl_score={float(rl_rank_pct_val):.4f} | "
                         f"rl_rank_pct={float(rl_rank_pct_val):.4f} | "
@@ -1122,7 +1148,7 @@ class BrokerBrain:
                         f"rl_mode=true | Sector={sector} "
                         f"(target={target_alloc:.0%}) | Theme={theme} | "
                         f"Sentiment={sent_label}({self.sentiment_policy},scale={sentiment_scale:.2f})"
-                        f"{earnings_note}{corr_note} | "
+                        f"{earnings_note}{corr_note}{weak_note} | "
                         f"{'PENNY ' if is_penny else ''}"
                         f"{(report.get('headlines') or [''])[0][:50]}"
                     )
@@ -1130,6 +1156,14 @@ class BrokerBrain:
                     corr_note = ""
                     if corr_stats is not None:
                         corr_note = f" | MaxCorr={corr_stats['max_abs_corr']:.2f}"
+                    weak_note = ""
+                    if weak_theme_scale < 1.0:
+                        weak_note = (
+                            f" | WeakSleeve={weak_theme_detail['weak_open_positions']}/"
+                            f"{weak_theme_detail['open_positions']}"
+                            f" avg={weak_theme_detail['avg_open_return_pct']:.1%}"
+                            f" scale={weak_theme_scale:.2f}"
+                        )
                     reason = (
                         f"logged_score={score:.4f} | composite_score={composite:.4f} | "
                         f"target_weight_pre_caps={target_weight_pre_caps:.4f} | "
@@ -1139,7 +1173,7 @@ class BrokerBrain:
                         f"score_source=composite | Sector={sector} "
                         f"(target={target_alloc:.0%}) | Theme={theme} | "
                         f"Sentiment={sent_label}({self.sentiment_policy},scale={sentiment_scale:.2f})"
-                        f"{earnings_note}{corr_note} | "
+                        f"{earnings_note}{corr_note}{weak_note} | "
                         f"{'PENNY ' if is_penny else ''}"
                         f"{(report.get('headlines') or [''])[0][:50]}"
                     )
@@ -1179,6 +1213,7 @@ class BrokerBrain:
                         "post_vol_weight": allocation_steps["post_vol_weight"],
                         "post_sector_weight": allocation_steps["post_sector_weight"],
                         "post_theme_weight": allocation_steps["post_theme_weight"],
+                        "post_weak_sleeve_weight": allocation_steps["post_weak_sleeve_weight"],
                         "post_correlation_weight": allocation_steps["post_correlation_weight"],
                         "post_low_price_weight": allocation_steps["post_low_price_weight"],
                         "target_weight_post_caps": allocation_steps["target_weight_post_caps"],
@@ -1194,6 +1229,7 @@ class BrokerBrain:
                         "volatility_cap_impact": allocation_steps["volatility_cap_impact"],
                         "sector_cap_impact": allocation_steps["sector_cap_impact"],
                         "theme_cap_impact": allocation_steps["theme_cap_impact"],
+                        "weak_sleeve_cap_impact": allocation_steps["weak_sleeve_cap_impact"],
                         "correlation_cap_impact": allocation_steps["correlation_cap_impact"],
                         "low_price_cap_impact": allocation_steps["low_price_cap_impact"],
                         "cash_or_risk_cap_impact": allocation_steps["cash_or_risk_cap_impact"],
@@ -1285,6 +1321,53 @@ class BrokerBrain:
         return label == "negative" and float(composite_score) < float(
             self.sentiment_veto_composite_floor
         )
+
+    def _theme_health_scale(self, theme: str) -> tuple[float, dict]:
+        """
+        Downweight new entries into a theme when the current open sleeve is
+        already failing together. This converts the diagnostics signal into a
+        conservative allocator response without forcing exits.
+        """
+        min_positions = max(1, int(self.weak_theme_min_positions))
+        threshold = float(self.weak_theme_return_threshold)
+        penalty = float(np.clip(self.weak_theme_penalty_mult, 0.05, 1.0))
+
+        rows = []
+        for held_ticker, pos in self.portfolio.positions.items():
+            held_theme = theme_bucket(
+                str(held_ticker),
+                self._sector_map.get(str(held_ticker).upper(), "Unknown"),
+            )
+            if held_theme != theme:
+                continue
+            avg_cost = float(pos.get("avg_cost", 0.0) or 0.0)
+            last_price = float(pos.get("last_price", 0.0) or 0.0)
+            if avg_cost <= 0 or last_price <= 0:
+                continue
+            ret = (last_price - avg_cost) / avg_cost
+            rows.append({"ticker": str(held_ticker).upper(), "return_pct": float(ret)})
+
+        n_open = len(rows)
+        weak_count = sum(1 for row in rows if row["return_pct"] < 0.0)
+        avg_return = (
+            float(sum(row["return_pct"] for row in rows) / n_open)
+            if n_open else 0.0
+        )
+        is_weak = (
+            n_open >= min_positions
+            and weak_count >= min_positions
+            and avg_return <= threshold
+        )
+        detail = {
+            "theme": theme,
+            "open_positions": n_open,
+            "weak_open_positions": weak_count,
+            "avg_open_return_pct": avg_return,
+            "threshold": threshold,
+            "scale": penalty if is_weak else 1.0,
+            "tickers": [row["ticker"] for row in rows],
+        }
+        return (penalty if is_weak else 1.0), detail
 
     def _finalize_allocation_audit(self, audit_df: pd.DataFrame) -> pd.DataFrame:
         if audit_df.empty or "candidate_status" not in audit_df.columns:
@@ -1403,6 +1486,7 @@ class BrokerBrain:
             "volatility_cap_impact",
             "sector_cap_impact",
             "theme_cap_impact",
+            "weak_sleeve_cap_impact",
             "correlation_cap_impact",
             "low_price_cap_impact",
             "cash_or_risk_cap_impact",
