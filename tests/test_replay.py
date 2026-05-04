@@ -713,6 +713,10 @@ def test_run_sensitivity_uses_rl_specific_grid(monkeypatch):
     assert "rl_min=10%" in labels
     assert "rl_min=20%" in labels
     assert "rl_phase=2" in labels
+    assert "weak_sleeve=25%" in labels
+    assert "weak_sleeve=block" in labels
+    assert "weak_sleeve=cooldown2" in labels
+    assert "low_price=pre_penalty" in labels
     assert "min_score=0.55" not in labels
     assert "min_score=0.65" not in labels
 

@@ -127,6 +127,11 @@ class BrokerBrain:
         weak_theme_min_positions: int = 2,
         weak_theme_return_threshold: float = -0.03,
         weak_theme_penalty_mult: float = 0.50,
+        weak_theme_cooldown_cycles: int = 0,
+        weak_theme_cooldown_min_hits: int = 2,
+        low_price_rank_policy: str = "late_cap",
+        low_price_rank_penalty_mult: float = 0.70,
+        low_price_high_rank_floor: float = 0.80,
         avoid_earnings_days:  int   = 3,       # skip stocks within N days of earnings
         device=None,
         rl_enabled:           bool  = False,
@@ -166,6 +171,11 @@ class BrokerBrain:
         self.weak_theme_min_positions = weak_theme_min_positions
         self.weak_theme_return_threshold = weak_theme_return_threshold
         self.weak_theme_penalty_mult = weak_theme_penalty_mult
+        self.weak_theme_cooldown_cycles = weak_theme_cooldown_cycles
+        self.weak_theme_cooldown_min_hits = weak_theme_cooldown_min_hits
+        self.low_price_rank_policy = str(low_price_rank_policy or "late_cap").strip().lower()
+        self.low_price_rank_penalty_mult = low_price_rank_penalty_mult
+        self.low_price_high_rank_floor = low_price_high_rank_floor
         self.avoid_earnings_days  = avoid_earnings_days
         self.device               = device
         self.rl_enabled           = rl_enabled
@@ -186,6 +196,8 @@ class BrokerBrain:
         self._last_rl_audit: pd.DataFrame = pd.DataFrame()
         self._last_cycle_audit: pd.DataFrame = pd.DataFrame()
         self._last_allocation_summary: dict = {}
+        self._weak_theme_states: dict[str, dict] = {}
+        self._weak_theme_cycle_id: int = 0
 
     def _current_market_regime(self, df_features: pd.DataFrame) -> int | None:
         regime_cols = [f"regime_{i}" for i in range(4) if f"regime_{i}" in df_features.columns]
@@ -349,6 +361,7 @@ class BrokerBrain:
         risk_engine=None,   # PortfolioRiskEngine instance
     ) -> list[Decision]:
         decisions = []
+        self._weak_theme_cycle_id += 1
         market_regime = self._current_market_regime(df_features)
         if risk_engine is not None and hasattr(risk_engine, "set_market_regime"):
             risk_engine.set_market_regime(market_regime)
@@ -689,6 +702,56 @@ class BrokerBrain:
                         threshold_skips += 1
                         continue
 
+                raw_signal_for_rank = (
+                    float(rl_score_val)
+                    if self.rl_enabled and rl_score_val is not None
+                    else float(composite)
+                )
+                candidate_price = float(report.get("price", np.nan))
+                is_low_price_candidate = (
+                    np.isfinite(candidate_price)
+                    and candidate_price < 10.0
+                )
+                low_price_rank_scale = 1.0
+                if is_low_price_candidate:
+                    if self.low_price_rank_policy == "pre_penalty":
+                        low_price_rank_scale = float(np.clip(
+                            self.low_price_rank_penalty_mult,
+                            0.05,
+                            1.0,
+                        ))
+                    elif (
+                        self.low_price_rank_policy in {"exclude_high_rank", "exclude_top"}
+                        and raw_signal_for_rank >= float(self.low_price_high_rank_floor)
+                    ):
+                        cycle_audit_rows.append(
+                            {
+                                "ticker": ticker,
+                                "candidate_status": "low_price_high_rank_excluded",
+                                "logged_score": raw_signal_for_rank,
+                                "composite_score": float(composite),
+                                "rl_rank_pct": float(rl_score_val) if rl_score_val is not None else np.nan,
+                                "rl_weight": float(rl_weight_val) if rl_weight_val is not None else np.nan,
+                                "rl_raw_weight": (
+                                    float(rl_raw_weight_val) if rl_raw_weight_val is not None else np.nan
+                                ),
+                                "sector": self._sector_map.get(ticker.upper(), "Unknown"),
+                                "theme_bucket": theme_bucket(
+                                    ticker,
+                                    self._sector_map.get(ticker.upper(), "Unknown"),
+                                ),
+                                "low_price_bucket": low_price_bucket(
+                                    candidate_price,
+                                    self.penny_threshold,
+                                ),
+                                "low_price_rank_policy": self.low_price_rank_policy,
+                                "low_price_rank_scale": 0.0,
+                                "low_price_high_rank_floor": float(self.low_price_high_rank_floor),
+                            }
+                        )
+                        threshold_skips += 1
+                        continue
+
                 if self._sentiment_vetoes_entry(sentiment_label, composite):
                     sentiment_blocked_skips += 1
                     cycle_audit_rows.append(
@@ -724,6 +787,9 @@ class BrokerBrain:
                 report["sector"] = self._sector_map.get(ticker.upper(), "Unknown")
                 report["theme_bucket"] = theme_bucket(ticker, report["sector"])
                 report["sentiment_label"] = sentiment_label
+                report["rank_score"] = raw_signal_for_rank * low_price_rank_scale
+                report["low_price_rank_policy"] = self.low_price_rank_policy
+                report["low_price_rank_scale"] = low_price_rank_scale
                 if rl_score_val is not None:
                     report["rl_score"] = rl_score_val
                     report["rl_rank_pct"] = rl_score_val
@@ -754,16 +820,19 @@ class BrokerBrain:
                         ),
                         "sentiment_label": sentiment_label,
                         "sentiment_policy": self.sentiment_policy,
+                        "low_price_rank_policy": self.low_price_rank_policy,
+                        "low_price_rank_scale": float(low_price_rank_scale),
+                        "rank_score": float(report["rank_score"]),
                     }
                 )
 
             # Sort by rl_score (RL mode) or composite_score (heuristic mode)
             if self.rl_enabled:
                 researched.sort(
-                    key=lambda r: (-r.get("rl_score", 0.0), -r["composite_score"], r["ticker"]),
+                    key=lambda r: (-r.get("rank_score", r.get("rl_score", 0.0)), -r["composite_score"], r["ticker"]),
                 )
             else:
-                researched.sort(key=lambda r: (-r["composite_score"], r["ticker"]))
+                researched.sort(key=lambda r: (-r.get("rank_score", r["composite_score"]), r["ticker"]))
 
             # ── Per-cycle RL summary log ──────────────────────────────────────
             if self.rl_enabled and rl_scores is not None:
@@ -1222,6 +1291,9 @@ class BrokerBrain:
                         "theme_effective_bet_count": float(theme_effective_bets),
                         "theme_cap": float(self.theme_max_pct),
                         "low_price_cap": float(self.low_price_max_pct),
+                        "low_price_rank_policy": self.low_price_rank_policy,
+                        "low_price_rank_scale": float(report.get("low_price_rank_scale", 1.0)),
+                        "rank_score": float(report.get("rank_score", score)),
                         "sentiment_label": sentiment_label,
                         "sentiment_policy": self.sentiment_policy,
                         "sentiment_weight_scale": float(sentiment_scale),
@@ -1330,7 +1402,7 @@ class BrokerBrain:
         """
         min_positions = max(1, int(self.weak_theme_min_positions))
         threshold = float(self.weak_theme_return_threshold)
-        penalty = float(np.clip(self.weak_theme_penalty_mult, 0.05, 1.0))
+        penalty = float(np.clip(self.weak_theme_penalty_mult, 0.0, 1.0))
 
         rows = []
         for held_ticker, pos in self.portfolio.positions.items():
@@ -1358,16 +1430,46 @@ class BrokerBrain:
             and weak_count >= min_positions
             and avg_return <= threshold
         )
+        cooldown_cycles = max(0, int(self.weak_theme_cooldown_cycles))
+        cooldown_min_hits = max(1, int(self.weak_theme_cooldown_min_hits))
+        state = self._weak_theme_states.setdefault(
+            theme,
+            {
+                "weak_hits": 0,
+                "cooldown_remaining": 0,
+                "last_cycle_id": -1,
+            },
+        )
+        cycle_id = int(getattr(self, "_weak_theme_cycle_id", 0))
+        if state.get("last_cycle_id") != cycle_id:
+            if int(state.get("cooldown_remaining", 0)) > 0:
+                state["cooldown_remaining"] = int(state["cooldown_remaining"]) - 1
+            state["weak_hits"] = int(state.get("weak_hits", 0)) + 1 if is_weak else 0
+            if (
+                cooldown_cycles > 0
+                and is_weak
+                and int(state["weak_hits"]) >= cooldown_min_hits
+            ):
+                state["cooldown_remaining"] = max(
+                    int(state.get("cooldown_remaining", 0)),
+                    cooldown_cycles,
+                )
+            state["last_cycle_id"] = cycle_id
+        cooldown_active = int(state.get("cooldown_remaining", 0)) > 0
+        scale = 0.0 if cooldown_active else (penalty if is_weak else 1.0)
         detail = {
             "theme": theme,
             "open_positions": n_open,
             "weak_open_positions": weak_count,
             "avg_open_return_pct": avg_return,
             "threshold": threshold,
-            "scale": penalty if is_weak else 1.0,
+            "scale": scale,
             "tickers": [row["ticker"] for row in rows],
+            "weak_hits": int(state.get("weak_hits", 0)),
+            "cooldown_active": bool(cooldown_active),
+            "cooldown_remaining": int(state.get("cooldown_remaining", 0)),
         }
-        return (penalty if is_weak else 1.0), detail
+        return scale, detail
 
     def _finalize_allocation_audit(self, audit_df: pd.DataFrame) -> pd.DataFrame:
         if audit_df.empty or "candidate_status" not in audit_df.columns:

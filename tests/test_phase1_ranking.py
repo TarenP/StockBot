@@ -374,6 +374,64 @@ class TestPhase1RLRanking(unittest.TestCase):
         self.assertEqual(detail["weak_open_positions"], 2)
         self.assertLess(detail["avg_open_return_pct"], -0.03)
 
+        brain.weak_theme_penalty_mult = 0.0
+        scale, detail = brain._theme_health_scale("precious_metals_miners")
+        self.assertEqual(scale, 0.0)
+        self.assertEqual(detail["scale"], 0.0)
+
+        brain.weak_theme_penalty_mult = 0.50
+        brain.weak_theme_cooldown_cycles = 2
+        brain.weak_theme_cooldown_min_hits = 2
+        brain._weak_theme_states = {}
+        brain._weak_theme_cycle_id = 1
+        scale, detail = brain._theme_health_scale("precious_metals_miners")
+        self.assertEqual(scale, 0.50)
+        self.assertFalse(detail["cooldown_active"])
+        brain._weak_theme_cycle_id = 2
+        scale, detail = brain._theme_health_scale("precious_metals_miners")
+        self.assertEqual(scale, 0.0)
+        self.assertTrue(detail["cooldown_active"])
+        self.assertEqual(detail["weak_hits"], 2)
+
+    def test_low_price_pre_penalty_changes_rank_order(self):
+        tickers = ["LOW", "HIGH"]
+        df = _make_df_features(tickers)
+        brain = _make_brain(rl_enabled=True, min_score=0.0)
+        brain.low_price_rank_policy = "pre_penalty"
+        brain.low_price_rank_penalty_mult = 0.50
+        composite_scores = {"LOW": 0.90, "HIGH": 0.80}
+        rl_scores = pd.Series({"LOW": 0.95, "HIGH": 0.70}, name="rl_score")
+
+        def _research(ticker):
+            report = _research_factory(composite_scores)(ticker)
+            report["price"] = 6.0 if ticker == "LOW" else 50.0
+            return report
+
+        from unittest.mock import PropertyMock
+        with (
+            patch("broker.brain.get_rl_targets", return_value=rl_scores),
+            patch("broker.brain.research", side_effect=_research),
+            patch.object(brain, "_screen_candidates", return_value=tickers),
+            patch.object(brain, "_assert_model_available"),
+            patch.object(brain, "_maybe_refresh_sector_map"),
+            patch.object(brain, "_get_current_prices", return_value={}),
+            patch.object(brain, "_near_earnings", return_value=False),
+            patch("broker.brain.validate_portfolio_prices", return_value={}),
+            patch("broker.brain.score_sectors", return_value={}),
+            patch("broker.brain.get_portfolio_sector_weights", return_value={}),
+            patch("broker.brain.compute_target_allocations", return_value={"Unknown": 1.0}),
+            patch("broker.brain._get_next_earnings_date", return_value=None),
+            patch.object(type(brain.portfolio), "position_values",
+                         new_callable=PropertyMock, return_value={}),
+            patch.object(type(brain.portfolio), "equity",
+                         new_callable=PropertyMock, return_value=brain.portfolio.cash),
+        ):
+            brain.portfolio.update_prices = MagicMock()
+            decisions = brain.run_cycle(df, screener_top_n=100)
+
+        buy_tickers = [d.ticker for d in decisions if d.action == "BUY"]
+        self.assertEqual(buy_tickers[:2], ["HIGH", "LOW"])
+
     def test_sentiment_policy_helpers_are_explicit(self):
         brain = _make_brain(rl_enabled=True)
 

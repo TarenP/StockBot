@@ -511,6 +511,11 @@ def parse_args(config: dict = None):
     p.add_argument("--weak_theme_min_positions", type=int, default=cfg.get("weak_theme_min_positions", 2))
     p.add_argument("--weak_theme_return_threshold", type=float, default=cfg.get("weak_theme_return_threshold", -0.03))
     p.add_argument("--weak_theme_penalty_mult", type=float, default=cfg.get("weak_theme_penalty_mult", 0.50))
+    p.add_argument("--weak_theme_cooldown_cycles", type=int, default=cfg.get("weak_theme_cooldown_cycles", 0))
+    p.add_argument("--weak_theme_cooldown_min_hits", type=int, default=cfg.get("weak_theme_cooldown_min_hits", 2))
+    p.add_argument("--low_price_rank_policy", type=str, default=cfg.get("low_price_rank_policy", "late_cap"))
+    p.add_argument("--low_price_rank_penalty_mult", type=float, default=cfg.get("low_price_rank_penalty_mult", 0.70))
+    p.add_argument("--low_price_high_rank_floor", type=float, default=cfg.get("low_price_high_rank_floor", 0.80))
     p.add_argument("--avoid_earnings", type=int,   default=cfg.get("avoid_earnings", 5))
     p.add_argument("--top_n",          type=int,   default=cfg.get("top_n",          500))
     p.add_argument("--max_daily_loss", type=float, default=cfg.get("max_daily_loss", 0.025))
@@ -612,6 +617,11 @@ def main(config: dict = None, maintenance_context: dict | None = None):
         weak_theme_min_positions = args.weak_theme_min_positions,
         weak_theme_return_threshold = args.weak_theme_return_threshold,
         weak_theme_penalty_mult = args.weak_theme_penalty_mult,
+        weak_theme_cooldown_cycles = args.weak_theme_cooldown_cycles,
+        weak_theme_cooldown_min_hits = args.weak_theme_cooldown_min_hits,
+        low_price_rank_policy = args.low_price_rank_policy,
+        low_price_rank_penalty_mult = args.low_price_rank_penalty_mult,
+        low_price_high_rank_floor = args.low_price_high_rank_floor,
         avoid_earnings_days = args.avoid_earnings,
         device              = DEVICE,
         rl_enabled          = args.rl_enabled,

@@ -269,6 +269,7 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
     pending_losses: list[dict[str, Any]] = []
     replacements: list[dict[str, Any]] = []
     replacement_trade_ids: set[int] = set()
+    latest_buy_reason: dict[str, str] = {}
 
     for rec in trade_log:
         action = str(rec.get("action", "")).upper()
@@ -293,6 +294,10 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
                         "ticker": ticker,
                         "time": when,
                         "exit_reason_class": exit_class,
+                        "source_theme": _parse_entry_theme(
+                            ticker,
+                            latest_buy_reason.get(ticker, ""),
+                        ),
                         "realized_pnl": realized_pnl,
                         "cash_freed": cash_freed,
                         "remaining_cash": max(0.0, cash_freed),
@@ -302,6 +307,7 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
 
         if action != "BUY" or value <= 0:
             continue
+        latest_buy_reason[ticker] = str(rec.get("reason", "") or "")
 
         for loss in list(pending_losses):
             age_days = (when - loss["time"]).days
@@ -318,9 +324,14 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
                     "source_exit_ticker": loss["ticker"],
                     "source_exit_time": loss["time"].isoformat(),
                     "source_exit_reason_class": loss["exit_reason_class"],
+                    "source_theme": loss.get("source_theme"),
                     "source_realized_pnl": loss["realized_pnl"],
                     "replacement_ticker": ticker,
                     "replacement_time": when.isoformat(),
+                    "replacement_theme": _parse_entry_theme(
+                        ticker,
+                        str(rec.get("reason", "") or ""),
+                    ),
                     "days_after_exit": age_days,
                     "attributed_value": attributed_value,
                     "entry_value": value,
@@ -366,6 +377,29 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
     fresh_avg = sum(fresh_returns) / len(fresh_returns) if fresh_returns else None
     replacement_avg = sum(open_returns) / len(open_returns) if open_returns else None
 
+    def _scoreboard(field: str) -> list[dict[str, Any]]:
+        groups: dict[str, dict[str, Any]] = {}
+        for row in replacements:
+            key = str(row.get(field) or "unknown")
+            slot = groups.setdefault(
+                key,
+                {"bucket": key, "sample_size": 0, "open_entries": 0, "open_return_sum": 0.0},
+            )
+            slot["sample_size"] += 1
+            if row.get("replacement_open") and row.get("replacement_return_pct") is not None:
+                slot["open_entries"] += 1
+                slot["open_return_sum"] += _safe_float(row.get("replacement_return_pct"))
+        out = []
+        for slot in groups.values():
+            open_entries = int(slot["open_entries"])
+            slot["avg_open_return_pct"] = (
+                slot["open_return_sum"] / open_entries if open_entries else None
+            )
+            slot["small_sample"] = int(slot["sample_size"]) < 10
+            slot.pop("open_return_sum", None)
+            out.append(slot)
+        return sorted(out, key=lambda row: _safe_float(row.get("avg_open_return_pct")), reverse=True)
+
     return {
         "generated_at": datetime.now().isoformat(),
         "redeploy_window_days": int(redeploy_window_days),
@@ -397,6 +431,9 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
         "confidence_note": (
             "small_sample" if len(open_replacements) < 10 else "normal_sample"
         ),
+        "scoreboard_by_replacement_theme": _scoreboard("replacement_theme"),
+        "scoreboard_by_source_exit_reason": _scoreboard("source_exit_reason_class"),
+        "scoreboard_by_source_theme": _scoreboard("source_theme"),
         "replacement_entries_detail": replacements[-20:],
     }
 
@@ -898,6 +935,10 @@ def build_replay_live_parity_report(config: dict | None = None, brain=None) -> d
         "weak_theme_min_positions": "weak_theme_min_positions",
         "weak_theme_return_threshold": "weak_theme_return_threshold",
         "weak_theme_penalty_mult": "weak_theme_penalty_mult",
+        "weak_theme_cooldown_cycles": "weak_theme_cooldown_cycles",
+        "weak_theme_cooldown_min_hits": "weak_theme_cooldown_min_hits",
+        "low_price_rank_penalty_mult": "low_price_rank_penalty_mult",
+        "low_price_high_rank_floor": "low_price_high_rank_floor",
         "avoid_earnings_days": "avoid_earnings_days",
         "rl_phase": "rl_phase",
         "rl_exit_threshold": "rl_exit_threshold",

@@ -489,6 +489,11 @@ def run_replay(
     weak_theme_min_positions: int = 2,
     weak_theme_return_threshold: float = -0.03,
     weak_theme_penalty_mult: float = 0.50,
+    weak_theme_cooldown_cycles: int = 0,
+    weak_theme_cooldown_min_hits: int = 2,
+    low_price_rank_policy: str = "late_cap",
+    low_price_rank_penalty_mult: float = 0.70,
+    low_price_high_rank_floor: float = 0.80,
     avoid_earnings_days: int = 3,
     execution_spread: float = 0.001,
     rl_phase: int = 1,
@@ -533,6 +538,11 @@ def run_replay(
         weak_theme_min_positions=weak_theme_min_positions,
         weak_theme_return_threshold=weak_theme_return_threshold,
         weak_theme_penalty_mult=weak_theme_penalty_mult,
+        weak_theme_cooldown_cycles=weak_theme_cooldown_cycles,
+        weak_theme_cooldown_min_hits=weak_theme_cooldown_min_hits,
+        low_price_rank_policy=low_price_rank_policy,
+        low_price_rank_penalty_mult=low_price_rank_penalty_mult,
+        low_price_high_rank_floor=low_price_high_rank_floor,
         avoid_earnings_days=avoid_earnings_days,
         execution_spread=execution_spread,
         rl_phase=rl_phase,
@@ -577,6 +587,11 @@ def _run_replay_v2(
     weak_theme_min_positions: int = 2,
     weak_theme_return_threshold: float = -0.03,
     weak_theme_penalty_mult: float = 0.50,
+    weak_theme_cooldown_cycles: int = 0,
+    weak_theme_cooldown_min_hits: int = 2,
+    low_price_rank_policy: str = "late_cap",
+    low_price_rank_penalty_mult: float = 0.70,
+    low_price_high_rank_floor: float = 0.80,
     avoid_earnings_days: int = 3,
     execution_spread: float = 0.001,
     rl_phase: int = 1,
@@ -858,6 +873,11 @@ def _run_replay_v2(
         weak_theme_min_positions=weak_theme_min_positions,
         weak_theme_return_threshold=weak_theme_return_threshold,
         weak_theme_penalty_mult=weak_theme_penalty_mult,
+        weak_theme_cooldown_cycles=weak_theme_cooldown_cycles,
+        weak_theme_cooldown_min_hits=weak_theme_cooldown_min_hits,
+        low_price_rank_policy=low_price_rank_policy,
+        low_price_rank_penalty_mult=low_price_rank_penalty_mult,
+        low_price_high_rank_floor=low_price_high_rank_floor,
         avoid_earnings_days=avoid_earnings_days,
         device=None,
         rl_enabled=(strategy == "screener_rl"),
@@ -1083,6 +1103,11 @@ def _replay_kwargs_from_live_config(live_config: dict | None = None) -> dict:
         "weak_theme_min_positions": int(live_config.get("weak_theme_min_positions", 2)),
         "weak_theme_return_threshold": float(live_config.get("weak_theme_return_threshold", -0.03)),
         "weak_theme_penalty_mult": float(live_config.get("weak_theme_penalty_mult", 0.50)),
+        "weak_theme_cooldown_cycles": int(live_config.get("weak_theme_cooldown_cycles", 0)),
+        "weak_theme_cooldown_min_hits": int(live_config.get("weak_theme_cooldown_min_hits", 2)),
+        "low_price_rank_policy": str(live_config.get("low_price_rank_policy", "late_cap")),
+        "low_price_rank_penalty_mult": float(live_config.get("low_price_rank_penalty_mult", 0.70)),
+        "low_price_high_rank_floor": float(live_config.get("low_price_high_rank_floor", 0.80)),
         "avoid_earnings_days": int(live_config.get("avoid_earnings", 3)),
         "execution_spread": float(live_config.get("execution_spread", 0.001)),
         "rl_phase": int(live_config.get("rl_phase", 1)),
@@ -1132,6 +1157,12 @@ def run_sensitivity(
     add("target_vol=22%", target_volatility=0.22)
     add("target_vol=30%", target_volatility=0.30)
     add("sector=45%", max_sector_pct=0.45)
+    add("weak_sleeve=50%", weak_theme_penalty_mult=0.50)
+    add("weak_sleeve=25%", weak_theme_penalty_mult=0.25)
+    add("weak_sleeve=block", weak_theme_penalty_mult=0.0)
+    add("weak_sleeve=cooldown2", weak_theme_cooldown_cycles=2)
+    add("low_price=pre_penalty", low_price_rank_policy="pre_penalty")
+    add("low_price=exclude_high_rank", low_price_rank_policy="exclude_high_rank")
     add("earnings=4d", avoid_earnings_days=4)
     add("spread=5bps", execution_spread=0.0005)
     add("spread=20bps", execution_spread=0.0020)
@@ -1977,6 +2008,11 @@ def run_ablation(
     weak_theme_min_positions: int = 2,
     weak_theme_return_threshold: float = -0.03,
     weak_theme_penalty_mult: float = 0.50,
+    weak_theme_cooldown_cycles: int = 0,
+    weak_theme_cooldown_min_hits: int = 2,
+    low_price_rank_policy: str = "late_cap",
+    low_price_rank_penalty_mult: float = 0.70,
+    low_price_high_rank_floor: float = 0.80,
     avoid_earnings_days: int = 3,
     rl_phase: int = 1,
     rl_exit_threshold: float = 0.30,
@@ -2082,6 +2118,11 @@ def run_ablation(
             weak_theme_min_positions=weak_theme_min_positions,
             weak_theme_return_threshold=weak_theme_return_threshold,
             weak_theme_penalty_mult=weak_theme_penalty_mult,
+            weak_theme_cooldown_cycles=weak_theme_cooldown_cycles,
+            weak_theme_cooldown_min_hits=weak_theme_cooldown_min_hits,
+            low_price_rank_policy=low_price_rank_policy,
+            low_price_rank_penalty_mult=low_price_rank_penalty_mult,
+            low_price_high_rank_floor=low_price_high_rank_floor,
             avoid_earnings_days=avoid_earnings_days,
             rl_phase=rl_phase,
             rl_exit_threshold=rl_exit_threshold,

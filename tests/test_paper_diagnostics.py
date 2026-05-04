@@ -373,8 +373,11 @@ def test_redeployment_quality_tracks_stop_loss_recycling():
     assert report["small_sample"] is True
     assert report["replacement_entries_detail"][0]["source_exit_ticker"] == "HOOD"
     assert report["replacement_entries_detail"][0]["replacement_ticker"] == "STX"
+    assert report["replacement_entries_detail"][0]["replacement_theme"] == "sector_technology"
     assert report["replacement_entries_detail"][0]["downweight_reason"] == "cash_or_risk_cap"
     assert np.isclose(report["avg_open_replacement_return_pct"], 0.10)
+    assert report["scoreboard_by_replacement_theme"][0]["bucket"] == "sector_technology"
+    assert report["scoreboard_by_source_exit_reason"][0]["bucket"] == "stop_loss"
 
 
 def test_low_price_signal_suppression_quantifies_tokenized_top_rank_names():
