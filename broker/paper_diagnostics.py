@@ -497,6 +497,46 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
     }
 
 
+def standardize_replacement_scoreboards(redeployment_report: dict) -> list[dict[str, Any]]:
+    """
+    Flatten replacement-entry scoreboards into a stable review artifact.
+
+    Each row keeps sample size and fresh-entry baseline context attached so
+    experiment reviews do not quote replacement performance without confidence.
+    """
+    report = redeployment_report or {}
+    fresh_avg = report.get("avg_fresh_open_return_pct")
+    rows: list[dict[str, Any]] = []
+    for dimension, key in [
+        ("replacement_theme", "scoreboard_by_replacement_theme"),
+        ("source_exit_reason", "scoreboard_by_source_exit_reason"),
+        ("source_theme", "scoreboard_by_source_theme"),
+    ]:
+        for item in report.get(key) or []:
+            avg_return = item.get("avg_open_return_pct")
+            rows.append(
+                {
+                    "dimension": dimension,
+                    "bucket": item.get("bucket"),
+                    "sample_size": int(item.get("sample_size", 0) or 0),
+                    "open_entries": int(item.get("open_entries", 0) or 0),
+                    "closed_entries": int(item.get("closed_entries", 0) or 0),
+                    "avg_open_return_pct": avg_return,
+                    "fresh_open_return_baseline_pct": fresh_avg,
+                    "replacement_vs_fresh_delta_pct": (
+                        _safe_float(avg_return) - _safe_float(fresh_avg)
+                        if avg_return is not None and fresh_avg is not None else None
+                    ),
+                    "wins": int(item.get("wins", 0) or 0),
+                    "win_rate": item.get("win_rate"),
+                    "stop_out_rate": item.get("stop_out_rate"),
+                    "avg_holding_days": item.get("avg_holding_days"),
+                    "small_sample": bool(item.get("small_sample", True)),
+                }
+            )
+    return rows
+
+
 def summarize_low_price_signal_suppression(
     trade_log: list[dict],
     high_rank_floor: float = 0.80,
@@ -942,6 +982,7 @@ def summarize_performance_attribution(portfolio) -> dict:
 
     price_sanity = summarize_price_sanity(portfolio)
     redeployment = summarize_redeployment_quality(portfolio)
+    replacement_scoreboards = standardize_replacement_scoreboards(redeployment)
     low_price_suppression = summarize_low_price_signal_suppression(trade_log)
 
     return {
@@ -968,6 +1009,7 @@ def summarize_performance_attribution(portfolio) -> dict:
         ),
         "price_sanity": price_sanity,
         "redeployment_quality": redeployment,
+        "replacement_scoreboards": replacement_scoreboards,
         "low_price_signal_suppression": low_price_suppression,
         "closed_trade_sample": closed[-20:],
     }

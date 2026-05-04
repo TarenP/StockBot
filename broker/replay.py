@@ -19,6 +19,7 @@ Usage:
     python Agent.py --mode replay --sensitivity
 """
 
+import json
 import logging
 import re
 from datetime import datetime, timedelta
@@ -37,6 +38,31 @@ _REPLAY_MIN_PRICE = 0.01
 _REPLAY_SPLIT_RATIO_THRESHOLD = 2.0
 _REPLAY_CORP_ACTION_LOOKBACK = 20
 _LAST_REPLAY_SCORE_AUDIT = pd.DataFrame()
+
+POLICY_REVIEW_COLUMNS = [
+    "family",
+    "variant",
+    "params",
+    "outcome_total_return",
+    "outcome_sharpe",
+    "outcome_max_drawdown",
+    "outcome_win_rate",
+    "mechanism_weak_reentry_count",
+    "mechanism_weak_reentry_theme_count",
+    "mechanism_weak_selected_count",
+    "mechanism_tokenized_high_rank_low_price_count",
+    "mechanism_low_price_tokenized_rate",
+    "mechanism_avg_top_theme_concentration",
+    "mechanism_max_top_theme_concentration",
+    "mechanism_avg_low_price_exposure",
+    "mechanism_max_low_price_exposure",
+    "confidence_high_rank_low_price_count",
+    "confidence_note",
+    "outcome_rank_score",
+    "mechanism_rank_score",
+    "policy_rank_score",
+    "family_rank",
+]
 
 
 # ── Historical research stub ──────────────────────────────────────────────────
@@ -1306,6 +1332,195 @@ def _summarize_replay_control_metrics(
     return metrics
 
 
+def _pct_rank(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce")
+    if values.notna().sum() == 0:
+        return pd.Series(np.nan, index=series.index)
+    fill_value = values.min() if higher_is_better else values.max()
+    if not np.isfinite(fill_value):
+        fill_value = 0.0
+    return values.fillna(fill_value).rank(
+        method="average",
+        pct=True,
+        ascending=higher_is_better,
+    )
+
+
+def _policy_family(label: str) -> str:
+    text = str(label or "")
+    if text.startswith("weak_sleeve="):
+        return "weak_sleeve"
+    if text.startswith("low_price="):
+        return "low_price"
+    if text == "current_config (base)":
+        return "baseline"
+    return "general"
+
+
+def build_policy_review_report(sensitivity_df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """
+    Convert the raw sensitivity sweep into a stable experiment-review table.
+
+    The raw sweep answers "what happened"; this table separates outcome,
+    mechanism, and confidence fields so weak-sleeve and low-price policies are
+    judged on the behavior they were designed to change.
+    """
+    if sensitivity_df is None or sensitivity_df.empty:
+        return pd.DataFrame(columns=POLICY_REVIEW_COLUMNS), {
+            "generated_at": datetime.now().isoformat(),
+            "families": {},
+            "confidence_note": "empty_sensitivity",
+        }
+
+    rows = []
+    for _, row in sensitivity_df.iterrows():
+        label = str(row.get("params", ""))
+        family = _policy_family(label)
+        rows.append(
+            {
+                "family": family,
+                "variant": "base" if family == "baseline" else label,
+                "params": label,
+                "outcome_total_return": row.get("total_return"),
+                "outcome_sharpe": row.get("sharpe"),
+                "outcome_max_drawdown": row.get("max_drawdown"),
+                "outcome_win_rate": row.get("win_rate"),
+                "mechanism_weak_reentry_count": row.get("weak_sleeve_reentry_count"),
+                "mechanism_weak_reentry_theme_count": row.get("weak_sleeve_reentry_theme_count"),
+                "mechanism_weak_selected_count": row.get("weak_sleeve_selected_count"),
+                "mechanism_tokenized_high_rank_low_price_count": row.get(
+                    "tokenized_high_rank_low_price_count"
+                ),
+                "mechanism_low_price_tokenized_rate": row.get("low_price_tokenized_rate"),
+                "mechanism_avg_top_theme_concentration": row.get("avg_top_theme_concentration"),
+                "mechanism_max_top_theme_concentration": row.get("max_top_theme_concentration"),
+                "mechanism_avg_low_price_exposure": row.get("avg_low_price_exposure"),
+                "mechanism_max_low_price_exposure": row.get("max_low_price_exposure"),
+                "confidence_high_rank_low_price_count": row.get("high_rank_low_price_count"),
+            }
+        )
+
+    review = pd.DataFrame(rows)
+    if review.empty:
+        return pd.DataFrame(columns=POLICY_REVIEW_COLUMNS), {
+            "generated_at": datetime.now().isoformat(),
+            "families": {},
+            "confidence_note": "empty_sensitivity",
+        }
+
+    baseline = review[review["family"].eq("baseline")].copy()
+    expanded_parts = []
+    for family in ["weak_sleeve", "low_price"]:
+        family_rows = review[review["family"].eq(family)].copy()
+        if family_rows.empty:
+            continue
+        if not baseline.empty:
+            base_rows = baseline.copy()
+            base_rows["family"] = family
+            base_rows["variant"] = "current_config (base)"
+            family_rows = pd.concat([base_rows, family_rows], ignore_index=True)
+        expanded_parts.append(family_rows)
+
+    general = review[review["family"].eq("general")].copy()
+    if not general.empty:
+        expanded_parts.append(general)
+
+    if not expanded_parts:
+        expanded_parts.append(review)
+    review = pd.concat(expanded_parts, ignore_index=True)
+
+    review["outcome_rank_score"] = np.nan
+    review["mechanism_rank_score"] = np.nan
+    review["policy_rank_score"] = np.nan
+    review["family_rank"] = np.nan
+    review["confidence_note"] = "normal_sample"
+
+    for family, idx in review.groupby("family").groups.items():
+        subset = review.loc[idx]
+        outcome_parts = [
+            _pct_rank(subset["outcome_total_return"], True),
+            _pct_rank(subset["outcome_sharpe"], True),
+            _pct_rank(subset["outcome_max_drawdown"], True),
+        ]
+        outcome_score = pd.concat(outcome_parts, axis=1).mean(axis=1)
+
+        mechanism_parts = []
+        if family == "weak_sleeve":
+            mechanism_parts = [
+                _pct_rank(subset["mechanism_weak_reentry_count"], False),
+                _pct_rank(subset["mechanism_weak_reentry_theme_count"], False),
+                _pct_rank(subset["mechanism_weak_selected_count"], False),
+                _pct_rank(subset["mechanism_max_top_theme_concentration"], False),
+            ]
+            sample = (
+                pd.to_numeric(subset["mechanism_weak_reentry_count"], errors="coerce").fillna(0)
+                + pd.to_numeric(subset["mechanism_weak_selected_count"], errors="coerce").fillna(0)
+            )
+            review.loc[idx, "confidence_note"] = np.where(sample < 10, "small_sample", "normal_sample")
+        elif family == "low_price":
+            mechanism_parts = [
+                _pct_rank(subset["mechanism_tokenized_high_rank_low_price_count"], False),
+                _pct_rank(subset["mechanism_low_price_tokenized_rate"], False),
+                _pct_rank(subset["mechanism_max_low_price_exposure"], False),
+            ]
+            sample = pd.to_numeric(
+                subset["confidence_high_rank_low_price_count"],
+                errors="coerce",
+            ).fillna(0)
+            review.loc[idx, "confidence_note"] = np.where(sample < 10, "small_sample", "normal_sample")
+        elif family == "general":
+            mechanism_parts = [
+                _pct_rank(subset["mechanism_max_top_theme_concentration"], False),
+                _pct_rank(subset["mechanism_max_low_price_exposure"], False),
+            ]
+
+        mechanism_score = (
+            pd.concat(mechanism_parts, axis=1).mean(axis=1)
+            if mechanism_parts else pd.Series(np.nan, index=subset.index)
+        )
+        policy_score = (
+            0.65 * outcome_score + 0.35 * mechanism_score.fillna(outcome_score)
+        )
+        ranks = policy_score.rank(method="first", ascending=False)
+
+        review.loc[idx, "outcome_rank_score"] = outcome_score
+        review.loc[idx, "mechanism_rank_score"] = mechanism_score
+        review.loc[idx, "policy_rank_score"] = policy_score
+        review.loc[idx, "family_rank"] = ranks
+
+    review = review[POLICY_REVIEW_COLUMNS].sort_values(["family", "family_rank", "params"])
+    summary = {
+        "generated_at": datetime.now().isoformat(),
+        "families": {},
+        "confidence_note": (
+            "small_sample_present"
+            if review["confidence_note"].eq("small_sample").any()
+            else "normal_sample"
+        ),
+        "ranking_policy": (
+            "65% outcome score and 35% mechanism score within each family; "
+            "small-sample flags are carried separately."
+        ),
+    }
+    for family, group in review.groupby("family"):
+        leader = group.sort_values("family_rank").iloc[0]
+        summary["families"][family] = {
+            "leader": str(leader["params"]),
+            "leader_policy_rank_score": _json_float(leader.get("policy_rank_score")),
+            "rows": int(len(group)),
+            "small_sample_rows": int(group["confidence_note"].eq("small_sample").sum()),
+        }
+    return review, summary
+
+
+def _json_float(value) -> float | None:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    return out if np.isfinite(out) else None
+
+
 # ── Friction regime reporting ─────────────────────────────────────────────────
 
 # Three friction regimes for honest cost-model sensitivity reporting.
@@ -1611,6 +1826,20 @@ def run_full_replay(
         sens_path = Path(save_plot).with_name(f"{Path(save_plot).stem}_sensitivity.csv")
         sens_df.to_csv(sens_path, index=False)
         logger.info("Sensitivity sweep saved -> %s", sens_path)
+
+        policy_review_df, policy_review_summary = build_policy_review_report(sens_df)
+        policy_review_path = Path(save_plot).with_name(
+            f"{Path(save_plot).stem}_policy_review.csv"
+        )
+        policy_review_summary_path = Path(save_plot).with_name(
+            f"{Path(save_plot).stem}_policy_review.json"
+        )
+        policy_review_df.to_csv(policy_review_path, index=False)
+        policy_review_summary_path.write_text(
+            json.dumps(policy_review_summary, indent=2, sort_keys=True)
+        )
+        logger.info("Policy review saved -> %s", policy_review_path)
+        logger.info("Policy review summary saved -> %s", policy_review_summary_path)
 
         # Flag if results are knife-edge
         sharpes = sens_df["sharpe"].values

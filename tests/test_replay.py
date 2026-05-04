@@ -774,6 +774,73 @@ def test_replay_control_metrics_count_weak_reentry_and_low_price_tokenization():
     assert np.isclose(metrics["max_low_price_exposure"], 0.03)
 
 
+def test_build_policy_review_report_groups_outcome_mechanism_confidence():
+    sensitivity = pd.DataFrame(
+        [
+            {
+                "params": "current_config (base)",
+                "total_return": 0.08,
+                "sharpe": 1.0,
+                "max_drawdown": -0.10,
+                "win_rate": 0.55,
+                "weak_sleeve_reentry_count": 3,
+                "weak_sleeve_reentry_theme_count": 1,
+                "weak_sleeve_selected_count": 4,
+                "tokenized_high_rank_low_price_count": 2,
+                "high_rank_low_price_count": 3,
+                "low_price_tokenized_rate": 0.67,
+                "avg_top_theme_concentration": 0.30,
+                "max_top_theme_concentration": 0.40,
+                "avg_low_price_exposure": 0.08,
+                "max_low_price_exposure": 0.10,
+            },
+            {
+                "params": "weak_sleeve=block",
+                "total_return": 0.07,
+                "sharpe": 0.95,
+                "max_drawdown": -0.08,
+                "win_rate": 0.54,
+                "weak_sleeve_reentry_count": 0,
+                "weak_sleeve_reentry_theme_count": 0,
+                "weak_sleeve_selected_count": 0,
+                "tokenized_high_rank_low_price_count": 2,
+                "high_rank_low_price_count": 3,
+                "low_price_tokenized_rate": 0.67,
+                "avg_top_theme_concentration": 0.24,
+                "max_top_theme_concentration": 0.30,
+                "avg_low_price_exposure": 0.08,
+                "max_low_price_exposure": 0.10,
+            },
+            {
+                "params": "low_price=pre_penalty",
+                "total_return": 0.09,
+                "sharpe": 1.1,
+                "max_drawdown": -0.09,
+                "win_rate": 0.56,
+                "weak_sleeve_reentry_count": 3,
+                "weak_sleeve_reentry_theme_count": 1,
+                "weak_sleeve_selected_count": 4,
+                "tokenized_high_rank_low_price_count": 0,
+                "high_rank_low_price_count": 3,
+                "low_price_tokenized_rate": 0.0,
+                "avg_top_theme_concentration": 0.30,
+                "max_top_theme_concentration": 0.40,
+                "avg_low_price_exposure": 0.03,
+                "max_low_price_exposure": 0.04,
+            },
+        ]
+    )
+
+    review, summary = replay_module.build_policy_review_report(sensitivity)
+
+    assert set(review["family"]) == {"weak_sleeve", "low_price"}
+    assert "current_config (base)" in set(review["variant"])
+    assert "outcome_rank_score" in review.columns
+    assert "mechanism_rank_score" in review.columns
+    assert summary["families"]["weak_sleeve"]["rows"] == 2
+    assert summary["families"]["low_price"]["small_sample_rows"] == 2
+
+
 def test_rolling_window_validation_summarizes_subperiods():
     aligned = pd.DataFrame(
         {

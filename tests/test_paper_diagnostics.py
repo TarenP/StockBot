@@ -14,6 +14,7 @@ from broker.paper_diagnostics import (
     summarize_low_price_signal_suppression,
     summarize_performance_attribution,
     summarize_redeployment_quality,
+    standardize_replacement_scoreboards,
 )
 from broker.portfolio import Portfolio
 
@@ -401,6 +402,33 @@ def test_redeployment_scoreboard_tracks_closed_replacement_outcomes():
     assert by_theme["theme_b"]["win_rate"] == 1.0
     assert by_theme["theme_b"]["stop_out_rate"] == 0.0
     assert by_theme["theme_b"]["avg_holding_days"] == 3.0
+
+
+def test_standardized_replacement_scoreboards_include_fresh_baseline():
+    redeployment = {
+        "avg_fresh_open_return_pct": -0.02,
+        "scoreboard_by_replacement_theme": [
+            {
+                "bucket": "sector_technology",
+                "sample_size": 2,
+                "open_entries": 1,
+                "closed_entries": 1,
+                "avg_open_return_pct": 0.06,
+                "wins": 1,
+                "win_rate": 1.0,
+                "stop_out_rate": 0.0,
+                "avg_holding_days": 4.0,
+                "small_sample": True,
+            }
+        ],
+    }
+
+    rows = standardize_replacement_scoreboards(redeployment)
+
+    assert rows[0]["dimension"] == "replacement_theme"
+    assert rows[0]["fresh_open_return_baseline_pct"] == -0.02
+    assert np.isclose(rows[0]["replacement_vs_fresh_delta_pct"], 0.08)
+    assert rows[0]["small_sample"] is True
 
 
 def test_low_price_signal_suppression_quantifies_tokenized_top_rank_names():
