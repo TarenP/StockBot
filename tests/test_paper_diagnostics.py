@@ -9,8 +9,10 @@ import pandas as pd
 from broker.broker import _paper_execution_cost
 from broker.paper_diagnostics import (
     build_replay_live_parity_report,
+    summarize_price_sanity,
     summarize_cap_impact_history,
     summarize_performance_attribution,
+    summarize_redeployment_quality,
 )
 from broker.portfolio import Portfolio
 
@@ -318,6 +320,56 @@ def test_performance_attribution_groups_open_and_closed_by_theme_and_price_bucke
     assert np.isclose(by_theme["precious_metals_miners"]["unrealized_pnl"], -20.0)
     assert by_bucket["sub_5"]["closed_trades"] == 1
     assert by_bucket["over_10"]["open_positions"] == 1
+    assert by_theme["precious_metals_miners"]["weak_open_positions"] == 1
+    assert np.isclose(by_theme["precious_metals_miners"]["avg_open_return_pct"], -2.0 / 30.0)
+
+
+def test_price_sanity_explains_post_split_bkng_scale():
+    portfolio = _portfolio()
+    assert portfolio.buy(
+        "BKNG",
+        1.0,
+        172.0,
+        "entry | Theme=sector_consumer_discretionary |",
+    )
+    portfolio.trade_log[-1]["time"] = "2026-04-30T16:39:32"
+    portfolio.positions["BKNG"]["last_price"] = 166.0
+
+    report = summarize_price_sanity(portfolio)
+
+    assert report["warnings"] == []
+    assert report["known_price_events"][0]["ticker"] == "BKNG"
+    assert report["known_price_events"][0]["known_price_event"]["ratio"] == 25.0
+
+
+def test_redeployment_quality_tracks_stop_loss_recycling():
+    portfolio = _portfolio()
+    assert portfolio.buy("HOOD", 10.0, 100.0, "entry | Theme=consumer_credit_finance |")
+    portfolio.trade_log[-1]["time"] = "2026-04-27T10:00:00"
+    assert portfolio.sell_all(
+        "HOOD",
+        80.0,
+        "Stop-loss (-20.0% vs -10.0% ATR-adjusted)",
+        execution_cost=1.0,
+    )
+    portfolio.trade_log[-1]["time"] = "2026-04-29T10:00:00"
+    assert portfolio.buy(
+        "STX",
+        1.0,
+        600.0,
+        "entry | downweight_reason=cash_or_risk_cap | Theme=sector_technology |",
+    )
+    portfolio.trade_log[-1]["time"] = "2026-04-30T10:00:00"
+    portfolio.positions["STX"]["last_price"] = 660.0
+
+    report = summarize_redeployment_quality(portfolio)
+
+    assert report["realized_loss_events"] == 1
+    assert report["replacement_entries"] == 1
+    assert report["replacement_entries_detail"][0]["source_exit_ticker"] == "HOOD"
+    assert report["replacement_entries_detail"][0]["replacement_ticker"] == "STX"
+    assert report["replacement_entries_detail"][0]["downweight_reason"] == "cash_or_risk_cap"
+    assert np.isclose(report["avg_open_replacement_return_pct"], 0.10)
 
 
 def test_paper_execution_cost_uses_tiered_or_configured_spread():

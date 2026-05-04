@@ -17,6 +17,17 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+_PARAM_OPTIONS = {
+    "min_score": [0.52, 0.58, 0.64],
+    "stop_loss_floor": [0.07, 0.10],
+    "take_profit": [0.45, 0.60],
+    "max_sector_pct": [0.30, 0.40],
+    "max_position_pct": [0.12, 0.18, 0.22],
+    "cash_floor": [0.01, 0.03],
+    "max_gross_exposure": [0.95, 0.99],
+    "target_volatility": [0.15, 0.22],
+}
+
 _PARAM_GRID = [
     {
         "min_score": ms,
@@ -28,20 +39,22 @@ _PARAM_GRID = [
         "max_gross_exposure": mge,
         "target_volatility": tv,
     }
-    for ms in [0.52, 0.58, 0.64]
-    for sl in [0.07, 0.10]
-    for tp in [0.45, 0.60]
-    for mx in [0.30, 0.40]
-    for mpp in [0.12, 0.18, 0.22]
-    for cf in [0.01, 0.03]
-    for mge in [0.95, 0.99]
-    for tv in [0.15, 0.22]
+    for ms in _PARAM_OPTIONS["min_score"]
+    for sl in _PARAM_OPTIONS["stop_loss_floor"]
+    for tp in _PARAM_OPTIONS["take_profit"]
+    for mx in _PARAM_OPTIONS["max_sector_pct"]
+    for mpp in _PARAM_OPTIONS["max_position_pct"]
+    for cf in _PARAM_OPTIONS["cash_floor"]
+    for mge in _PARAM_OPTIONS["max_gross_exposure"]
+    for tv in _PARAM_OPTIONS["target_volatility"]
 ]
 
 _HOLDOUT_FRACTION = 0.25
 _MIN_HOLDOUT_DAYS = 63
 _MAX_HOLDOUT_DAYS = 126
 _HOLDOUT_FINALISTS = 12
+_FAST_SEARCH_MAX_COMBINATIONS = 96
+_FAST_HOLDOUT_FINALISTS = 6
 
 
 def _read_config(path: str = "broker.config") -> dict:
@@ -68,6 +81,82 @@ def _config_float(cfg: dict, key: str, default: float) -> float:
         return float(cfg.get(key, default))
     except (TypeError, ValueError):
         return default
+
+
+def _config_str(cfg: dict, key: str, default: str) -> str:
+    value = cfg.get(key, default)
+    return str(value).strip().lower() if value is not None else default
+
+
+def _current_param_values(cfg: dict) -> dict:
+    return {
+        "min_score": _config_float(cfg, "min_score", 0.58),
+        "stop_loss_floor": _config_float(cfg, "stop_loss", 0.10),
+        "take_profit": _config_float(cfg, "take_profit", 0.60),
+        "max_sector_pct": _config_float(cfg, "max_sector", 0.40),
+        "max_position_pct": _config_float(cfg, "max_position_pct", 0.18),
+        "cash_floor": _config_float(cfg, "cash_floor", 0.03),
+        "max_gross_exposure": _config_float(cfg, "max_gross_exposure", 0.99),
+        "target_volatility": _config_float(cfg, "target_volatility", 0.22),
+    }
+
+
+def _param_signature(params: dict) -> tuple:
+    return tuple((key, round(float(params[key]), 6)) for key in _PARAM_OPTIONS)
+
+
+def _param_distance(params: dict, center: dict) -> tuple:
+    distance = 0.0
+    for key, options in _PARAM_OPTIONS.items():
+        lo = min(options)
+        hi = max(options)
+        width = max(hi - lo, 1e-9)
+        distance += abs(float(params[key]) - float(center[key])) / width
+    return (distance, _param_signature(params))
+
+
+def _build_param_grid(
+    cfg: dict,
+    search_mode: str | None = None,
+    max_combinations: int | None = None,
+) -> list[dict]:
+    """
+    Build the weekly parameter-search grid.
+
+    The old behavior tried every point in the full Cartesian grid. The default
+    fast mode keeps the current live settings plus the nearest deterministic
+    candidates, which preserves a real correction pass without turning weekly
+    maintenance into hundreds of full replays.
+    """
+    mode = (search_mode or _config_str(cfg, "autotune_search_mode", "fast")).lower()
+    if mode == "full":
+        return [dict(params) for params in _PARAM_GRID]
+
+    try:
+        budget = int(max_combinations or _config_int(
+            cfg, "autotune_max_combinations", _FAST_SEARCH_MAX_COMBINATIONS,
+        ))
+    except (TypeError, ValueError):
+        budget = _FAST_SEARCH_MAX_COMBINATIONS
+    budget = max(1, min(budget, len(_PARAM_GRID) + 1))
+
+    center = _current_param_values(cfg)
+    selected: list[dict] = []
+    seen: set[tuple] = set()
+
+    def add(params: dict) -> None:
+        sig = _param_signature(params)
+        if sig not in seen:
+            selected.append(dict(params))
+            seen.add(sig)
+
+    add(center)
+    for params in sorted(_PARAM_GRID, key=lambda row: _param_distance(row, center)):
+        add(params)
+        if len(selected) >= budget:
+            break
+
+    return selected
 
 
 def _base_replay_kwargs(cfg: dict, initial_cash: float) -> dict:
@@ -194,12 +283,27 @@ def tune_parameters(
     from broker.replay import run_replay
     from pipeline.benchmark import compute_metrics
 
+    cfg = _read_config(config_path)
+    search_mode = _config_str(cfg, "autotune_search_mode", "fast")
+    max_combinations = _config_int(
+        cfg, "autotune_max_combinations", _FAST_SEARCH_MAX_COMBINATIONS,
+    )
+    holdout_finalists = _config_int(
+        cfg, "autotune_holdout_finalists", _FAST_HOLDOUT_FINALISTS,
+    )
+    param_grid = _build_param_grid(
+        cfg,
+        search_mode=search_mode,
+        max_combinations=max_combinations,
+    )
+
     logger.info(
-        "AutoTuner: starting parameter optimisation (%d combinations)...",
+        "AutoTuner: starting parameter optimisation (%s mode, %d/%d combinations)...",
+        search_mode,
+        len(param_grid),
         len(_PARAM_GRID),
     )
 
-    cfg = _read_config(config_path)
     shared_kwargs = _base_replay_kwargs(cfg, initial_cash)
     df_search, df_holdout, has_holdout = _split_replay_holdout(
         df_features,
@@ -207,7 +311,7 @@ def tune_parameters(
     )
     results: list[dict] = []
 
-    for i, params in enumerate(_PARAM_GRID):
+    for i, params in enumerate(param_grid):
         try:
             rets, _ = run_replay(
                 df_search,
@@ -243,7 +347,7 @@ def tune_parameters(
                 row["search_max_drawdown"],
             ),
             reverse=True,
-        )[: min(_HOLDOUT_FINALISTS, len(results))]
+        )[: min(max(1, holdout_finalists), len(results))]
 
         for finalist in finalists:
             rets, _ = run_replay(

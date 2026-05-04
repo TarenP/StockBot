@@ -287,3 +287,53 @@ def test_run_shadow_cycle_forces_revalidation_on_metric_upgrade(monkeypatch):
         assert calls["validated"] == 1
     finally:
         state_path.unlink(missing_ok=True)
+
+
+def test_run_shadow_cycle_uses_validation_budget(monkeypatch):
+    state_path = Path.cwd() / f".test_shadows_state_{uuid4().hex}.json"
+    monkeypatch.setattr(shadows_module, "_STATE_FILE", str(state_path))
+
+    baseline = shadows_module._genome_from_config({})
+    baseline["fast_score"] = 0.4
+
+    calls = {}
+
+    monkeypatch.setattr(shadows_module, "_resolve_shadow_checkpoint", lambda path: None)
+    monkeypatch.setattr(shadows_module, "fast_score_population", lambda population, df_features: population)
+
+    def _fake_validate(population, *args, **kwargs):
+        calls.update(kwargs)
+        return population
+
+    monkeypatch.setattr(shadows_module, "validate_top_genomes", _fake_validate)
+    monkeypatch.setattr(shadows_module, "_maybe_promote", lambda population, *args, **kwargs: (population, False))
+    monkeypatch.setattr(shadows_module, "evolve_population", lambda population, live_config: population)
+    monkeypatch.setattr(shadows_module, "_maybe_enable_options", lambda *args, **kwargs: False)
+    monkeypatch.setattr(shadows_module, "_log_summary", lambda *args, **kwargs: None)
+
+    try:
+        state_path.write_text(
+            json.dumps(
+                {
+                    "population": [baseline],
+                    "generation": 1,
+                    "last_evolved": "2024-01-01",
+                    "last_validated": "2024-01-01",
+                    "options_days_beating": 0,
+                    "baseline_sharpe": 0.0,
+                }
+            )
+        )
+
+        shadows_module.run_shadow_cycle(
+            df_features=_snapshot_frame(),
+            price_lookup=_price_lookup(),
+            live_config={},
+            validation_top_n=3,
+            validation_replay_years=2,
+        )
+
+        assert calls["top_n"] == 3
+        assert calls["replay_years"] == 2
+    finally:
+        state_path.unlink(missing_ok=True)

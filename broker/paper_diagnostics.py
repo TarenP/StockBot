@@ -24,6 +24,21 @@ CAP_IMPACT_SUMMARY_PATH = STATE_DIR / "cap_impact_summary.json"
 PERFORMANCE_ATTRIBUTION_PATH = STATE_DIR / "performance_attribution.json"
 PARITY_REPORT_PATH = STATE_DIR / "replay_live_parity.json"
 
+KNOWN_PRICE_EVENTS = {
+    "BKNG": [
+        {
+            "type": "forward_split",
+            "effective_date": "2026-04-06",
+            "ratio": 25.0,
+            "note": (
+                "Booking Holdings traded on a post-split basis after its "
+                "25-for-1 split. Portfolio prices after this date should be "
+                "read on the post-split scale."
+            ),
+        }
+    ],
+}
+
 CAP_IMPACT_KEYS = [
     "sentiment_cap_impact",
     "volatility_cap_impact",
@@ -99,6 +114,26 @@ def _classify_exit_reason(reason: str) -> str:
     return "other"
 
 
+def _trade_time(rec: dict) -> datetime:
+    raw = rec.get("fill_date") or rec.get("date") or rec.get("time")
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return datetime.min
+
+
+def _known_price_event(ticker: str, when: datetime) -> dict | None:
+    symbol = str(ticker or "").upper()
+    for event in KNOWN_PRICE_EVENTS.get(symbol, []):
+        try:
+            effective = datetime.fromisoformat(event["effective_date"])
+        except Exception:
+            continue
+        if when.date() >= effective.date():
+            return event
+    return None
+
+
 def _entry_cap_summary_from_trade_log(trade_log: list[dict]) -> dict:
     counts = {key: 0 for key in CAP_IMPACT_KEYS}
     by_reason: dict[str, int] = {}
@@ -135,6 +170,186 @@ def _entry_cap_summary_from_trade_log(trade_log: list[dict]) -> dict:
             key=lambda item: item["count"],
             reverse=True,
         )[:10],
+    }
+
+
+def summarize_price_sanity(
+    portfolio,
+    reference_prices: dict[str, float] | None = None,
+) -> dict:
+    """
+    Flag obvious price-scale mismatches while documenting known split-adjusted
+    cases. The broker stores and trades adjusted prices, so known split events
+    are treated as explanations rather than errors.
+    """
+    positions = getattr(portfolio, "positions", {}) or {}
+    trade_log = list(getattr(portfolio, "trade_log", []) or [])
+    reference_prices = {str(k).upper(): v for k, v in (reference_prices or {}).items()}
+
+    latest_buy: dict[str, dict] = {}
+    for rec in trade_log:
+        if str(rec.get("action", "")).upper() == "BUY":
+            ticker = str(rec.get("ticker", "")).upper()
+            if ticker:
+                latest_buy[ticker] = rec
+
+    checks = []
+    for ticker, pos in positions.items():
+        ticker = str(ticker).upper()
+        latest = latest_buy.get(ticker, {})
+        when = _trade_time(latest) if latest else datetime.min
+        last_price = _safe_float(pos.get("last_price"))
+        avg_cost = _safe_float(pos.get("avg_cost"))
+        ref_price = _safe_float(reference_prices.get(ticker), default=np.nan)
+        event = _known_price_event(ticker, when)
+
+        status = "ok"
+        flags: list[str] = []
+        if np.isfinite(ref_price) and ref_price > 0 and last_price > 0:
+            ratio = last_price / ref_price
+            if ratio < 0.67 or ratio > 1.50:
+                status = "warning"
+                flags.append("reference_price_mismatch")
+        if avg_cost > 0 and last_price > 0:
+            move = abs(last_price / avg_cost - 1.0)
+            days_held = int(_safe_float(pos.get("days_held")))
+            if days_held <= 10 and move > 0.50:
+                status = "warning"
+                flags.append("large_short_holding_price_move")
+        if event and status == "ok":
+            status = "ok_known_price_event"
+
+        checks.append(
+            {
+                "ticker": ticker,
+                "status": status,
+                "flags": flags,
+                "last_price": last_price,
+                "avg_cost": avg_cost,
+                "latest_buy_price": _safe_float(latest.get("price"), default=np.nan),
+                "latest_buy_time": latest.get("time"),
+                "known_price_event": event,
+                "reference_price": ref_price if np.isfinite(ref_price) else None,
+            }
+        )
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "price_policy": "Adjusted prices are expected throughout paper accounting.",
+        "warnings": [row for row in checks if row["status"] == "warning"],
+        "known_price_events": [
+            row for row in checks if row["status"] == "ok_known_price_event"
+        ],
+        "checks": checks,
+    }
+
+
+def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> dict:
+    """
+    Attribute buys that consume cash freed by recent realized-loss exits.
+    This gives stop-out recycling a separate audit trail from normal entries.
+    """
+    trade_log = sorted(
+        list(getattr(portfolio, "trade_log", []) or []),
+        key=_trade_time,
+    )
+    positions = getattr(portfolio, "positions", {}) or {}
+    pending_losses: list[dict[str, Any]] = []
+    replacements: list[dict[str, Any]] = []
+
+    for rec in trade_log:
+        action = str(rec.get("action", "")).upper()
+        ticker = str(rec.get("ticker", "")).upper()
+        when = _trade_time(rec)
+        value = _safe_float(rec.get("value")) or (
+            _safe_float(rec.get("shares")) * _safe_float(rec.get("price"))
+        )
+
+        if action in {"SELL", "SELL_PARTIAL"}:
+            realized = rec.get("realized_pnl")
+            realized_pnl = _safe_float(realized, default=np.nan)
+            exit_class = _classify_exit_reason(str(rec.get("reason", "") or ""))
+            if (
+                np.isfinite(realized_pnl)
+                and realized_pnl < 0
+                and exit_class in {"stop_loss", "dead_money", "signal_exit", "rl_phase2", "other"}
+            ):
+                cash_freed = _safe_float(rec.get("net_cash_flow"), value)
+                pending_losses.append(
+                    {
+                        "ticker": ticker,
+                        "time": when,
+                        "exit_reason_class": exit_class,
+                        "realized_pnl": realized_pnl,
+                        "cash_freed": cash_freed,
+                        "remaining_cash": max(0.0, cash_freed),
+                    }
+                )
+            continue
+
+        if action != "BUY" or value <= 0:
+            continue
+
+        for loss in list(pending_losses):
+            age_days = (when - loss["time"]).days
+            if age_days < 0:
+                continue
+            if age_days > int(redeploy_window_days) or loss["remaining_cash"] <= 1e-9:
+                continue
+            attributed_value = min(value, loss["remaining_cash"])
+            pos = positions.get(ticker, {})
+            avg_cost = _safe_float(pos.get("avg_cost"), _safe_float(rec.get("price")))
+            last_price = _safe_float(pos.get("last_price"), avg_cost)
+            replacements.append(
+                {
+                    "source_exit_ticker": loss["ticker"],
+                    "source_exit_time": loss["time"].isoformat(),
+                    "source_exit_reason_class": loss["exit_reason_class"],
+                    "source_realized_pnl": loss["realized_pnl"],
+                    "replacement_ticker": ticker,
+                    "replacement_time": when.isoformat(),
+                    "days_after_exit": age_days,
+                    "attributed_value": attributed_value,
+                    "entry_value": value,
+                    "downweight_reason": _parse_downweight_reason(str(rec.get("reason", ""))),
+                    "replacement_open": ticker in positions,
+                    "replacement_return_pct": (
+                        (last_price - avg_cost) / avg_cost if avg_cost > 0 else None
+                    ),
+                    "replacement_unrealized_pnl": (
+                        (last_price - avg_cost) * _safe_float(pos.get("shares"))
+                        if ticker in positions else None
+                    ),
+                }
+            )
+            loss["remaining_cash"] -= attributed_value
+            break
+
+    open_replacements = [row for row in replacements if row.get("replacement_open")]
+    open_returns = [
+        _safe_float(row.get("replacement_return_pct"), default=np.nan)
+        for row in open_replacements
+    ]
+    open_returns = [value for value in open_returns if np.isfinite(value)]
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "redeploy_window_days": int(redeploy_window_days),
+        "realized_loss_events": len(pending_losses),
+        "replacement_entries": len(replacements),
+        "redeployed_value": sum(_safe_float(row.get("attributed_value")) for row in replacements),
+        "avg_replacement_entry_value": (
+            sum(_safe_float(row.get("entry_value")) for row in replacements) / len(replacements)
+            if replacements else 0.0
+        ),
+        "open_replacement_unrealized_pnl": sum(
+            _safe_float(row.get("replacement_unrealized_pnl"))
+            for row in open_replacements
+        ),
+        "avg_open_replacement_return_pct": (
+            sum(open_returns) / len(open_returns) if open_returns else None
+        ),
+        "replacement_entries_detail": replacements[-20:],
     }
 
 
@@ -235,13 +450,6 @@ def build_trade_attribution(trade_log: list[dict]) -> list[dict]:
 
     open_lots: dict[str, list[dict]] = {}
     closed: list[dict] = []
-
-    def _trade_time(rec: dict) -> datetime:
-        raw = rec.get("fill_date") or rec.get("date") or rec.get("time")
-        try:
-            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
-        except Exception:
-            return datetime.min
 
     for rec in sorted(trade_log, key=_trade_time):
         action = str(rec.get("action", "")).upper()
@@ -436,6 +644,19 @@ def summarize_performance_attribution(portfolio) -> dict:
         theme_slot["open_positions"] = int(theme_slot.get("open_positions", 0)) + 1
         theme_slot["open_value"] = _safe_float(theme_slot.get("open_value")) + value
         theme_slot["unrealized_pnl"] = _safe_float(theme_slot.get("unrealized_pnl")) + unrealized
+        theme_slot["open_return_pct_sum"] = _safe_float(
+            theme_slot.get("open_return_pct_sum")
+        ) + ((last_price - avg_cost) / avg_cost if avg_cost > 0 else 0.0)
+        theme_slot["open_holding_days_sum"] = _safe_float(
+            theme_slot.get("open_holding_days_sum")
+        ) + _safe_float(pos.get("days_held"))
+        theme_slot["weak_open_positions"] = int(
+            theme_slot.get("weak_open_positions", 0)
+        ) + (1 if unrealized < 0 else 0)
+        tickers = list(theme_slot.get("open_tickers") or [])
+        if ticker not in tickers:
+            tickers.append(ticker)
+        theme_slot["open_tickers"] = tickers
 
         price_bucket = low_price_bucket(last_price)
         bucket_slot = by_price_bucket.setdefault(
@@ -453,6 +674,15 @@ def summarize_performance_attribution(portfolio) -> dict:
         bucket_slot["open_positions"] = int(bucket_slot.get("open_positions", 0)) + 1
         bucket_slot["open_value"] = _safe_float(bucket_slot.get("open_value")) + value
         bucket_slot["unrealized_pnl"] = _safe_float(bucket_slot.get("unrealized_pnl")) + unrealized
+        bucket_slot["open_return_pct_sum"] = _safe_float(
+            bucket_slot.get("open_return_pct_sum")
+        ) + ((last_price - avg_cost) / avg_cost if avg_cost > 0 else 0.0)
+        bucket_slot["open_holding_days_sum"] = _safe_float(
+            bucket_slot.get("open_holding_days_sum")
+        ) + _safe_float(pos.get("days_held"))
+        bucket_slot["weak_open_positions"] = int(
+            bucket_slot.get("weak_open_positions", 0)
+        ) + (1 if unrealized < 0 else 0)
 
     def _finalize_group(rows: dict[str, dict[str, Any]], sort_key: str) -> list[dict]:
         finalized = []
@@ -460,20 +690,41 @@ def summarize_performance_attribution(portfolio) -> dict:
             closed_count = int(item.get("closed_trades", 0) or 0)
             wins_count = int(item.get("wins", 0) or 0)
             stop_count = int(item.get("stop_loss_exits", 0) or 0)
+            open_count = int(item.get("open_positions", 0) or 0)
+            open_cost = _safe_float(item.get("open_value")) - _safe_float(
+                item.get("unrealized_pnl")
+            )
             item["win_rate"] = wins_count / closed_count if closed_count else None
             item["stop_out_rate"] = stop_count / closed_count if closed_count else None
             item["avg_return_pct"] = (
                 _safe_float(item.get("return_pct_sum")) / closed_count
                 if closed_count else None
             )
+            item["avg_open_return_pct"] = (
+                _safe_float(item.get("open_return_pct_sum")) / open_count
+                if open_count else None
+            )
+            item["avg_open_holding_days"] = (
+                _safe_float(item.get("open_holding_days_sum")) / open_count
+                if open_count else None
+            )
+            item["open_unrealized_return_pct"] = (
+                _safe_float(item.get("unrealized_pnl")) / open_cost
+                if open_cost > 0 else None
+            )
             item["total_pnl"] = (
                 _safe_float(item.get("realized_net_pnl"))
                 + _safe_float(item.get("unrealized_pnl"))
             )
             item.pop("return_pct_sum", None)
+            item.pop("open_return_pct_sum", None)
+            item.pop("open_holding_days_sum", None)
             item.pop("wins", None)
             finalized.append(item)
         return sorted(finalized, key=lambda item: _safe_float(item.get(sort_key)), reverse=True)
+
+    price_sanity = summarize_price_sanity(portfolio)
+    redeployment = summarize_redeployment_quality(portfolio)
 
     return {
         "generated_at": datetime.now().isoformat(),
@@ -497,6 +748,8 @@ def summarize_performance_attribution(portfolio) -> dict:
             key=lambda item: item["realized_net_pnl"],
             reverse=True,
         ),
+        "price_sanity": price_sanity,
+        "redeployment_quality": redeployment,
         "closed_trade_sample": closed[-20:],
     }
 

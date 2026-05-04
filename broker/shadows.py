@@ -631,12 +631,15 @@ def run_shadow_cycle(
     checkpoint_path: str | None = None,
     config_path: str = "broker.config",
     allow_promotion: bool = False,
+    validation_top_n: int = VALIDATION_TOP_N,
+    validation_replay_years: int = 1,
 ) -> bool:
     """
     One shadow cycle — called from Broker.py after the live cycle.
 
     Daily:  fast-score all 1000 genomes (~seconds)
-    Weekly: full replay validation of top 20, then evolve population
+    Weekly: full replay validation of the top validation_top_n genomes, then
+        evolve population.
 
     allow_promotion: if False (default), winning genomes are logged as
         advisory recommendations but NOT written to broker.config.
@@ -672,7 +675,12 @@ def run_shadow_cycle(
 
     if days_since_val >= 7 or force_revalidation:
         population = validate_top_genomes(
-            population, df_features, price_lookup, resolved_checkpoint
+            population,
+            df_features,
+            price_lookup,
+            resolved_checkpoint,
+            top_n=max(1, int(validation_top_n)),
+            replay_years=max(1, int(validation_replay_years)),
         )
         if allow_promotion:
             population, promoted = _maybe_promote(

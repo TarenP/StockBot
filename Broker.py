@@ -230,6 +230,8 @@ if __name__ == "__main__":
                 live_config     = config,
                 checkpoint_path = config.get("rl_checkpoint_path"),
                 allow_promotion = getattr(args, "approve_promotion", False),
+                validation_top_n = int(config.get("shadow_validation_top_n", 6)),
+                validation_replay_years = int(config.get("shadow_replay_years", 1)),
             )
 
             # Reload config — shadows may have promoted new parameters
