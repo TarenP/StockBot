@@ -20,6 +20,7 @@ Usage:
 """
 
 import logging
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import MethodType
@@ -1132,6 +1133,8 @@ def run_sensitivity(
     current live config. Shows whether results are robust or knife-edge.
     """
     from pipeline.benchmark import compute_metrics
+    from broker.paper_diagnostics import summarize_low_price_signal_suppression
+    global _LAST_REPLAY_SCORE_AUDIT
 
     base = _replay_kwargs_from_live_config(live_config)
     strategy = strategy or _resolve_replay_strategy(live_config)
@@ -1188,7 +1191,8 @@ def run_sensitivity(
             continue
         seen.add(key)
 
-        rets, _ = run_replay(
+        _LAST_REPLAY_SCORE_AUDIT = pd.DataFrame()
+        rets, trade_log = run_replay(
             df_features,
             price_lookup,
             strategy=strategy,
@@ -1198,6 +1202,11 @@ def run_sensitivity(
             **params,
         )
         m = compute_metrics(rets, label)
+        policy_metrics = _summarize_replay_control_metrics(
+            trade_log,
+            globals().get("_LAST_REPLAY_SCORE_AUDIT", pd.DataFrame()),
+            summarize_low_price_signal_suppression,
+        )
         rows.append({
             "params":       label,
             "total_return": m["total_return"],
@@ -1205,9 +1214,96 @@ def run_sensitivity(
             "sharpe":       m["sharpe"],
             "max_drawdown": m["max_drawdown"],
             "win_rate":     m["win_rate"],
+            **policy_metrics,
         })
 
     return pd.DataFrame(rows)
+
+
+def _summarize_replay_control_metrics(
+    trade_log: list[dict],
+    score_audit: pd.DataFrame | None,
+    low_price_summary_fn,
+) -> dict:
+    low_price = low_price_summary_fn(trade_log)
+    weak_reentries = 0
+    weak_reentry_themes: set[str] = set()
+    for rec in trade_log or []:
+        if str(rec.get("action", "")).upper() != "BUY":
+            continue
+        reason = str(rec.get("reason", "") or "")
+        if "WeakSleeve=" not in reason:
+            continue
+        weak_reentries += 1
+        match = re.search(r"(?:^|\|\s*)Theme=([^|]+)", reason)
+        if match:
+            weak_reentry_themes.add(match.group(1).split()[0].strip())
+
+    metrics = {
+        "weak_sleeve_reentry_count": weak_reentries,
+        "weak_sleeve_reentry_theme_count": len(weak_reentry_themes),
+        "tokenized_high_rank_low_price_count": int(
+            low_price.get("tokenized_high_rank_low_price_entries", 0) or 0
+        ),
+        "high_rank_low_price_count": int(
+            low_price.get("high_rank_low_price_entries", 0) or 0
+        ),
+        "low_price_tokenized_rate": low_price.get("tokenized_high_rank_low_price_rate"),
+    }
+
+    if not isinstance(score_audit, pd.DataFrame) or score_audit.empty:
+        metrics.update({
+            "avg_top_theme_concentration": np.nan,
+            "max_top_theme_concentration": np.nan,
+            "avg_low_price_exposure": np.nan,
+            "max_low_price_exposure": np.nan,
+            "weak_sleeve_selected_count": 0,
+        })
+        return metrics
+
+    selected = score_audit[
+        score_audit.get("candidate_status", pd.Series(index=score_audit.index)).eq("buy_selected")
+    ].copy()
+    if selected.empty:
+        metrics.update({
+            "avg_top_theme_concentration": 0.0,
+            "max_top_theme_concentration": 0.0,
+            "avg_low_price_exposure": 0.0,
+            "max_low_price_exposure": 0.0,
+            "weak_sleeve_selected_count": 0,
+        })
+        return metrics
+
+    theme_concentrations = []
+    low_price_exposures = []
+    for _cycle_date, group in selected.groupby("cycle_date", dropna=False):
+        weights = group.get("final_weight", pd.Series(index=group.index, dtype=float)).astype(float)
+        if "theme_bucket" in group:
+            theme_weights = group.assign(_weight=weights).groupby("theme_bucket")["_weight"].sum()
+            theme_concentrations.append(float(theme_weights.max()) if not theme_weights.empty else 0.0)
+        low_mask = group.get("low_price_bucket", pd.Series(index=group.index)).isin({"sub_5", "5_to_10"})
+        low_price_exposures.append(float(weights[low_mask].sum()))
+
+    weak_impact = selected.get(
+        "weak_sleeve_cap_impact",
+        pd.Series(0.0, index=selected.index, dtype=float),
+    ).astype(float)
+    metrics.update({
+        "avg_top_theme_concentration": (
+            float(np.mean(theme_concentrations)) if theme_concentrations else 0.0
+        ),
+        "max_top_theme_concentration": (
+            float(np.max(theme_concentrations)) if theme_concentrations else 0.0
+        ),
+        "avg_low_price_exposure": (
+            float(np.mean(low_price_exposures)) if low_price_exposures else 0.0
+        ),
+        "max_low_price_exposure": (
+            float(np.max(low_price_exposures)) if low_price_exposures else 0.0
+        ),
+        "weak_sleeve_selected_count": int((weak_impact > 1e-9).sum()),
+    })
+    return metrics
 
 
 # ── Friction regime reporting ─────────────────────────────────────────────────

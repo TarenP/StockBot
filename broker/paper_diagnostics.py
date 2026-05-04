@@ -270,6 +270,12 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
     replacements: list[dict[str, Any]] = []
     replacement_trade_ids: set[int] = set()
     latest_buy_reason: dict[str, str] = {}
+    exits_by_ticker: dict[str, list[dict[str, Any]]] = {}
+    for rec in trade_log:
+        action = str(rec.get("action", "")).upper()
+        if action not in {"SELL", "SELL_PARTIAL"}:
+            continue
+        exits_by_ticker.setdefault(str(rec.get("ticker", "")).upper(), []).append(rec)
 
     for rec in trade_log:
         action = str(rec.get("action", "")).upper()
@@ -319,6 +325,21 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
             pos = positions.get(ticker, {})
             avg_cost = _safe_float(pos.get("avg_cost"), _safe_float(rec.get("price")))
             last_price = _safe_float(pos.get("last_price"), avg_cost)
+            replacement_exit = next(
+                (
+                    exit_rec for exit_rec in exits_by_ticker.get(ticker, [])
+                    if _trade_time(exit_rec) > when
+                ),
+                None,
+            )
+            replacement_realized_pnl = (
+                _safe_float(replacement_exit.get("realized_pnl"), default=np.nan)
+                if replacement_exit else np.nan
+            )
+            replacement_holding_days = (
+                (_trade_time(replacement_exit) - when).days
+                if replacement_exit else None
+            )
             replacements.append(
                 {
                     "source_exit_ticker": loss["ticker"],
@@ -344,6 +365,20 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
                         (last_price - avg_cost) * _safe_float(pos.get("shares"))
                         if ticker in positions else None
                     ),
+                    "replacement_closed": replacement_exit is not None,
+                    "replacement_exit_reason_class": (
+                        _classify_exit_reason(str(replacement_exit.get("reason", "") or ""))
+                        if replacement_exit else None
+                    ),
+                    "replacement_realized_pnl": (
+                        replacement_realized_pnl
+                        if np.isfinite(replacement_realized_pnl) else None
+                    ),
+                    "replacement_closed_win": (
+                        replacement_realized_pnl > 0
+                        if np.isfinite(replacement_realized_pnl) else None
+                    ),
+                    "replacement_holding_days": replacement_holding_days,
                 }
             )
             replacement_trade_ids.add(id(rec))
@@ -383,20 +418,44 @@ def summarize_redeployment_quality(portfolio, redeploy_window_days: int = 7) -> 
             key = str(row.get(field) or "unknown")
             slot = groups.setdefault(
                 key,
-                {"bucket": key, "sample_size": 0, "open_entries": 0, "open_return_sum": 0.0},
+                {
+                    "bucket": key,
+                    "sample_size": 0,
+                    "open_entries": 0,
+                    "closed_entries": 0,
+                    "wins": 0,
+                    "stop_outs": 0,
+                    "holding_days_sum": 0.0,
+                    "open_return_sum": 0.0,
+                },
             )
             slot["sample_size"] += 1
             if row.get("replacement_open") and row.get("replacement_return_pct") is not None:
                 slot["open_entries"] += 1
                 slot["open_return_sum"] += _safe_float(row.get("replacement_return_pct"))
+            if row.get("replacement_closed"):
+                slot["closed_entries"] += 1
+                if row.get("replacement_closed_win"):
+                    slot["wins"] += 1
+                if row.get("replacement_exit_reason_class") == "stop_loss":
+                    slot["stop_outs"] += 1
+                if row.get("replacement_holding_days") is not None:
+                    slot["holding_days_sum"] += _safe_float(row.get("replacement_holding_days"))
         out = []
         for slot in groups.values():
             open_entries = int(slot["open_entries"])
+            closed_entries = int(slot["closed_entries"])
             slot["avg_open_return_pct"] = (
                 slot["open_return_sum"] / open_entries if open_entries else None
             )
+            slot["win_rate"] = slot["wins"] / closed_entries if closed_entries else None
+            slot["stop_out_rate"] = slot["stop_outs"] / closed_entries if closed_entries else None
+            slot["avg_holding_days"] = (
+                slot["holding_days_sum"] / closed_entries if closed_entries else None
+            )
             slot["small_sample"] = int(slot["sample_size"]) < 10
             slot.pop("open_return_sum", None)
+            slot.pop("holding_days_sum", None)
             out.append(slot)
         return sorted(out, key=lambda row: _safe_float(row.get("avg_open_return_pct")), reverse=True)
 

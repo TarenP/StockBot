@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 
 import broker.replay as replay_module
+from broker.paper_diagnostics import summarize_low_price_signal_suppression
 
 
 def _feature_frame():
@@ -701,7 +702,7 @@ def test_run_sensitivity_uses_rl_specific_grid(monkeypatch):
         ),
     )
 
-    replay_module.run_sensitivity(
+    result = replay_module.run_sensitivity(
         df_features=_feature_frame(),
         price_lookup=_price_lookup(),
         live_config={"rl_enabled": True},
@@ -719,6 +720,58 @@ def test_run_sensitivity_uses_rl_specific_grid(monkeypatch):
     assert "low_price=pre_penalty" in labels
     assert "min_score=0.55" not in labels
     assert "min_score=0.65" not in labels
+    assert "weak_sleeve_reentry_count" in result.columns
+    assert "tokenized_high_rank_low_price_count" in result.columns
+    assert "avg_top_theme_concentration" in result.columns
+
+
+def test_replay_control_metrics_count_weak_reentry_and_low_price_tokenization():
+    trade_log = [
+        {
+            "action": "BUY",
+            "ticker": "LOW",
+            "price": 4.0,
+            "reason": (
+                "rl_rank_pct=0.9500 | target_weight_pre_caps=0.2000 | "
+                "final_weight=0.0300 | downweight_reason=low_price_or_penny_cap | "
+                "Theme=theme_a | WeakSleeve=2/2 avg=-5.0% scale=0.50 |"
+            ),
+        }
+    ]
+    score_audit = pd.DataFrame(
+        [
+            {
+                "cycle_date": "2024-01-02",
+                "candidate_status": "buy_selected",
+                "ticker": "LOW",
+                "theme_bucket": "theme_a",
+                "low_price_bucket": "sub_5",
+                "final_weight": 0.03,
+                "weak_sleeve_cap_impact": 0.03,
+            },
+            {
+                "cycle_date": "2024-01-02",
+                "candidate_status": "buy_selected",
+                "ticker": "HIGH",
+                "theme_bucket": "theme_b",
+                "low_price_bucket": "over_10",
+                "final_weight": 0.10,
+                "weak_sleeve_cap_impact": 0.00,
+            },
+        ]
+    )
+
+    metrics = replay_module._summarize_replay_control_metrics(
+        trade_log,
+        score_audit,
+        summarize_low_price_signal_suppression,
+    )
+
+    assert metrics["weak_sleeve_reentry_count"] == 1
+    assert metrics["weak_sleeve_selected_count"] == 1
+    assert metrics["tokenized_high_rank_low_price_count"] == 1
+    assert np.isclose(metrics["max_top_theme_concentration"], 0.10)
+    assert np.isclose(metrics["max_low_price_exposure"], 0.03)
 
 
 def test_rolling_window_validation_summarizes_subperiods():

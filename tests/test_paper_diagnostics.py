@@ -378,6 +378,29 @@ def test_redeployment_quality_tracks_stop_loss_recycling():
     assert np.isclose(report["avg_open_replacement_return_pct"], 0.10)
     assert report["scoreboard_by_replacement_theme"][0]["bucket"] == "sector_technology"
     assert report["scoreboard_by_source_exit_reason"][0]["bucket"] == "stop_loss"
+    assert report["scoreboard_by_replacement_theme"][0]["open_entries"] == 1
+    assert report["scoreboard_by_replacement_theme"][0]["closed_entries"] == 0
+
+
+def test_redeployment_scoreboard_tracks_closed_replacement_outcomes():
+    portfolio = _portfolio()
+    assert portfolio.buy("BAD", 10.0, 100.0, "entry | Theme=theme_a |")
+    portfolio.trade_log[-1]["time"] = "2026-04-01T10:00:00"
+    assert portfolio.sell_all("BAD", 80.0, "Stop-loss")
+    portfolio.trade_log[-1]["time"] = "2026-04-02T10:00:00"
+    assert portfolio.buy("GOOD", 5.0, 100.0, "entry | Theme=theme_b |")
+    portfolio.trade_log[-1]["time"] = "2026-04-03T10:00:00"
+    assert portfolio.sell_all("GOOD", 110.0, "Take-profit")
+    portfolio.trade_log[-1]["time"] = "2026-04-06T10:00:00"
+
+    report = summarize_redeployment_quality(portfolio)
+    by_theme = {row["bucket"]: row for row in report["scoreboard_by_replacement_theme"]}
+
+    assert by_theme["theme_b"]["closed_entries"] == 1
+    assert by_theme["theme_b"]["wins"] == 1
+    assert by_theme["theme_b"]["win_rate"] == 1.0
+    assert by_theme["theme_b"]["stop_out_rate"] == 0.0
+    assert by_theme["theme_b"]["avg_holding_days"] == 3.0
 
 
 def test_low_price_signal_suppression_quantifies_tokenized_top_rank_names():
