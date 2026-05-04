@@ -837,8 +837,123 @@ def test_build_policy_review_report_groups_outcome_mechanism_confidence():
     assert "current_config (base)" in set(review["variant"])
     assert "outcome_rank_score" in review.columns
     assert "mechanism_rank_score" in review.columns
+    assert "confidence_penalty" in review.columns
+    assert "decision_status" in review.columns
+    assert "ranking_formula" in summary
+    assert summary["decision_thresholds"]["small_sample_penalty"] > 0
     assert summary["families"]["weak_sleeve"]["rows"] == 2
     assert summary["families"]["low_price"]["small_sample_rows"] == 2
+
+
+def test_policy_review_confidence_prevents_small_sample_leader_from_dominating():
+    sensitivity = pd.DataFrame(
+        [
+            {
+                "params": "current_config (base)",
+                "total_return": 0.05,
+                "sharpe": 0.8,
+                "max_drawdown": -0.10,
+                "win_rate": 0.50,
+                "weak_sleeve_reentry_count": 0,
+                "weak_sleeve_reentry_theme_count": 0,
+                "weak_sleeve_selected_count": 0,
+                "tokenized_high_rank_low_price_count": 1,
+                "high_rank_low_price_count": 20,
+                "low_price_tokenized_rate": 0.05,
+                "avg_top_theme_concentration": 0.30,
+                "max_top_theme_concentration": 0.35,
+                "avg_low_price_exposure": 0.04,
+                "max_low_price_exposure": 0.05,
+            },
+            {
+                "params": "low_price=pre_penalty",
+                "total_return": 0.50,
+                "sharpe": 2.5,
+                "max_drawdown": -0.02,
+                "win_rate": 0.75,
+                "weak_sleeve_reentry_count": 0,
+                "weak_sleeve_reentry_theme_count": 0,
+                "weak_sleeve_selected_count": 0,
+                "tokenized_high_rank_low_price_count": 0,
+                "high_rank_low_price_count": 1,
+                "low_price_tokenized_rate": 0.0,
+                "avg_top_theme_concentration": 0.30,
+                "max_top_theme_concentration": 0.35,
+                "avg_low_price_exposure": 0.02,
+                "max_low_price_exposure": 0.03,
+            },
+        ]
+    )
+
+    review, summary = replay_module.build_policy_review_report(sensitivity)
+    low_price_rows = review[review["family"].eq("low_price")]
+    leader = low_price_rows.sort_values("family_rank").iloc[0]
+    small_sample = low_price_rows[low_price_rows["params"].eq("low_price=pre_penalty")].iloc[0]
+
+    assert leader["params"] == "current_config (base)"
+    assert small_sample["confidence_note"] == "small_sample"
+    assert small_sample["confidence_penalty"] > 0
+    assert small_sample["policy_rank_score"] < small_sample["raw_policy_rank_score"]
+    assert summary["families"]["low_price"]["leader"] == "current_config (base)"
+
+
+def test_policy_winner_stability_summarizes_repeated_windows():
+    review_1 = pd.DataFrame(
+        [
+            {
+                "family": "weak_sleeve",
+                "params": "weak_sleeve=block",
+                "family_rank": 1,
+                "policy_rank_score": 0.80,
+                "decision_status": "candidate",
+                "confidence_note": "normal_sample",
+            },
+            {
+                "family": "low_price",
+                "params": "low_price=pre_penalty",
+                "family_rank": 1,
+                "policy_rank_score": 0.70,
+                "decision_status": "test_again",
+                "confidence_note": "small_sample",
+            },
+        ]
+    )
+    review_2 = review_1.copy()
+    review_3 = pd.DataFrame(
+        [
+            {
+                "family": "weak_sleeve",
+                "params": "weak_sleeve=25%",
+                "family_rank": 1,
+                "policy_rank_score": 0.82,
+                "decision_status": "candidate",
+                "confidence_note": "normal_sample",
+            },
+            {
+                "family": "low_price",
+                "params": "low_price=pre_penalty",
+                "family_rank": 1,
+                "policy_rank_score": 0.68,
+                "decision_status": "test_again",
+                "confidence_note": "small_sample",
+            },
+        ]
+    )
+
+    stability = replay_module.summarize_policy_winner_stability(
+        {"w1": review_1, "w2": review_2, "w3": review_3}
+    )
+    by_family_winner = {
+        (row["family"], row["winner"]): row
+        for row in stability.to_dict(orient="records")
+    }
+
+    weak_block = by_family_winner[("weak_sleeve", "weak_sleeve=block")]
+    low_price = by_family_winner[("low_price", "low_price=pre_penalty")]
+    assert weak_block["winner_windows"] == 2
+    assert np.isclose(weak_block["winner_rate"], 2 / 3)
+    assert weak_block["stability_note"] == "stable_candidate"
+    assert low_price["stability_note"] == "stable_but_small_sample"
 
 
 def test_rolling_window_validation_summarizes_subperiods():

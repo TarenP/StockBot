@@ -38,6 +38,11 @@ _REPLAY_MIN_PRICE = 0.01
 _REPLAY_SPLIT_RATIO_THRESHOLD = 2.0
 _REPLAY_CORP_ACTION_LOOKBACK = 20
 _LAST_REPLAY_SCORE_AUDIT = pd.DataFrame()
+POLICY_REVIEW_OUTCOME_WEIGHT = 0.65
+POLICY_REVIEW_MECHANISM_WEIGHT = 0.35
+POLICY_REVIEW_SMALL_SAMPLE_PENALTY = 0.15
+POLICY_REVIEW_MIN_LEADER_EDGE = 0.05
+POLICY_REVIEW_MIN_MECHANISM_SCORE = 0.50
 
 POLICY_REVIEW_COLUMNS = [
     "family",
@@ -58,10 +63,14 @@ POLICY_REVIEW_COLUMNS = [
     "mechanism_max_low_price_exposure",
     "confidence_high_rank_low_price_count",
     "confidence_note",
+    "confidence_penalty",
     "outcome_rank_score",
     "mechanism_rank_score",
+    "raw_policy_rank_score",
     "policy_rank_score",
     "family_rank",
+    "decision_status",
+    "decision_reason",
 ]
 
 
@@ -1431,9 +1440,13 @@ def build_policy_review_report(sensitivity_df: pd.DataFrame) -> tuple[pd.DataFra
 
     review["outcome_rank_score"] = np.nan
     review["mechanism_rank_score"] = np.nan
+    review["raw_policy_rank_score"] = np.nan
     review["policy_rank_score"] = np.nan
     review["family_rank"] = np.nan
     review["confidence_note"] = "normal_sample"
+    review["confidence_penalty"] = 0.0
+    review["decision_status"] = "review"
+    review["decision_reason"] = "ranked for comparison"
 
     for family, idx in review.groupby("family").groups.items():
         subset = review.loc[idx]
@@ -1478,15 +1491,64 @@ def build_policy_review_report(sensitivity_df: pd.DataFrame) -> tuple[pd.DataFra
             pd.concat(mechanism_parts, axis=1).mean(axis=1)
             if mechanism_parts else pd.Series(np.nan, index=subset.index)
         )
-        policy_score = (
-            0.65 * outcome_score + 0.35 * mechanism_score.fillna(outcome_score)
+        raw_policy_score = (
+            POLICY_REVIEW_OUTCOME_WEIGHT * outcome_score
+            + POLICY_REVIEW_MECHANISM_WEIGHT * mechanism_score.fillna(outcome_score)
         )
+        confidence_note = review.loc[idx, "confidence_note"]
+        confidence_penalty = pd.Series(0.0, index=subset.index)
+        confidence_penalty.loc[confidence_note.eq("small_sample")] = (
+            POLICY_REVIEW_SMALL_SAMPLE_PENALTY
+        )
+        policy_score = (raw_policy_score - confidence_penalty).clip(lower=0.0)
+        normal_scores = policy_score.loc[~confidence_note.eq("small_sample")]
+        if not normal_scores.empty:
+            confidence_cap = max(float(normal_scores.max()) - 1e-6, 0.0)
+            policy_score.loc[confidence_note.eq("small_sample")] = np.minimum(
+                policy_score.loc[confidence_note.eq("small_sample")],
+                confidence_cap,
+            )
         ranks = policy_score.rank(method="first", ascending=False)
 
         review.loc[idx, "outcome_rank_score"] = outcome_score
         review.loc[idx, "mechanism_rank_score"] = mechanism_score
+        review.loc[idx, "raw_policy_rank_score"] = raw_policy_score
+        review.loc[idx, "confidence_penalty"] = confidence_penalty
         review.loc[idx, "policy_rank_score"] = policy_score
         review.loc[idx, "family_rank"] = ranks
+
+    for family, idx in review.groupby("family").groups.items():
+        if family not in {"weak_sleeve", "low_price"}:
+            continue
+        group = review.loc[idx].copy()
+        baseline_rows = group[group["variant"].eq("current_config (base)")]
+        baseline_score = (
+            float(baseline_rows.iloc[0]["policy_rank_score"])
+            if not baseline_rows.empty else None
+        )
+        leader_idx = group.sort_values("family_rank").index[0]
+        leader = review.loc[leader_idx]
+        leader_score = float(leader.get("policy_rank_score", 0.0) or 0.0)
+        mechanism_score = float(leader.get("mechanism_rank_score", np.nan))
+        confidence_note = str(leader.get("confidence_note", "normal_sample"))
+        score_edge = (
+            leader_score - baseline_score
+            if baseline_score is not None else np.nan
+        )
+        if confidence_note == "small_sample":
+            status = "test_again"
+            reason = "family leader is small-sample; repeat on more windows before adopting"
+        elif np.isfinite(mechanism_score) and mechanism_score < POLICY_REVIEW_MIN_MECHANISM_SCORE:
+            status = "reject_mechanism"
+            reason = "family leader lacks enough mechanism improvement"
+        elif baseline_score is not None and np.isfinite(score_edge) and score_edge < POLICY_REVIEW_MIN_LEADER_EDGE:
+            status = "keep_current"
+            reason = "leader does not beat current config by the required policy-score edge"
+        else:
+            status = "candidate"
+            reason = "leader clears outcome, mechanism, and confidence checks"
+        review.loc[leader_idx, "decision_status"] = status
+        review.loc[leader_idx, "decision_reason"] = reason
 
     review = review[POLICY_REVIEW_COLUMNS].sort_values(["family", "family_rank", "params"])
     summary = {
@@ -1498,8 +1560,44 @@ def build_policy_review_report(sensitivity_df: pd.DataFrame) -> tuple[pd.DataFra
             else "normal_sample"
         ),
         "ranking_policy": (
-            "65% outcome score and 35% mechanism score within each family; "
-            "small-sample flags are carried separately."
+            f"{POLICY_REVIEW_OUTCOME_WEIGHT:.0%} outcome score and "
+            f"{POLICY_REVIEW_MECHANISM_WEIGHT:.0%} mechanism score within each family; "
+            f"small-sample rows receive a {POLICY_REVIEW_SMALL_SAMPLE_PENALTY:.2f} "
+            "policy-score penalty."
+        ),
+        "ranking_formula": {
+            "outcome_score": "mean percentile rank of total_return, sharpe, and max_drawdown",
+            "weak_sleeve_mechanism_score": (
+                "mean percentile rank favoring fewer weak re-entries, fewer weak themes, "
+                "fewer weak-sleeve selections, and lower max theme concentration"
+            ),
+            "low_price_mechanism_score": (
+                "mean percentile rank favoring fewer tokenized high-rank low-price entries, "
+                "lower tokenized rate, and lower max low-price exposure"
+            ),
+            "raw_policy_rank_score": (
+                f"{POLICY_REVIEW_OUTCOME_WEIGHT:.2f} * outcome_score + "
+                f"{POLICY_REVIEW_MECHANISM_WEIGHT:.2f} * mechanism_score"
+            ),
+            "policy_rank_score": (
+                "raw_policy_rank_score minus confidence_penalty; small-sample rows cannot "
+                "rank above the best normal-sample row in the same family"
+            ),
+        },
+        "decision_thresholds": {
+            "small_sample_penalty": POLICY_REVIEW_SMALL_SAMPLE_PENALTY,
+            "min_leader_edge_vs_current": POLICY_REVIEW_MIN_LEADER_EDGE,
+            "min_mechanism_score_for_candidate": POLICY_REVIEW_MIN_MECHANISM_SCORE,
+        },
+        "standard_review_packet": [
+            "*_sensitivity.csv",
+            "*_policy_review.csv",
+            "*_policy_review.json",
+            "paper diagnostics replacement_scoreboards",
+        ],
+        "window_guidance": (
+            "Treat one-window family_rank as provisional; compare leaders across repeated "
+            "identical replay windows before changing live policy."
         ),
     }
     for family, group in review.groupby("family"):
@@ -1507,10 +1605,94 @@ def build_policy_review_report(sensitivity_df: pd.DataFrame) -> tuple[pd.DataFra
         summary["families"][family] = {
             "leader": str(leader["params"]),
             "leader_policy_rank_score": _json_float(leader.get("policy_rank_score")),
+            "leader_raw_policy_rank_score": _json_float(leader.get("raw_policy_rank_score")),
+            "leader_confidence_penalty": _json_float(leader.get("confidence_penalty")),
+            "leader_decision_status": str(leader.get("decision_status")),
+            "leader_decision_reason": str(leader.get("decision_reason")),
             "rows": int(len(group)),
             "small_sample_rows": int(group["confidence_note"].eq("small_sample").sum()),
         }
     return review, summary
+
+
+def summarize_policy_winner_stability(policy_reviews) -> pd.DataFrame:
+    """
+    Summarize family winners across repeated policy-review windows.
+
+    Pass either a list of policy-review DataFrames or a dict of
+    {window_label: policy_review_df}. A winner is the family_rank==1 row within
+    each family/window. The output is intentionally small so it can sit beside
+    the standard review packet.
+    """
+    if isinstance(policy_reviews, dict):
+        items = list(policy_reviews.items())
+    else:
+        items = [(f"window_{i + 1}", review) for i, review in enumerate(policy_reviews or [])]
+
+    winner_rows = []
+    family_windows: dict[str, set[str]] = {}
+    for window_label, review in items:
+        if not isinstance(review, pd.DataFrame) or review.empty:
+            continue
+        for family, group in review.groupby("family"):
+            if family not in {"weak_sleeve", "low_price"}:
+                continue
+            family_windows.setdefault(str(family), set()).add(str(window_label))
+            ranked = group.sort_values(["family_rank", "policy_rank_score"], ascending=[True, False])
+            leader = ranked.iloc[0]
+            winner_rows.append(
+                {
+                    "family": str(family),
+                    "winner": str(leader.get("params")),
+                    "window": str(window_label),
+                    "decision_status": str(leader.get("decision_status", "review")),
+                    "confidence_note": str(leader.get("confidence_note", "normal_sample")),
+                }
+            )
+
+    if not winner_rows:
+        return pd.DataFrame(
+            columns=[
+                "family",
+                "winner",
+                "winner_windows",
+                "total_windows",
+                "winner_rate",
+                "small_sample_windows",
+                "candidate_windows",
+                "stability_note",
+            ]
+        )
+
+    winners = pd.DataFrame(winner_rows)
+    out = []
+    for (family, winner), group in winners.groupby(["family", "winner"]):
+        total_windows = len(family_windows.get(str(family), set()))
+        winner_windows = int(len(group))
+        winner_rate = winner_windows / total_windows if total_windows else 0.0
+        small_sample_windows = int(group["confidence_note"].eq("small_sample").sum())
+        candidate_windows = int(group["decision_status"].eq("candidate").sum())
+        if total_windows < 3:
+            stability_note = "too_few_windows"
+        elif winner_rate >= 0.60 and small_sample_windows == 0:
+            stability_note = "stable_candidate"
+        elif winner_rate >= 0.60:
+            stability_note = "stable_but_small_sample"
+        else:
+            stability_note = "unstable"
+        out.append(
+            {
+                "family": family,
+                "winner": winner,
+                "winner_windows": winner_windows,
+                "total_windows": total_windows,
+                "winner_rate": winner_rate,
+                "small_sample_windows": small_sample_windows,
+                "candidate_windows": candidate_windows,
+                "stability_note": stability_note,
+            }
+        )
+    return pd.DataFrame(out).sort_values(["family", "winner_rate"], ascending=[True, False])
 
 
 def _json_float(value) -> float | None:
