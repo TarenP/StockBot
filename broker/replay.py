@@ -86,6 +86,20 @@ POLICY_REVIEW_COLUMNS = [
     "decision_reason",
 ]
 
+POLICY_FAMILY_VARIANTS = {
+    "weak_sleeve": [
+        ("weak_sleeve=50%", {"weak_theme_penalty_mult": 0.50, "weak_theme_cooldown_cycles": 0}),
+        ("weak_sleeve=25%", {"weak_theme_penalty_mult": 0.25, "weak_theme_cooldown_cycles": 0}),
+        ("weak_sleeve=block", {"weak_theme_penalty_mult": 0.0, "weak_theme_cooldown_cycles": 0}),
+        ("weak_sleeve=cooldown2", {"weak_theme_cooldown_cycles": 2}),
+    ],
+    "low_price": [
+        ("low_price=late_cap", {"low_price_rank_policy": "late_cap"}),
+        ("low_price=pre_penalty", {"low_price_rank_policy": "pre_penalty"}),
+        ("low_price=exclude_high_rank", {"low_price_rank_policy": "exclude_high_rank"}),
+    ],
+}
+
 
 # ── Historical research stub ──────────────────────────────────────────────────
 
@@ -1267,6 +1281,338 @@ def run_sensitivity(
         })
 
     return pd.DataFrame(rows)
+
+
+def _policy_family_scenarios(base: dict, family: str) -> list[dict]:
+    if family not in POLICY_FAMILY_VARIANTS:
+        raise ValueError(f"Unknown policy family: {family}")
+    scenarios = [{**base, "label": "current_config (base)"}]
+    for label, overrides in POLICY_FAMILY_VARIANTS[family]:
+        scenarios.append({**base, **overrides, "label": label})
+    return scenarios
+
+
+def _date_level_values(index) -> pd.DatetimeIndex:
+    if isinstance(index, pd.MultiIndex):
+        return pd.DatetimeIndex(index.get_level_values("date")).unique().sort_values()
+    return pd.DatetimeIndex(index).unique().sort_values()
+
+
+def build_policy_replay_windows(
+    dates,
+    *,
+    n_windows: int = 5,
+    window_years: int = 1,
+    step_months: int = 3,
+) -> list[dict]:
+    """
+    Build fixed rolling replay windows for policy-family selection.
+
+    Defaults match the runbook: five 1-year windows stepped quarterly. If the
+    available history is shorter, windows are clipped to the available date
+    range but still share identical start/end dates across variants.
+    """
+    date_index = pd.DatetimeIndex(dates).dropna().unique().sort_values()
+    if date_index.empty:
+        return []
+    n_windows = max(1, int(n_windows))
+    window_years = max(1, int(window_years))
+    step_months = max(1, int(step_months))
+    last_date = pd.Timestamp(date_index.max())
+    first_date = pd.Timestamp(date_index.min())
+    out = []
+    for i in range(n_windows):
+        end = last_date - pd.DateOffset(months=step_months * (n_windows - i - 1))
+        end_candidates = date_index[date_index <= end]
+        if end_candidates.empty:
+            continue
+        end = pd.Timestamp(end_candidates.max())
+        start_target = end - pd.DateOffset(years=window_years)
+        start_candidates = date_index[date_index >= max(start_target, first_date)]
+        if start_candidates.empty:
+            continue
+        start = pd.Timestamp(start_candidates.min())
+        out.append(
+            {
+                "label": f"window_{chr(ord('A') + len(out))}",
+                "start": start,
+                "end": end,
+                "trading_days": int(((date_index >= start) & (date_index <= end)).sum()),
+            }
+        )
+    return out
+
+
+def _slice_replay_window(df_features: pd.DataFrame, price_lookup: pd.DataFrame, start, end):
+    start = pd.Timestamp(start)
+    end = pd.Timestamp(end)
+    feature_dates = pd.DatetimeIndex(df_features.index.get_level_values("date"))
+    price_dates = pd.DatetimeIndex(price_lookup.index.get_level_values("date"))
+    df_window = df_features.loc[(feature_dates >= start) & (feature_dates <= end)]
+    price_window = price_lookup.loc[(price_dates >= start) & (price_dates <= end)]
+    return df_window, price_window
+
+
+def run_policy_family_sensitivity(
+    df_features: pd.DataFrame,
+    price_lookup: pd.DataFrame,
+    *,
+    family: str,
+    initial_cash: float = 10_000.0,
+    live_config: dict | None = None,
+    strategy: str | None = None,
+    checkpoint_path: str | None = None,
+) -> pd.DataFrame:
+    """
+    Run only one policy family against the current config.
+
+    This is the runbook-safe alternative to the broad sensitivity sweep: no
+    unrelated stops, exits, spreads, or risk knobs are changed.
+    """
+    from pipeline.benchmark import compute_metrics
+    from broker.paper_diagnostics import summarize_low_price_signal_suppression
+    global _LAST_REPLAY_SCORE_AUDIT
+
+    base = _replay_kwargs_from_live_config(live_config)
+    resolved_strategy = strategy or _resolve_replay_strategy(live_config)
+    scenarios = _policy_family_scenarios(base, family)
+    rows = []
+    for scenario in scenarios:
+        params = dict(scenario)
+        label = params.pop("label")
+        _LAST_REPLAY_SCORE_AUDIT = pd.DataFrame()
+        rets, trade_log = run_replay(
+            df_features,
+            price_lookup,
+            strategy=resolved_strategy,
+            checkpoint_path=checkpoint_path,
+            initial_cash=initial_cash,
+            label=label,
+            **params,
+        )
+        metrics = compute_metrics(rets, label)
+        policy_metrics = _summarize_replay_control_metrics(
+            trade_log,
+            globals().get("_LAST_REPLAY_SCORE_AUDIT", pd.DataFrame()),
+            summarize_low_price_signal_suppression,
+        )
+        rows.append(
+            {
+                "params": label,
+                "family": family,
+                "total_return": metrics["total_return"],
+                "ann_return": metrics["ann_return"],
+                "sharpe": metrics["sharpe"],
+                "max_drawdown": metrics["max_drawdown"],
+                "win_rate": metrics["win_rate"],
+                "trade_count": len(trade_log),
+                **policy_metrics,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _aggregate_policy_sensitivity(sensitivity_by_window: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    frames = []
+    for window_label, df in sensitivity_by_window.items():
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            frames.append(df.assign(window=str(window_label)))
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    numeric_cols = [
+        col for col in combined.columns
+        if col not in {"params", "family", "window"}
+        and pd.api.types.is_numeric_dtype(combined[col])
+    ]
+    grouped = combined.groupby("params", dropna=False)
+    out = grouped[numeric_cols].mean().reset_index()
+    families = grouped["family"].first().reset_index()
+    out = out.merge(families, on="params", how="left")
+    return out
+
+
+def summarize_policy_family_matrix(
+    policy_reviews: dict[str, pd.DataFrame],
+    sensitivity_by_window: dict[str, pd.DataFrame],
+    stability_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Produce the runbook summary table: wins, average outcome/mechanism metrics,
+    and final decision for each family variant.
+    """
+    aggregate = _aggregate_policy_sensitivity(sensitivity_by_window)
+    if aggregate.empty:
+        return pd.DataFrame(
+            columns=[
+                "variant",
+                "wins",
+                "total_windows",
+                "avg_policy_rank_score",
+                "avg_return",
+                "avg_mdd",
+                "avg_turnover",
+                "key_mechanism_change",
+                "decision",
+            ]
+        )
+    final_review, _summary = build_policy_review_report(aggregate, stability_df=stability_df)
+    review_rows = []
+    for _window, review in policy_reviews.items():
+        if isinstance(review, pd.DataFrame) and not review.empty:
+            review_rows.append(review.assign(window=_window))
+    review_all = pd.concat(review_rows, ignore_index=True) if review_rows else pd.DataFrame()
+    stability_lookup = {
+        str(row.get("winner")): row
+        for row in (stability_df.to_dict(orient="records") if isinstance(stability_df, pd.DataFrame) else [])
+    }
+    rows = []
+    for _, row in final_review.iterrows():
+        variant = str(row["params"])
+        variant_reviews = (
+            review_all[review_all["params"].eq(variant)]
+            if not review_all.empty else pd.DataFrame()
+        )
+        wins = int(stability_lookup.get(variant, {}).get("winner_windows", 0) or 0)
+        total_windows = int(stability_lookup.get(variant, {}).get("total_windows", 0) or 0)
+        rows.append(
+            {
+                "variant": variant,
+                "wins": wins,
+                "total_windows": total_windows,
+                "avg_policy_rank_score": (
+                    float(variant_reviews["policy_rank_score"].mean())
+                    if not variant_reviews.empty else _json_float(row.get("policy_rank_score"))
+                ),
+                "avg_return": _json_float(row.get("outcome_total_return")),
+                "avg_mdd": _json_float(row.get("outcome_max_drawdown")),
+                "avg_turnover": _json_float(row.get("outcome_turnover")),
+                "key_mechanism_change": _mechanism_change_label(row),
+                "decision": str(row.get("decision_status")),
+                "decision_reason": str(row.get("decision_reason")),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["decision", "avg_policy_rank_score"], ascending=[True, False])
+
+
+def _mechanism_change_label(row: pd.Series) -> str:
+    family = str(row.get("family"))
+    if family == "weak_sleeve":
+        return (
+            f"weak selections={_json_float(row.get('mechanism_weak_selected_count'))}, "
+            f"weak reentries={_json_float(row.get('mechanism_weak_reentry_count'))}, "
+            f"max theme={_json_float(row.get('mechanism_max_top_theme_concentration'))}"
+        )
+    if family == "low_price":
+        return (
+            f"tokenized={_json_float(row.get('mechanism_tokenized_high_rank_low_price_count'))}, "
+            f"token rate={_json_float(row.get('mechanism_low_price_tokenized_rate'))}, "
+            f"max low-price={_json_float(row.get('mechanism_max_low_price_exposure'))}"
+        )
+    return "general sensitivity"
+
+
+def run_policy_family_matrix(
+    df_features: pd.DataFrame,
+    price_lookup: pd.DataFrame,
+    *,
+    family: str,
+    n_windows: int = 5,
+    window_years: int = 1,
+    step_months: int = 3,
+    initial_cash: float = 10_000.0,
+    live_config: dict | None = None,
+    strategy: str | None = None,
+    checkpoint_path: str | None = None,
+    output_root: str | Path | None = None,
+) -> dict:
+    """
+    Execute the policy-selection runbook for one family.
+
+    The function intentionally isolates one policy family at a time. It runs
+    every variant over the same repeated windows, builds per-window policy
+    reviews, computes winner stability, then rebuilds an aggregate review with
+    promotion gates enabled.
+    """
+    if family not in POLICY_FAMILY_VARIANTS:
+        raise ValueError(f"Unknown policy family: {family}")
+    windows = build_policy_replay_windows(
+        _date_level_values(df_features.index),
+        n_windows=n_windows,
+        window_years=window_years,
+        step_months=step_months,
+    )
+    sensitivity_by_window: dict[str, pd.DataFrame] = {}
+    reviews_by_window: dict[str, pd.DataFrame] = {}
+    review_summaries_by_window: dict[str, dict] = {}
+    out_root = Path(output_root) if output_root is not None else None
+
+    for window in windows:
+        label = str(window["label"])
+        df_window, price_window = _slice_replay_window(
+            df_features,
+            price_lookup,
+            window["start"],
+            window["end"],
+        )
+        sensitivity = run_policy_family_sensitivity(
+            df_window,
+            price_window,
+            family=family,
+            initial_cash=initial_cash,
+            live_config=live_config,
+            strategy=strategy,
+            checkpoint_path=checkpoint_path,
+        )
+        review, summary = build_policy_review_report(sensitivity)
+        sensitivity_by_window[label] = sensitivity
+        reviews_by_window[label] = review
+        review_summaries_by_window[label] = summary
+
+        if out_root is not None:
+            window_dir = out_root / family / label
+            window_dir.mkdir(parents=True, exist_ok=True)
+            sensitivity.to_csv(window_dir / "sensitivity.csv", index=False)
+            review.to_csv(window_dir / "policy_review.csv", index=False)
+            (window_dir / "policy_review.json").write_text(
+                json.dumps(summary, indent=2, sort_keys=True)
+            )
+
+    stability = summarize_policy_winner_stability(reviews_by_window)
+    aggregate_sensitivity = _aggregate_policy_sensitivity(sensitivity_by_window)
+    aggregate_review, aggregate_summary = build_policy_review_report(
+        aggregate_sensitivity,
+        stability_df=stability,
+    )
+    summary_table = summarize_policy_family_matrix(
+        reviews_by_window,
+        sensitivity_by_window,
+        stability,
+    )
+
+    if out_root is not None:
+        family_dir = out_root / family
+        family_dir.mkdir(parents=True, exist_ok=True)
+        stability.to_csv(family_dir / "winner_stability.csv", index=False)
+        aggregate_sensitivity.to_csv(family_dir / "aggregate_sensitivity.csv", index=False)
+        aggregate_review.to_csv(family_dir / "aggregate_policy_review.csv", index=False)
+        summary_table.to_csv(family_dir / "summary_table.csv", index=False)
+        (family_dir / "aggregate_policy_review.json").write_text(
+            json.dumps(aggregate_summary, indent=2, sort_keys=True)
+        )
+
+    return {
+        "family": family,
+        "windows": windows,
+        "sensitivity_by_window": sensitivity_by_window,
+        "policy_reviews_by_window": reviews_by_window,
+        "policy_review_summaries_by_window": review_summaries_by_window,
+        "winner_stability": stability,
+        "aggregate_sensitivity": aggregate_sensitivity,
+        "aggregate_policy_review": aggregate_review,
+        "aggregate_policy_review_summary": aggregate_summary,
+        "summary_table": summary_table,
+    }
 
 
 def _summarize_replay_control_metrics(

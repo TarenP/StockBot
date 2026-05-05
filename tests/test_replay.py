@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 from uuid import uuid4
 
@@ -1101,6 +1102,120 @@ def test_append_policy_promotion_history_records_rollback_context():
     assert record["leader_decision_status"] == "promote"
     assert record["override"] is False
     path.unlink(missing_ok=True)
+
+
+def test_policy_replay_windows_are_fixed_and_labeled():
+    dates = pd.date_range("2024-01-01", periods=420, freq="B")
+
+    windows = replay_module.build_policy_replay_windows(
+        dates,
+        n_windows=3,
+        window_years=1,
+        step_months=3,
+    )
+
+    assert [window["label"] for window in windows] == ["window_A", "window_B", "window_C"]
+    assert all(window["start"] <= window["end"] for window in windows)
+    assert windows[0]["end"] < windows[-1]["end"]
+
+
+def test_policy_family_sensitivity_isolates_one_family(monkeypatch):
+    labels = []
+
+    def fake_run_replay(*args, label=None, **kwargs):
+        labels.append(label)
+        return np.array([0.01, 0.0], dtype=float), []
+
+    monkeypatch.setattr(replay_module, "run_replay", fake_run_replay)
+
+    result = replay_module.run_policy_family_sensitivity(
+        _feature_frame(),
+        _price_lookup(),
+        family="low_price",
+        live_config={"rl_enabled": False},
+        strategy="screener_heuristics",
+    )
+
+    assert "current_config (base)" in labels
+    assert "low_price=late_cap" in labels
+    assert "low_price=pre_penalty" in labels
+    assert "low_price=exclude_high_rank" in labels
+    assert not any(str(label).startswith("weak_sleeve=") for label in labels)
+    assert set(result["family"]) == {"low_price"}
+
+
+def test_policy_family_matrix_builds_summary_and_artifacts(monkeypatch):
+    def fake_family_sensitivity(df_features, price_lookup, *, family, **kwargs):
+        return pd.DataFrame(
+            [
+                {
+                    "params": "current_config (base)",
+                    "family": family,
+                    "total_return": 0.05,
+                    "ann_return": 0.05,
+                    "sharpe": 0.8,
+                    "max_drawdown": -0.10,
+                    "win_rate": 0.50,
+                    "trade_count": 20,
+                    "weak_sleeve_reentry_count": 12,
+                    "weak_sleeve_reentry_theme_count": 3,
+                    "weak_sleeve_selected_count": 12,
+                    "tokenized_high_rank_low_price_count": 0,
+                    "high_rank_low_price_count": 20,
+                    "low_price_tokenized_rate": 0.0,
+                    "avg_top_theme_concentration": 0.35,
+                    "max_top_theme_concentration": 0.45,
+                    "avg_low_price_exposure": 0.04,
+                    "max_low_price_exposure": 0.05,
+                },
+                {
+                    "params": "weak_sleeve=25%",
+                    "family": family,
+                    "total_return": 0.12,
+                    "ann_return": 0.12,
+                    "sharpe": 1.2,
+                    "max_drawdown": -0.09,
+                    "win_rate": 0.57,
+                    "trade_count": 22,
+                    "weak_sleeve_reentry_count": 0,
+                    "weak_sleeve_reentry_theme_count": 0,
+                    "weak_sleeve_selected_count": 10,
+                    "tokenized_high_rank_low_price_count": 0,
+                    "high_rank_low_price_count": 20,
+                    "low_price_tokenized_rate": 0.0,
+                    "avg_top_theme_concentration": 0.25,
+                    "max_top_theme_concentration": 0.30,
+                    "avg_low_price_exposure": 0.04,
+                    "max_low_price_exposure": 0.05,
+                },
+            ]
+        )
+
+    monkeypatch.setattr(replay_module, "run_policy_family_sensitivity", fake_family_sensitivity)
+    out_root = Path("tests/_tmp") / f"policy_matrix_{uuid4().hex}"
+    dates = pd.date_range("2023-01-02", periods=420, freq="B")
+    tickers = ["AAA", "BBB"]
+    index = pd.MultiIndex.from_product([dates, tickers], names=["date", "ticker"])
+    df_features = pd.DataFrame({"ret_1d": 0.0}, index=index)
+    price_lookup = pd.DataFrame({"close": 10.0, "volume": 1_000_000.0}, index=index)
+
+    result = replay_module.run_policy_family_matrix(
+        df_features,
+        price_lookup,
+        family="weak_sleeve",
+        n_windows=3,
+        output_root=out_root,
+        live_config={"rl_enabled": False},
+        strategy="screener_heuristics",
+    )
+
+    assert result["family"] == "weak_sleeve"
+    assert len(result["windows"]) == 3
+    assert not result["winner_stability"].empty
+    assert not result["summary_table"].empty
+    assert (out_root / "weak_sleeve" / "aggregate_policy_review.csv").exists()
+    assert (out_root / "weak_sleeve" / "summary_table.csv").exists()
+    shutil.rmtree(out_root, ignore_errors=True)
 
 
 def test_rolling_window_validation_summarizes_subperiods():
