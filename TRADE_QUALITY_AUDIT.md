@@ -7,6 +7,72 @@ Good structure, real controls, still leaving obvious edge on the table.
 
 ---
 
+## Policy Selection Workflow Update (2026-05-04)
+
+The policy-selection runbook is now executable through the replay matrix layer.
+Use it before changing broker defaults for the two active policy families:
+
+- `weak_sleeve`: `weak_sleeve=50%`, `weak_sleeve=25%`, `weak_sleeve=block`, `weak_sleeve=cooldown2`
+- `low_price`: `low_price=late_cap`, `low_price=pre_penalty`, `low_price=exclude_high_rank`
+
+### Operating rule
+
+Test one family at a time. Run the weak-sleeve matrix first, freeze or hold its
+outcome, then run the low-price matrix with that weak-sleeve outcome fixed. Do
+not mix exit-stack changes, new signal families, sentiment changes, or
+execution-cost changes into the same first-pass comparison.
+
+### Standard replay setup
+
+Use five rolling one-year windows stepped quarterly where runtime allows. The
+minimum acceptable short run is three windows: early, middle, recent. Every
+variant inside a family must use the exact same windows.
+
+The matrix runner writes:
+
+- per-window `sensitivity.csv`
+- per-window `policy_review.csv`
+- per-window `policy_review.json`
+- `window_manifest.csv` and `window_manifest.json`
+- `winner_stability.csv`
+- `aggregate_sensitivity.csv`
+- `aggregate_policy_review.csv`
+- `aggregate_policy_review.json`
+- `summary_table.csv`
+
+### Promotion standard
+
+A policy may replace the current default only if it clears all promotion gates:
+
+- `family_rank == 1`
+- minimum incumbent edge
+- mechanism-score floor
+- confidence gate with small-sample penalties applied
+- repeated-window stability
+- drawdown guardrail
+- turnover guardrail
+
+Allowed decision statuses are:
+
+- `promote`
+- `hold_for_more_evidence`
+- `reject_mechanism`
+- `reject_confidence`
+- `reject_drawdown`
+- `reject_turnover`
+- `reject_insufficient_edge`
+
+`hold_for_more_evidence` is a valid outcome. Do not lower thresholds simply to
+force a winner.
+
+### Review priority
+
+Settle the weak-sleeve and low-price defaults with replay evidence before
+adding major new feature families such as earnings reactions, macro regimes, or
+insider adjustments.
+
+---
+
 ## Changes Applied
 
 ### Config (broker.config)

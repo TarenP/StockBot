@@ -113,7 +113,12 @@ python Agent.py --mode train --folds 10
 python Broker.py
 ```
 
-After step 3, run `python Broker.py` every morning. The broker handles price updates, sentiment, and trade decisions automatically. Model finetuning, parameter optimisation, and RL mode switching also run on a schedule — but they depend on data quality. If data sources are degraded, new entries are blocked and the manifest records why. Check `logs/broker.log` after each run to see what happened.
+After step 3, run `python Broker.py` whenever you want the broker to do the
+right thing. The command is daily-idempotent: the first invocation of the day
+runs the full broker cycle, while later same-day invocations refresh prices,
+marks, diagnostics, and status without rerunning trades. Use `--force` only
+when you intentionally want to rerun today's full cycle and overwrite the
+current-day canonical outputs.
 
 ---
 
@@ -251,6 +256,16 @@ holding, validates the marks, credits known cash dividends for held shares,
 updates `broker/state/portfolio.json`, records a no-trade equity snapshot, and
 prints the refreshed status. It does not buy or sell. Add `--refresh-prices`
 when you also want it to update the broader local price cache before printing.
+
+### Force or inspect automation
+```bash
+python Broker.py --force          # rerun today's full cycle
+python Broker.py --dry-run        # show what the orchestrator would do
+python Broker.py --only-periodic  # run due registered periodic tasks only
+```
+Automation state lives in `broker/state/orchestrator_state.json`. Historical
+run metadata is written under `broker/state/runs/<run_id>/`, while the latest
+canonical outputs live under `broker/state/current/`.
 
 ### See trade history
 ```bash
@@ -527,6 +542,90 @@ Any failure logs `INVARIANT FAIL` with details.
 - `friction` — execution cost assumptions
 - `watchlist_included` — whether watchlist tickers were included
 
+### Policy-selection matrix workflow
+
+Use the policy matrix when choosing new broker defaults for one policy family at
+a time. The matrix runner is the executable version of the policy-selection
+runbook: it builds repeated rolling windows, runs every variant in one family
+over the same windows, writes per-window reviews, then writes aggregate winner
+stability and promotion-review artifacts.
+
+Do not mix policy families in the first-pass comparison. Run the weak-sleeve
+family first, freeze or hold that outcome, then run the low-price family.
+
+```python
+from broker.replay import run_policy_family_matrix
+
+weak_result = run_policy_family_matrix(
+    df_features,
+    price_lookup,
+    family="weak_sleeve",
+    n_windows=5,
+    window_years=1,
+    step_months=3,
+    output_root="experiments",
+    live_config=live_config,
+    strategy="screener_rl",
+    checkpoint_path="models/best_fold9.pt",
+)
+
+low_price_result = run_policy_family_matrix(
+    df_features,
+    price_lookup,
+    family="low_price",
+    n_windows=5,
+    window_years=1,
+    step_months=3,
+    output_root="experiments",
+    live_config=live_config,  # keep the weak-sleeve winner fixed here
+    strategy="screener_rl",
+    checkpoint_path="models/best_fold9.pt",
+)
+```
+
+Supported policy families:
+
+| Family | Variants |
+|---|---|
+| `weak_sleeve` | `weak_sleeve=50%`, `weak_sleeve=25%`, `weak_sleeve=block`, `weak_sleeve=cooldown2` |
+| `low_price` | `low_price=late_cap`, `low_price=pre_penalty`, `low_price=exclude_high_rank` |
+
+Matrix artifacts are written under `experiments/<family>/<run_id>/`:
+
+```text
+run_metadata.json
+window_manifest.csv
+window_manifest.json
+window_A/
+  sensitivity.csv
+  policy_review.csv
+  policy_review.json
+...
+winner_stability.csv
+aggregate_sensitivity.csv
+aggregate_policy_review.csv
+aggregate_policy_review.json
+summary_table.csv
+```
+
+Promotion decisions are family-local. A policy is promotable only when it clears
+the review gates: `family_rank == 1`, minimum incumbent edge, mechanism-score
+floor, confidence checks, repeated-window stability, drawdown guardrail, and
+turnover guardrail. Valid decision statuses are:
+
+- `promote`
+- `hold_for_more_evidence`
+- `reject_mechanism`
+- `reject_confidence`
+- `reject_drawdown`
+- `reject_turnover`
+- `reject_insufficient_edge`
+
+The summary table is the first review surface to inspect. It includes wins,
+winner rate, average policy score, average return, best/worst window return,
+average drawdown, best/worst window drawdown, turnover, the key mechanism
+change, decision status, and decision reason.
+
 ### RL ablation study
 ```bash
 python Agent.py --mode ablation --rl_checkpoint models/best_fold9.pt
@@ -643,12 +742,13 @@ pipeline/
 
 broker/
   broker.py                   Core broker logic + freshness gates + manifest emission
+  orchestrator.py             Smart Broker.py daily idempotency + periodic task state
   brain.py                    Decision engine (exits, sectors, buys, RL ranking)
   portfolio.py                Cash, positions, options book, P&L tracking
   analyst.py                  On-demand stock research (live price + news)
   options.py                  Options strategies, Greeks, cash-secured accounting
   risk.py                     Portfolio risk engine + startup validation
-  replay.py                   Broker replay + friction sensitivity + invariant checks
+  replay.py                   Broker replay + friction, policy matrix, promotion review
   shadows.py                  Shadow portfolio engine — evolutionary parameter search
   sectors.py                  Dynamic sector scoring and allocation
   validator.py                Data quality cross-verification (30%+ move check)
@@ -668,15 +768,20 @@ models/
 
 broker/state/                 Generated on first run — do not edit manually
   portfolio.json              Live portfolio (cash, positions, trade history)
+  orchestrator_state.json     Smart Broker.py daily/periodic task state
   journal.jsonl               Full trade log with reasoning
   equity_curve.csv            Equity over time with SPY prices
   maintenance.json            Staleness timestamps for each auto-maintenance task
   shadows.json                Shadow portfolio state and standings
   last_live_manifest.json     Most recent live cycle manifest
+  current/                    Latest canonical status, summary, manifest, trade log
+  runs/<run_id>/              Per-invocation orchestration metadata
 
 plots/                        Charts and manifests saved here
   replay_manifest.json        Replay run manifest (universe hash, checkpoint, friction)
   live_universe_snapshot.json Frozen universe snapshot for replay determinism
+experiments/                  Policy-family matrix outputs (generated)
+  <family>/<run_id>/          Window manifest, per-window reviews, aggregate summary
 logs/                         broker.log, autotuner.log, maintenance.log
 tests/                        191+ tests covering universe, replay, manifests, exits
 ```
@@ -690,6 +795,10 @@ tests/                        191+ tests covering universe, replay, manifests, e
 python Broker.py
 ```
 One command. Price updates, sentiment, and trade decisions run automatically. Finetuning and parameter optimisation run on a weekly schedule. New entries are blocked if data quality falls below configured thresholds — check `logs/broker.log` to see what ran and why.
+
+Same-day reruns are read-only status refreshes unless you pass `--force`.
+Canonical latest outputs are written under `broker/state/current/`, and each
+orchestrated invocation records metadata under `broker/state/runs/<run_id>/`.
 
 **First time only:**
 ```bash
@@ -726,6 +835,19 @@ python Agent.py --mode replay --replay_years 3
 ```
 
 The manifest records: timestamp, code version (git commit), config hash, checkpoint path, universe hash and size, benchmark availability, freshness coverage, and friction regime assumptions. Re-running with the same snapshot and checkpoint will produce the same trade log.
+
+For policy-default selection, also archive the matrix packet from
+`experiments/<family>/<run_id>/`:
+
+- `run_metadata.json`
+- `window_manifest.csv`
+- `winner_stability.csv`
+- `aggregate_policy_review.json`
+- `summary_table.csv`
+
+Treat `hold_for_more_evidence` as a valid result. A clean matrix run is not a
+promotion by itself; promotion still requires repeated-window stability,
+mechanism improvement, confidence, and drawdown/turnover guardrails.
 
 ---
 
