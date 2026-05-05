@@ -1,3 +1,7 @@
+import json
+from pathlib import Path
+from uuid import uuid4
+
 import numpy as np
 import pandas as pd
 
@@ -897,6 +901,117 @@ def test_policy_review_confidence_prevents_small_sample_leader_from_dominating()
     assert summary["families"]["low_price"]["leader"] == "current_config (base)"
 
 
+def test_policy_review_promotion_requires_stability_and_risk_gates():
+    sensitivity = pd.DataFrame(
+        [
+            {
+                "params": "current_config (base)",
+                "total_return": 0.05,
+                "sharpe": 0.8,
+                "max_drawdown": -0.10,
+                "win_rate": 0.50,
+                "trade_count": 20,
+                "weak_sleeve_reentry_count": 12,
+                "weak_sleeve_reentry_theme_count": 3,
+                "weak_sleeve_selected_count": 12,
+                "tokenized_high_rank_low_price_count": 0,
+                "high_rank_low_price_count": 20,
+                "low_price_tokenized_rate": 0.0,
+                "avg_top_theme_concentration": 0.35,
+                "max_top_theme_concentration": 0.45,
+                "avg_low_price_exposure": 0.04,
+                "max_low_price_exposure": 0.05,
+            },
+            {
+                "params": "weak_sleeve=25%",
+                "total_return": 0.12,
+                "sharpe": 1.2,
+                "max_drawdown": -0.09,
+                "win_rate": 0.57,
+                "trade_count": 22,
+                "weak_sleeve_reentry_count": 0,
+                "weak_sleeve_reentry_theme_count": 0,
+                "weak_sleeve_selected_count": 10,
+                "tokenized_high_rank_low_price_count": 0,
+                "high_rank_low_price_count": 20,
+                "low_price_tokenized_rate": 0.0,
+                "avg_top_theme_concentration": 0.25,
+                "max_top_theme_concentration": 0.30,
+                "avg_low_price_exposure": 0.04,
+                "max_low_price_exposure": 0.05,
+            },
+        ]
+    )
+    no_stability_review, no_stability_summary = replay_module.build_policy_review_report(sensitivity)
+    leader = no_stability_review[no_stability_review["family"].eq("weak_sleeve")].sort_values("family_rank").iloc[0]
+    assert leader["decision_status"] == "hold_for_more_evidence"
+    assert no_stability_summary["families"]["weak_sleeve"]["leader_stability_total_windows"] == 0
+
+    stability = pd.DataFrame(
+        [
+            {
+                "family": "weak_sleeve",
+                "winner": "weak_sleeve=25%",
+                "winner_windows": 3,
+                "total_windows": 5,
+                "winner_rate": 0.60,
+                "small_sample_windows": 0,
+                "candidate_windows": 3,
+                "stability_note": "stable_candidate",
+            }
+        ]
+    )
+    review, summary = replay_module.build_policy_review_report(sensitivity, stability_df=stability)
+    leader = review[review["family"].eq("weak_sleeve")].sort_values("family_rank").iloc[0]
+    assert leader["decision_status"] == "promote"
+    assert leader["incumbent_edge"] >= replay_module.POLICY_REVIEW_MIN_LEADER_EDGE
+    assert summary["families"]["weak_sleeve"]["leader_decision_status"] == "promote"
+
+
+def test_policy_review_rejects_drawdown_and_turnover_blowouts():
+    base = {
+        "params": "current_config (base)",
+        "total_return": 0.05,
+        "sharpe": 0.8,
+        "max_drawdown": -0.10,
+        "win_rate": 0.50,
+        "trade_count": 20,
+        "weak_sleeve_reentry_count": 12,
+        "weak_sleeve_reentry_theme_count": 3,
+        "weak_sleeve_selected_count": 12,
+        "tokenized_high_rank_low_price_count": 0,
+        "high_rank_low_price_count": 20,
+        "low_price_tokenized_rate": 0.0,
+        "avg_top_theme_concentration": 0.35,
+        "max_top_theme_concentration": 0.45,
+        "avg_low_price_exposure": 0.04,
+        "max_low_price_exposure": 0.05,
+    }
+    candidate = {
+        **base,
+        "params": "weak_sleeve=block",
+        "total_return": 0.50,
+        "sharpe": 2.5,
+        "max_drawdown": -0.30,
+        "trade_count": 22,
+        "weak_sleeve_reentry_count": 0,
+        "weak_sleeve_reentry_theme_count": 0,
+        "weak_sleeve_selected_count": 10,
+        "max_top_theme_concentration": 0.20,
+    }
+    stability = pd.DataFrame(
+        [{"family": "weak_sleeve", "winner": "weak_sleeve=block", "winner_windows": 3, "total_windows": 5}]
+    )
+    review, _summary = replay_module.build_policy_review_report(pd.DataFrame([base, candidate]), stability)
+    leader = review[review["family"].eq("weak_sleeve")].sort_values("family_rank").iloc[0]
+    assert leader["decision_status"] == "reject_drawdown"
+
+    turnover_candidate = {**candidate, "max_drawdown": -0.09, "trade_count": 60}
+    review, _summary = replay_module.build_policy_review_report(pd.DataFrame([base, turnover_candidate]), stability)
+    leader = review[review["family"].eq("weak_sleeve")].sort_values("family_rank").iloc[0]
+    assert leader["decision_status"] == "reject_turnover"
+
+
 def test_policy_winner_stability_summarizes_repeated_windows():
     review_1 = pd.DataFrame(
         [
@@ -905,7 +1020,7 @@ def test_policy_winner_stability_summarizes_repeated_windows():
                 "params": "weak_sleeve=block",
                 "family_rank": 1,
                 "policy_rank_score": 0.80,
-                "decision_status": "candidate",
+                "decision_status": "promote",
                 "confidence_note": "normal_sample",
             },
             {
@@ -913,7 +1028,7 @@ def test_policy_winner_stability_summarizes_repeated_windows():
                 "params": "low_price=pre_penalty",
                 "family_rank": 1,
                 "policy_rank_score": 0.70,
-                "decision_status": "test_again",
+                "decision_status": "reject_confidence",
                 "confidence_note": "small_sample",
             },
         ]
@@ -926,7 +1041,7 @@ def test_policy_winner_stability_summarizes_repeated_windows():
                 "params": "weak_sleeve=25%",
                 "family_rank": 1,
                 "policy_rank_score": 0.82,
-                "decision_status": "candidate",
+                "decision_status": "promote",
                 "confidence_note": "normal_sample",
             },
             {
@@ -934,7 +1049,7 @@ def test_policy_winner_stability_summarizes_repeated_windows():
                 "params": "low_price=pre_penalty",
                 "family_rank": 1,
                 "policy_rank_score": 0.68,
-                "decision_status": "test_again",
+                "decision_status": "reject_confidence",
                 "confidence_note": "small_sample",
             },
         ]
@@ -954,6 +1069,38 @@ def test_policy_winner_stability_summarizes_repeated_windows():
     assert np.isclose(weak_block["winner_rate"], 2 / 3)
     assert weak_block["stability_note"] == "stable_candidate"
     assert low_price["stability_note"] == "stable_but_small_sample"
+
+
+def test_append_policy_promotion_history_records_rollback_context():
+    path = Path("tests/_tmp") / f"promotion_history_{uuid4().hex}.jsonl"
+    summary = {
+        "families": {
+            "weak_sleeve": {
+                "leader_policy_rank_score": 0.81,
+                "leader_incumbent_edge": 0.08,
+                "leader_decision_status": "promote",
+                "leader_decision_reason": "leader clears all gates",
+                "leader_stability_winner_windows": 3,
+                "leader_stability_total_windows": 5,
+            }
+        }
+    }
+
+    replay_module.append_policy_promotion_history(
+        path,
+        family="weak_sleeve",
+        promoted_policy="weak_sleeve=25%",
+        prior_policy="weak_sleeve=50%",
+        policy_review_summary=summary,
+    )
+
+    record = json.loads(path.read_text().strip())
+    assert record["family"] == "weak_sleeve"
+    assert record["promoted_policy"] == "weak_sleeve=25%"
+    assert record["prior_policy"] == "weak_sleeve=50%"
+    assert record["leader_decision_status"] == "promote"
+    assert record["override"] is False
+    path.unlink(missing_ok=True)
 
 
 def test_rolling_window_validation_summarizes_subperiods():

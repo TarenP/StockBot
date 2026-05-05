@@ -42,7 +42,12 @@ POLICY_REVIEW_OUTCOME_WEIGHT = 0.65
 POLICY_REVIEW_MECHANISM_WEIGHT = 0.35
 POLICY_REVIEW_SMALL_SAMPLE_PENALTY = 0.15
 POLICY_REVIEW_MIN_LEADER_EDGE = 0.05
-POLICY_REVIEW_MIN_MECHANISM_SCORE = 0.50
+POLICY_REVIEW_MIN_MECHANISM_SCORE = 0.55
+POLICY_REVIEW_MAX_DRAWDOWN_DEGRADATION = 0.15
+POLICY_REVIEW_MAX_TURNOVER_DEGRADATION = 0.25
+POLICY_REVIEW_STABILITY_MIN_WINDOWS = 3
+POLICY_REVIEW_STABILITY_MIN_WIN_RATE = 0.60
+POLICY_REVIEW_STABILITY_MIN_CANDIDATE_WINDOWS = 2
 
 POLICY_REVIEW_COLUMNS = [
     "family",
@@ -52,6 +57,7 @@ POLICY_REVIEW_COLUMNS = [
     "outcome_sharpe",
     "outcome_max_drawdown",
     "outcome_win_rate",
+    "outcome_turnover",
     "mechanism_weak_reentry_count",
     "mechanism_weak_reentry_theme_count",
     "mechanism_weak_selected_count",
@@ -62,6 +68,13 @@ POLICY_REVIEW_COLUMNS = [
     "mechanism_avg_low_price_exposure",
     "mechanism_max_low_price_exposure",
     "confidence_high_rank_low_price_count",
+    "stability_winner_windows",
+    "stability_total_windows",
+    "stability_winner_rate",
+    "incumbent_policy_rank_score",
+    "incumbent_edge",
+    "drawdown_degradation",
+    "turnover_degradation",
     "confidence_note",
     "confidence_penalty",
     "outcome_rank_score",
@@ -1249,6 +1262,7 @@ def run_sensitivity(
             "sharpe":       m["sharpe"],
             "max_drawdown": m["max_drawdown"],
             "win_rate":     m["win_rate"],
+            "trade_count":   len(trade_log),
             **policy_metrics,
         })
 
@@ -1366,7 +1380,53 @@ def _policy_family(label: str) -> str:
     return "general"
 
 
-def build_policy_review_report(sensitivity_df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+def _safe_ratio(num: float, den: float) -> float:
+    try:
+        den = float(den)
+        if den == 0 or not np.isfinite(den):
+            return 0.0
+        out = float(num) / den
+    except Exception:
+        return 0.0
+    return out if np.isfinite(out) else 0.0
+
+
+def _float_or_nan(value) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        return np.nan
+    return out if np.isfinite(out) else np.nan
+
+
+def _relative_degradation(candidate: float, incumbent: float, *, lower_is_worse: bool) -> float:
+    if not (np.isfinite(candidate) and np.isfinite(incumbent)):
+        return np.nan
+    denom = max(abs(float(incumbent)), 1e-9)
+    if lower_is_worse:
+        return max(0.0, (float(incumbent) - float(candidate)) / denom)
+    return max(0.0, (float(candidate) - float(incumbent)) / denom)
+
+
+def _policy_stability_lookup(stability_df: pd.DataFrame | None) -> dict[tuple[str, str], dict]:
+    if not isinstance(stability_df, pd.DataFrame) or stability_df.empty:
+        return {}
+    out: dict[tuple[str, str], dict] = {}
+    for _, row in stability_df.iterrows():
+        key = (str(row.get("family")), str(row.get("winner")))
+        out[key] = {
+            "winner_windows": int(row.get("winner_windows", 0) or 0),
+            "total_windows": int(row.get("total_windows", 0) or 0),
+            "winner_rate": _safe_ratio(row.get("winner_windows", 0), row.get("total_windows", 0)),
+            "stability_note": str(row.get("stability_note", "")),
+        }
+    return out
+
+
+def build_policy_review_report(
+    sensitivity_df: pd.DataFrame,
+    stability_df: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, dict]:
     """
     Convert the raw sensitivity sweep into a stable experiment-review table.
 
@@ -1394,6 +1454,7 @@ def build_policy_review_report(sensitivity_df: pd.DataFrame) -> tuple[pd.DataFra
                 "outcome_sharpe": row.get("sharpe"),
                 "outcome_max_drawdown": row.get("max_drawdown"),
                 "outcome_win_rate": row.get("win_rate"),
+                "outcome_turnover": row.get("turnover", row.get("trade_count")),
                 "mechanism_weak_reentry_count": row.get("weak_sleeve_reentry_count"),
                 "mechanism_weak_reentry_theme_count": row.get("weak_sleeve_reentry_theme_count"),
                 "mechanism_weak_selected_count": row.get("weak_sleeve_selected_count"),
@@ -1406,6 +1467,13 @@ def build_policy_review_report(sensitivity_df: pd.DataFrame) -> tuple[pd.DataFra
                 "mechanism_avg_low_price_exposure": row.get("avg_low_price_exposure"),
                 "mechanism_max_low_price_exposure": row.get("max_low_price_exposure"),
                 "confidence_high_rank_low_price_count": row.get("high_rank_low_price_count"),
+                "stability_winner_windows": np.nan,
+                "stability_total_windows": np.nan,
+                "stability_winner_rate": np.nan,
+                "incumbent_policy_rank_score": np.nan,
+                "incumbent_edge": np.nan,
+                "drawdown_degradation": np.nan,
+                "turnover_degradation": np.nan,
             }
         )
 
@@ -1517,36 +1585,88 @@ def build_policy_review_report(sensitivity_df: pd.DataFrame) -> tuple[pd.DataFra
         review.loc[idx, "policy_rank_score"] = policy_score
         review.loc[idx, "family_rank"] = ranks
 
+    stability_lookup = _policy_stability_lookup(stability_df)
+
     for family, idx in review.groupby("family").groups.items():
         if family not in {"weak_sleeve", "low_price"}:
             continue
         group = review.loc[idx].copy()
         baseline_rows = group[group["variant"].eq("current_config (base)")]
-        baseline_score = (
-            float(baseline_rows.iloc[0]["policy_rank_score"])
-            if not baseline_rows.empty else None
+        baseline = baseline_rows.iloc[0] if not baseline_rows.empty else None
+        baseline_score = _float_or_nan(baseline["policy_rank_score"]) if baseline is not None else None
+        baseline_drawdown = (
+            _float_or_nan(baseline["outcome_max_drawdown"]) if baseline is not None else np.nan
+        )
+        baseline_turnover = (
+            _float_or_nan(baseline["outcome_turnover"]) if baseline is not None else np.nan
         )
         leader_idx = group.sort_values("family_rank").index[0]
         leader = review.loc[leader_idx]
-        leader_score = float(leader.get("policy_rank_score", 0.0) or 0.0)
-        mechanism_score = float(leader.get("mechanism_rank_score", np.nan))
+        leader_score = _float_or_nan(leader.get("policy_rank_score"))
+        if not np.isfinite(leader_score):
+            leader_score = 0.0
+        mechanism_score = _float_or_nan(leader.get("mechanism_rank_score"))
         confidence_note = str(leader.get("confidence_note", "normal_sample"))
         score_edge = (
             leader_score - baseline_score
             if baseline_score is not None else np.nan
         )
+        leader_drawdown = _float_or_nan(leader.get("outcome_max_drawdown"))
+        leader_turnover = _float_or_nan(leader.get("outcome_turnover"))
+        drawdown_degradation = _relative_degradation(
+            leader_drawdown,
+            baseline_drawdown,
+            lower_is_worse=True,
+        )
+        turnover_degradation = _relative_degradation(
+            leader_turnover,
+            baseline_turnover,
+            lower_is_worse=False,
+        )
+        stability = stability_lookup.get((str(family), str(leader.get("params"))), {})
+        winner_windows = int(stability.get("winner_windows", 0) or 0)
+        total_windows = int(stability.get("total_windows", 0) or 0)
+        winner_rate = _safe_ratio(winner_windows, total_windows)
+
+        review.loc[leader_idx, "incumbent_policy_rank_score"] = baseline_score
+        review.loc[leader_idx, "incumbent_edge"] = score_edge
+        review.loc[leader_idx, "drawdown_degradation"] = drawdown_degradation
+        review.loc[leader_idx, "turnover_degradation"] = turnover_degradation
+        review.loc[leader_idx, "stability_winner_windows"] = winner_windows
+        review.loc[leader_idx, "stability_total_windows"] = total_windows
+        review.loc[leader_idx, "stability_winner_rate"] = winner_rate
+
         if confidence_note == "small_sample":
-            status = "test_again"
-            reason = "family leader is small-sample; repeat on more windows before adopting"
+            status = "reject_confidence"
+            reason = "family leader is small-sample and cannot replace the default"
         elif np.isfinite(mechanism_score) and mechanism_score < POLICY_REVIEW_MIN_MECHANISM_SCORE:
             status = "reject_mechanism"
             reason = "family leader lacks enough mechanism improvement"
         elif baseline_score is not None and np.isfinite(score_edge) and score_edge < POLICY_REVIEW_MIN_LEADER_EDGE:
-            status = "keep_current"
+            status = "reject_insufficient_edge"
             reason = "leader does not beat current config by the required policy-score edge"
+        elif (
+            np.isfinite(drawdown_degradation)
+            and drawdown_degradation > POLICY_REVIEW_MAX_DRAWDOWN_DEGRADATION
+        ):
+            status = "reject_drawdown"
+            reason = "leader worsens drawdown beyond the promotion guardrail"
+        elif (
+            np.isfinite(turnover_degradation)
+            and turnover_degradation > POLICY_REVIEW_MAX_TURNOVER_DEGRADATION
+        ):
+            status = "reject_turnover"
+            reason = "leader increases turnover beyond the promotion guardrail"
+        elif (
+            total_windows < POLICY_REVIEW_STABILITY_MIN_WINDOWS
+            or winner_windows < POLICY_REVIEW_STABILITY_MIN_CANDIDATE_WINDOWS
+            or winner_rate < POLICY_REVIEW_STABILITY_MIN_WIN_RATE
+        ):
+            status = "hold_for_more_evidence"
+            reason = "leader clears single-window gates but lacks repeated-window stability"
         else:
-            status = "candidate"
-            reason = "leader clears outcome, mechanism, and confidence checks"
+            status = "promote"
+            reason = "leader clears outcome, mechanism, confidence, risk, and stability gates"
         review.loc[leader_idx, "decision_status"] = status
         review.loc[leader_idx, "decision_reason"] = reason
 
@@ -1588,7 +1708,21 @@ def build_policy_review_report(sensitivity_df: pd.DataFrame) -> tuple[pd.DataFra
             "small_sample_penalty": POLICY_REVIEW_SMALL_SAMPLE_PENALTY,
             "min_leader_edge_vs_current": POLICY_REVIEW_MIN_LEADER_EDGE,
             "min_mechanism_score_for_candidate": POLICY_REVIEW_MIN_MECHANISM_SCORE,
+            "max_drawdown_degradation": POLICY_REVIEW_MAX_DRAWDOWN_DEGRADATION,
+            "max_turnover_degradation": POLICY_REVIEW_MAX_TURNOVER_DEGRADATION,
+            "stability_min_windows": POLICY_REVIEW_STABILITY_MIN_WINDOWS,
+            "stability_min_winner_windows": POLICY_REVIEW_STABILITY_MIN_CANDIDATE_WINDOWS,
+            "stability_min_winner_rate": POLICY_REVIEW_STABILITY_MIN_WIN_RATE,
         },
+        "decision_statuses": [
+            "promote",
+            "hold_for_more_evidence",
+            "reject_mechanism",
+            "reject_confidence",
+            "reject_drawdown",
+            "reject_turnover",
+            "reject_insufficient_edge",
+        ],
         "standard_review_packet": [
             "*_sensitivity.csv",
             "*_policy_review.csv",
@@ -1607,6 +1741,12 @@ def build_policy_review_report(sensitivity_df: pd.DataFrame) -> tuple[pd.DataFra
             "leader_policy_rank_score": _json_float(leader.get("policy_rank_score")),
             "leader_raw_policy_rank_score": _json_float(leader.get("raw_policy_rank_score")),
             "leader_confidence_penalty": _json_float(leader.get("confidence_penalty")),
+            "leader_incumbent_edge": _json_float(leader.get("incumbent_edge")),
+            "leader_drawdown_degradation": _json_float(leader.get("drawdown_degradation")),
+            "leader_turnover_degradation": _json_float(leader.get("turnover_degradation")),
+            "leader_stability_winner_windows": int(leader.get("stability_winner_windows", 0) or 0),
+            "leader_stability_total_windows": int(leader.get("stability_total_windows", 0) or 0),
+            "leader_stability_winner_rate": _json_float(leader.get("stability_winner_rate")),
             "leader_decision_status": str(leader.get("decision_status")),
             "leader_decision_reason": str(leader.get("decision_reason")),
             "rows": int(len(group)),
@@ -1671,7 +1811,7 @@ def summarize_policy_winner_stability(policy_reviews) -> pd.DataFrame:
         winner_windows = int(len(group))
         winner_rate = winner_windows / total_windows if total_windows else 0.0
         small_sample_windows = int(group["confidence_note"].eq("small_sample").sum())
-        candidate_windows = int(group["decision_status"].eq("candidate").sum())
+        candidate_windows = int(group["decision_status"].isin({"promote", "hold_for_more_evidence"}).sum())
         if total_windows < 3:
             stability_note = "too_few_windows"
         elif winner_rate >= 0.60 and small_sample_windows == 0:
@@ -1693,6 +1833,44 @@ def summarize_policy_winner_stability(policy_reviews) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(out).sort_values(["family", "winner_rate"], ascending=[True, False])
+
+
+def append_policy_promotion_history(
+    path: str | Path,
+    *,
+    family: str,
+    promoted_policy: str,
+    prior_policy: str,
+    policy_review_summary: dict | None = None,
+    override_reason: str | None = None,
+) -> Path:
+    """
+    Append a rollback-friendly promotion record.
+
+    This does not change broker config. It records what would be promoted, what
+    it replaces, and why, so a later default change can be audited or reversed.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    summary = policy_review_summary or {}
+    family_summary = (summary.get("families") or {}).get(str(family), {})
+    record = {
+        "time": datetime.now().isoformat(),
+        "family": str(family),
+        "promoted_policy": str(promoted_policy),
+        "prior_policy": str(prior_policy),
+        "leader_policy_rank_score": family_summary.get("leader_policy_rank_score"),
+        "leader_incumbent_edge": family_summary.get("leader_incumbent_edge"),
+        "leader_decision_status": family_summary.get("leader_decision_status"),
+        "leader_decision_reason": family_summary.get("leader_decision_reason"),
+        "leader_stability_winner_windows": family_summary.get("leader_stability_winner_windows"),
+        "leader_stability_total_windows": family_summary.get("leader_stability_total_windows"),
+        "override": override_reason is not None,
+        "override_reason": override_reason,
+    }
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, sort_keys=True) + "\n")
+    return path
 
 
 def _json_float(value) -> float | None:
