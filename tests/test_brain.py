@@ -338,6 +338,50 @@ def test_rl_entry_floor_stays_at_configured_threshold_across_regimes():
     assert brain._effective_rl_entry_floor(3) == 0.22
 
 
+def test_soft_signal_adjustments_are_neutral_without_data_when_macro_disabled():
+    brain = BrokerBrain(
+        portfolio=_EmptyPortfolio(),
+        macro_regime_enabled=False,
+    )
+
+    rank_scale, weight_scale, notes = brain._soft_signal_adjustments(
+        {"ticker": "BBB", "composite_score": 0.80},
+        market_regime=None,
+    )
+
+    assert rank_scale == 1.0
+    assert weight_scale == 1.0
+    assert "earnings:no_data" in brain._format_soft_signal_notes(notes)
+    assert "insider:no_data" in brain._format_soft_signal_notes(notes)
+
+
+def test_soft_signal_adjustments_use_earnings_macro_and_insider_scores():
+    brain = BrokerBrain(
+        portfolio=_EmptyPortfolio(),
+        earnings_reaction_rank_strength=0.10,
+        earnings_reaction_weight_strength=0.10,
+        macro_regime_weight_strength=0.08,
+        insider_adjustment_rank_strength=0.08,
+        insider_adjustment_weight_strength=0.08,
+    )
+
+    rank_scale, weight_scale, notes = brain._soft_signal_adjustments(
+        {
+            "ticker": "BBB",
+            "composite_score": 0.80,
+            "earnings_reaction_score": 1.0,
+            "insider_signal_score": 0.5,
+        },
+        market_regime=3,
+    )
+
+    assert rank_scale > 1.0
+    assert weight_scale > 1.0 * (1.0 - brain.macro_regime_weight_strength)
+    assert notes["earnings"]["source"] == "earnings_reaction_score"
+    assert notes["macro"]["source"] == "regime_3"
+    assert notes["insider"]["source"] == "insider_signal_score"
+
+
 def test_run_cycle_allows_sector_overflow_for_strong_risk_on_candidate():
     portfolio = _EmptyPortfolio()
     brain = BrokerBrain(

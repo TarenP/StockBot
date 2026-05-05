@@ -56,6 +56,38 @@ CHUNK_SIZE   = 50   # tickers per yfinance batch request
 _DEFAULT_BENCHMARK_SYMBOLS = ["SPY"]
 
 
+def refresh_llm_sidecar_documents(
+    documents: list[dict] | None = None,
+    *,
+    store_dir: str = "broker/state/document_store",
+) -> dict:
+    """Persist raw documents for later local-LLM precompute.
+
+    This intentionally does not call Ollama. The broker/orchestrator precompute
+    task turns these raw documents into cached structured features when enabled.
+    """
+    if not documents:
+        return {"stored": 0}
+    from data_sources.document_store import DocumentStore
+
+    store = DocumentStore(store_dir)
+    stored = 0
+    for doc in documents:
+        text = str(doc.get("text", "") or "")
+        ticker = str(doc.get("ticker", "") or "").upper()
+        if not ticker or not text:
+            continue
+        store.put(
+            ticker,
+            text,
+            source_type=str(doc.get("source_type", "event")),
+            as_of_date=doc.get("as_of_date"),
+            metadata=doc.get("metadata") or {},
+        )
+        stored += 1
+    return {"stored": stored}
+
+
 def _normalize_ticker(ticker: str) -> str:
     return normalize_ticker(ticker)
 

@@ -115,6 +115,12 @@ def _parse_args():
         help="Bypass due checks for registered periodic tasks",
     )
     p.add_argument(
+        "--refresh-ai-sidecar",
+        dest="refresh_ai_sidecar",
+        action="store_true",
+        help="Precompute cached local-LLM document features before the broker cycle",
+    )
+    p.add_argument(
         "--dry-run",
         dest="dry_run",
         action="store_true",

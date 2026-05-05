@@ -1,0 +1,29 @@
+{
+  "date": "2026-05-05",
+  "source_runs": {
+    "weak_sleeve": "experiments/weak_sleeve/20260504_203045_659063",
+    "low_price": "experiments/low_price/20260504_203519_868809"
+  },
+  "decisions": {
+    "weak_sleeve": {
+      "decision": "hold_for_more_evidence",
+      "frozen_default": {
+        "weak_theme_penalty_mult": 0.5,
+        "weak_theme_cooldown_cycles": 0
+      },
+      "reason": "The aggregate leader was current_config (base), all rows were small-sample, stability was 1/5 windows, and no candidate cleared confidence or promotion gates."
+    },
+    "low_price": {
+      "decision": "hold_for_more_evidence",
+      "frozen_default": {
+        "low_price_rank_policy": "late_cap"
+      },
+      "reason": "low_price=pre_penalty won 4/5 windows mechanically, but failed confidence, had only a 0.0229 score edge versus the incumbent below the 0.05 threshold, and showed lower average return than current_config."
+    }
+  },
+  "next_layers": [
+    "earnings_reaction",
+    "macro_regime",
+    "insider_soft_adjustment"
+  ]
+}

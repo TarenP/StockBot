@@ -23,6 +23,7 @@ PORTFOLIO_HISTORY_PATH = STATE_DIR / "portfolio_history.jsonl"
 CAP_IMPACT_SUMMARY_PATH = STATE_DIR / "cap_impact_summary.json"
 PERFORMANCE_ATTRIBUTION_PATH = STATE_DIR / "performance_attribution.json"
 PARITY_REPORT_PATH = STATE_DIR / "replay_live_parity.json"
+LLM_SIDECAR_SUMMARY_PATH = STATE_DIR / "llm_sidecar_summary.json"
 
 KNOWN_PRICE_EVENTS = {
     "BKNG": [
@@ -985,6 +986,7 @@ def summarize_performance_attribution(portfolio) -> dict:
     replacement_scoreboards = standardize_replacement_scoreboards(redeployment)
     low_price_suppression = summarize_low_price_signal_suppression(trade_log)
 
+    llm_sidecar_summary = summarize_llm_sidecar_features(portfolio)
     return {
         "generated_at": datetime.now().isoformat(),
         "closed_trades": len(closed),
@@ -1011,7 +1013,36 @@ def summarize_performance_attribution(portfolio) -> dict:
         "redeployment_quality": redeployment,
         "replacement_scoreboards": replacement_scoreboards,
         "low_price_signal_suppression": low_price_suppression,
+        "llm_sidecar": llm_sidecar_summary,
         "closed_trade_sample": closed[-20:],
+    }
+
+
+def summarize_llm_sidecar_features(portfolio, cache_dir: str | Path = "broker/state/llm_cache") -> dict:
+    try:
+        from llm.feature_adapter import load_cached_sidecar_features
+    except Exception as exc:
+        return {"enabled": False, "loaded": 0, "error": str(exc)}
+
+    tickers = sorted(str(ticker).upper() for ticker in getattr(portfolio, "positions", {}).keys())
+    features = load_cached_sidecar_features(tickers, cache_dir=cache_dir)
+    trusted = {
+        ticker: payload for ticker, payload in features.items()
+        if bool(payload.get("llm_event_trusted", False))
+    }
+    thesis_counts: dict[str, int] = {}
+    risk_count = 0
+    for payload in trusted.values():
+        thesis = str(payload.get("thesis_impact", "unknown"))
+        thesis_counts[thesis] = thesis_counts.get(thesis, 0) + 1
+        risk_count += len(payload.get("top_risks") or [])
+    return {
+        "enabled": True,
+        "positions_checked": len(tickers),
+        "loaded": len(features),
+        "trusted": len(trusted),
+        "thesis_impact_counts": thesis_counts,
+        "top_risk_count": risk_count,
     }
 
 

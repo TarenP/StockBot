@@ -132,6 +132,17 @@ class BrokerBrain:
         low_price_rank_policy: str = "late_cap",
         low_price_rank_penalty_mult: float = 0.70,
         low_price_high_rank_floor: float = 0.80,
+        earnings_reaction_enabled: bool = True,
+        earnings_reaction_rank_strength: float = 0.10,
+        earnings_reaction_weight_strength: float = 0.10,
+        macro_regime_enabled: bool = True,
+        macro_regime_weight_strength: float = 0.08,
+        insider_adjustment_enabled: bool = True,
+        insider_adjustment_rank_strength: float = 0.08,
+        insider_adjustment_weight_strength: float = 0.08,
+        llm_sidecar_features: dict | None = None,
+        llm_sidecar_broker_influence: bool = False,
+        llm_sidecar_min_confidence: float = 0.65,
         avoid_earnings_days:  int   = 3,       # skip stocks within N days of earnings
         device=None,
         rl_enabled:           bool  = False,
@@ -176,6 +187,19 @@ class BrokerBrain:
         self.low_price_rank_policy = str(low_price_rank_policy or "late_cap").strip().lower()
         self.low_price_rank_penalty_mult = low_price_rank_penalty_mult
         self.low_price_high_rank_floor = low_price_high_rank_floor
+        self.earnings_reaction_enabled = bool(earnings_reaction_enabled)
+        self.earnings_reaction_rank_strength = earnings_reaction_rank_strength
+        self.earnings_reaction_weight_strength = earnings_reaction_weight_strength
+        self.macro_regime_enabled = bool(macro_regime_enabled)
+        self.macro_regime_weight_strength = macro_regime_weight_strength
+        self.insider_adjustment_enabled = bool(insider_adjustment_enabled)
+        self.insider_adjustment_rank_strength = insider_adjustment_rank_strength
+        self.insider_adjustment_weight_strength = insider_adjustment_weight_strength
+        self.llm_sidecar_features = {
+            str(k).upper(): v for k, v in (llm_sidecar_features or {}).items()
+        }
+        self.llm_sidecar_broker_influence = bool(llm_sidecar_broker_influence)
+        self.llm_sidecar_min_confidence = float(llm_sidecar_min_confidence)
         self.avoid_earnings_days  = avoid_earnings_days
         self.device               = device
         self.rl_enabled           = rl_enabled
@@ -784,12 +808,19 @@ class BrokerBrain:
                     )
                     continue
 
+                soft_rank_scale, soft_weight_scale, soft_signal_notes = self._soft_signal_adjustments(
+                    report,
+                    market_regime,
+                )
                 report["sector"] = self._sector_map.get(ticker.upper(), "Unknown")
                 report["theme_bucket"] = theme_bucket(ticker, report["sector"])
                 report["sentiment_label"] = sentiment_label
-                report["rank_score"] = raw_signal_for_rank * low_price_rank_scale
+                report["rank_score"] = raw_signal_for_rank * low_price_rank_scale * soft_rank_scale
                 report["low_price_rank_policy"] = self.low_price_rank_policy
                 report["low_price_rank_scale"] = low_price_rank_scale
+                report["soft_signal_rank_scale"] = soft_rank_scale
+                report["soft_signal_weight_scale"] = soft_weight_scale
+                report["soft_signal_notes"] = soft_signal_notes
                 if rl_score_val is not None:
                     report["rl_score"] = rl_score_val
                     report["rl_rank_pct"] = rl_score_val
@@ -822,6 +853,12 @@ class BrokerBrain:
                         "sentiment_policy": self.sentiment_policy,
                         "low_price_rank_policy": self.low_price_rank_policy,
                         "low_price_rank_scale": float(low_price_rank_scale),
+                        "soft_signal_rank_scale": float(soft_rank_scale),
+                        "soft_signal_weight_scale": float(soft_weight_scale),
+                        "soft_signal_summary": self._format_soft_signal_notes(soft_signal_notes),
+                        "llm_event_confidence": float(report.get("llm_event_confidence", 0.0) or 0.0),
+                        "llm_event_trusted": bool(report.get("llm_event_trusted", False)),
+                        "llm_thesis_impact": report.get("llm_thesis_impact", "unknown"),
                         "rank_score": float(report["rank_score"]),
                     }
                 )
@@ -1002,6 +1039,7 @@ class BrokerBrain:
                     "model_suggested_weight": model_suggested_weight,
                     "target_weight_pre_caps": target_weight_pre_caps,
                     "post_sentiment_weight": np.nan,
+                    "post_soft_signal_weight": np.nan,
                     "post_vol_weight": np.nan,
                     "post_sector_weight": np.nan,
                     "post_theme_weight": np.nan,
@@ -1017,6 +1055,11 @@ class BrokerBrain:
                 sentiment_scale = self._sentiment_weight_scale(sentiment_label)
                 alloc_value *= sentiment_scale
                 allocation_steps["post_sentiment_weight"] = (
+                    float(alloc_value / equity) if equity > 0 else np.nan
+                )
+                soft_weight_scale = float(report.get("soft_signal_weight_scale", 1.0) or 1.0)
+                alloc_value *= soft_weight_scale
+                allocation_steps["post_soft_signal_weight"] = (
                     float(alloc_value / equity) if equity > 0 else np.nan
                 )
 
@@ -1121,6 +1164,7 @@ class BrokerBrain:
                 drops = []
                 for reason_name, key in [
                     ("sentiment_policy", "post_sentiment_weight"),
+                    ("soft_signal_adjustment", "post_soft_signal_weight"),
                     ("volatility", "post_vol_weight"),
                     ("sector_cap", "post_sector_weight"),
                     ("theme_cap", "post_theme_weight"),
@@ -1147,8 +1191,12 @@ class BrokerBrain:
                     allocation_steps["post_sentiment_weight"],
                 )
                 allocation_steps["volatility_cap_impact"] = _impact(
-                    allocation_steps["post_sentiment_weight"],
+                    allocation_steps["post_soft_signal_weight"],
                     allocation_steps["post_vol_weight"],
+                )
+                allocation_steps["soft_signal_cap_impact"] = _impact(
+                    allocation_steps["post_sentiment_weight"],
+                    allocation_steps["post_soft_signal_weight"],
                 )
                 allocation_steps["sector_cap_impact"] = _impact(
                     allocation_steps["post_vol_weight"],
@@ -1186,6 +1234,10 @@ class BrokerBrain:
 
                 # Build reason
                 sent_label = sentiment_label
+                soft_note = self._format_soft_signal_notes(
+                    report.get("soft_signal_notes", {})
+                )
+                soft_reason = f" | SoftSignals={soft_note}" if soft_note else ""
                 earnings_note = ""
                 next_earnings = _get_next_earnings_date(ticker)
                 if next_earnings:
@@ -1217,7 +1269,7 @@ class BrokerBrain:
                         f"rl_mode=true | Sector={sector} "
                         f"(target={target_alloc:.0%}) | Theme={theme} | "
                         f"Sentiment={sent_label}({self.sentiment_policy},scale={sentiment_scale:.2f})"
-                        f"{earnings_note}{corr_note}{weak_note} | "
+                        f"{soft_reason}{earnings_note}{corr_note}{weak_note} | "
                         f"{'PENNY ' if is_penny else ''}"
                         f"{(report.get('headlines') or [''])[0][:50]}"
                     )
@@ -1242,7 +1294,7 @@ class BrokerBrain:
                         f"score_source=composite | Sector={sector} "
                         f"(target={target_alloc:.0%}) | Theme={theme} | "
                         f"Sentiment={sent_label}({self.sentiment_policy},scale={sentiment_scale:.2f})"
-                        f"{earnings_note}{corr_note}{weak_note} | "
+                        f"{soft_reason}{earnings_note}{corr_note}{weak_note} | "
                         f"{'PENNY ' if is_penny else ''}"
                         f"{(report.get('headlines') or [''])[0][:50]}"
                     )
@@ -1279,6 +1331,7 @@ class BrokerBrain:
                         "model_suggested_weight": allocation_steps["model_suggested_weight"],
                         "target_weight_pre_caps": allocation_steps["target_weight_pre_caps"],
                         "post_sentiment_weight": allocation_steps["post_sentiment_weight"],
+                        "post_soft_signal_weight": allocation_steps["post_soft_signal_weight"],
                         "post_vol_weight": allocation_steps["post_vol_weight"],
                         "post_sector_weight": allocation_steps["post_sector_weight"],
                         "post_theme_weight": allocation_steps["post_theme_weight"],
@@ -1293,11 +1346,20 @@ class BrokerBrain:
                         "low_price_cap": float(self.low_price_max_pct),
                         "low_price_rank_policy": self.low_price_rank_policy,
                         "low_price_rank_scale": float(report.get("low_price_rank_scale", 1.0)),
+                        "soft_signal_rank_scale": float(report.get("soft_signal_rank_scale", 1.0)),
+                        "soft_signal_weight_scale": float(report.get("soft_signal_weight_scale", 1.0)),
+                        "soft_signal_summary": self._format_soft_signal_notes(
+                            report.get("soft_signal_notes", {})
+                        ),
+                        "llm_event_confidence": float(report.get("llm_event_confidence", 0.0) or 0.0),
+                        "llm_event_trusted": bool(report.get("llm_event_trusted", False)),
+                        "llm_thesis_impact": report.get("llm_thesis_impact", "unknown"),
                         "rank_score": float(report.get("rank_score", score)),
                         "sentiment_label": sentiment_label,
                         "sentiment_policy": self.sentiment_policy,
                         "sentiment_weight_scale": float(sentiment_scale),
                         "sentiment_cap_impact": allocation_steps["sentiment_cap_impact"],
+                        "soft_signal_cap_impact": allocation_steps["soft_signal_cap_impact"],
                         "volatility_cap_impact": allocation_steps["volatility_cap_impact"],
                         "sector_cap_impact": allocation_steps["sector_cap_impact"],
                         "theme_cap_impact": allocation_steps["theme_cap_impact"],
@@ -1368,10 +1430,49 @@ class BrokerBrain:
     ) -> tuple[dict | None, bool]:
         report = research(ticker)
         if report is not None:
+            self._attach_llm_sidecar_features(ticker, report)
             return report, False
 
         fallback = research_from_features(df_features, ticker)
+        if fallback is not None:
+            self._attach_llm_sidecar_features(ticker, fallback)
         return fallback, fallback is not None
+
+    def _attach_llm_sidecar_features(self, ticker: str, report: dict) -> None:
+        features = self.llm_sidecar_features.get(str(ticker).upper())
+        if not isinstance(features, dict):
+            return
+        report["llm_sidecar"] = dict(features)
+        report["llm_event_confidence"] = float(features.get("llm_event_confidence", 0.0) or 0.0)
+        report["llm_event_trusted"] = bool(features.get("llm_event_trusted", False))
+        report["llm_guidance_direction"] = features.get("guidance_direction", "unknown")
+        report["llm_management_tone"] = features.get("management_tone", "unknown")
+        report["llm_demand_outlook"] = features.get("demand_outlook", "unknown")
+        report["llm_margin_outlook"] = features.get("margin_outlook", "unknown")
+        report["llm_thesis_impact"] = features.get("thesis_impact", "unknown")
+        report["llm_top_risks"] = list(features.get("top_risks") or [])[:5]
+        if self.llm_sidecar_broker_influence and bool(report["llm_event_trusted"]):
+            score = self._llm_sidecar_soft_score(features)
+            report["earnings_reaction_score"] = score
+
+    @staticmethod
+    def _llm_sidecar_soft_score(features: dict) -> float:
+        pos = {"positive", "strengthens"}
+        neg = {"negative", "weakens"}
+        score = 0
+        for key in (
+            "guidance_direction",
+            "management_tone",
+            "demand_outlook",
+            "margin_outlook",
+            "thesis_impact",
+        ):
+            value = str(features.get(key, "unknown")).lower()
+            if value in pos:
+                score += 1
+            elif value in neg:
+                score -= 1
+        return float(np.clip(score / 5.0, -1.0, 1.0))
 
     def _sentiment_label(self, report: dict) -> str:
         sent = report.get("sentiment", {})
@@ -1393,6 +1494,134 @@ class BrokerBrain:
         return label == "negative" and float(composite_score) < float(
             self.sentiment_veto_composite_floor
         )
+
+    @staticmethod
+    def _bounded_signal_score(value) -> float | None:
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(score):
+            return None
+        return float(np.clip(score, -1.0, 1.0))
+
+    @staticmethod
+    def _scale_from_signal(score: float | None, strength: float) -> float:
+        if score is None:
+            return 1.0
+        try:
+            strength_val = abs(float(strength))
+        except (TypeError, ValueError):
+            strength_val = 0.0
+        return float(np.clip(1.0 + float(score) * strength_val, 0.50, 1.50))
+
+    def _earnings_reaction_score(self, report: dict) -> tuple[float | None, str]:
+        for key in (
+            "earnings_reaction_score",
+            "post_earnings_reaction_score",
+            "earnings_surprise_score",
+        ):
+            score = self._bounded_signal_score(report.get(key))
+            if score is not None:
+                return score, key
+
+        surprise = report.get("earnings_surprise_pct")
+        post_return = (
+            report.get("post_earnings_return_1d")
+            if report.get("post_earnings_return_1d") is not None
+            else report.get("earnings_post_return_1d")
+        )
+        try:
+            if surprise is not None and post_return is not None:
+                surprise_score = np.tanh(float(surprise) / 0.10)
+                reaction_score = np.tanh(float(post_return) / 0.05)
+                return self._bounded_signal_score(
+                    0.5 * surprise_score + 0.5 * reaction_score
+                ), "surprise_plus_reaction"
+        except (TypeError, ValueError):
+            pass
+        return None, "no_data"
+
+    def _macro_regime_score(self, market_regime: int | None, report: dict) -> tuple[float | None, str]:
+        for key in ("macro_risk_score", "market_risk_score", "regime_risk_score"):
+            score = self._bounded_signal_score(report.get(key))
+            if score is not None:
+                return score, key
+
+        if market_regime is None:
+            return None, "no_data"
+        regime_map = {
+            0: 0.50,   # risk-on
+            1: 0.20,   # constructive/neutral
+            2: -0.10,  # choppy
+            3: -0.60,  # risk-off
+        }
+        return float(regime_map.get(int(market_regime), 0.0)), f"regime_{market_regime}"
+
+    def _insider_signal_score(self, report: dict) -> tuple[float | None, str]:
+        for key in (
+            "insider_signal_score",
+            "insider_net_buy_score",
+            "insider_cluster_score",
+            "insider_activity_score",
+        ):
+            score = self._bounded_signal_score(report.get(key))
+            if score is not None:
+                return score, key
+        return None, "no_data"
+
+    def _soft_signal_adjustments(
+        self,
+        report: dict,
+        market_regime: int | None,
+    ) -> tuple[float, float, dict]:
+        notes: dict[str, dict] = {}
+        rank_scale = 1.0
+        weight_scale = 1.0
+
+        if self.earnings_reaction_enabled:
+            score, source = self._earnings_reaction_score(report)
+            rank = self._scale_from_signal(score, self.earnings_reaction_rank_strength)
+            weight = self._scale_from_signal(score, self.earnings_reaction_weight_strength)
+            rank_scale *= rank
+            weight_scale *= weight
+            notes["earnings"] = {"score": score, "source": source, "rank": rank, "weight": weight}
+
+        if self.macro_regime_enabled:
+            score, source = self._macro_regime_score(market_regime, report)
+            weight = self._scale_from_signal(score, self.macro_regime_weight_strength)
+            weight_scale *= weight
+            notes["macro"] = {"score": score, "source": source, "rank": 1.0, "weight": weight}
+
+        if self.insider_adjustment_enabled:
+            score, source = self._insider_signal_score(report)
+            rank = self._scale_from_signal(score, self.insider_adjustment_rank_strength)
+            weight = self._scale_from_signal(score, self.insider_adjustment_weight_strength)
+            rank_scale *= rank
+            weight_scale *= weight
+            notes["insider"] = {"score": score, "source": source, "rank": rank, "weight": weight}
+
+        return (
+            float(np.clip(rank_scale, 0.50, 1.50)),
+            float(np.clip(weight_scale, 0.50, 1.50)),
+            notes,
+        )
+
+    @staticmethod
+    def _format_soft_signal_notes(notes: dict) -> str:
+        if not isinstance(notes, dict) or not notes:
+            return ""
+        parts = []
+        for name in ("earnings", "macro", "insider"):
+            detail = notes.get(name)
+            if not isinstance(detail, dict):
+                continue
+            source = str(detail.get("source", "no_data"))
+            score = detail.get("score")
+            score_label = "no_data" if score is None else f"{float(score):+.2f}"
+            weight = float(detail.get("weight", 1.0) or 1.0)
+            parts.append(f"{name}:{source}:{score_label}:w{weight:.2f}")
+        return ",".join(parts)
 
     def _theme_health_scale(self, theme: str) -> tuple[float, dict]:
         """

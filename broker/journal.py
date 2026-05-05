@@ -21,6 +21,7 @@ PORTFOLIO_HISTORY_PATH = Path("broker/state/portfolio_history.jsonl")
 CAP_IMPACT_SUMMARY_PATH = Path("broker/state/cap_impact_summary.json")
 PERFORMANCE_ATTRIBUTION_PATH = Path("broker/state/performance_attribution.json")
 PARITY_REPORT_PATH = Path("broker/state/replay_live_parity.json")
+LLM_SIDECAR_SUMMARY_PATH = Path("broker/state/llm_sidecar_summary.json")
 
 
 # ── Cycle logging ─────────────────────────────────────────────────────────────
@@ -224,6 +225,7 @@ def _print_status_snapshot(portfolio, eq: pd.DataFrame | None) -> None:
     cap_summary = _load_json_file(CAP_IMPACT_SUMMARY_PATH)
     attribution = _load_json_file(PERFORMANCE_ATTRIBUTION_PATH)
     parity = _load_json_file(PARITY_REPORT_PATH)
+    llm_sidecar = _load_json_file(LLM_SIDECAR_SUMMARY_PATH)
 
     print(f"\n  {'-'*55}")
     print("  Current Status")
@@ -336,6 +338,13 @@ def _print_status_snapshot(portfolio, eq: pd.DataFrame | None) -> None:
     if parity:
         status = "OK" if parity.get("compatible") else "CHECK"
         print(f"  Replay parity:   {status}")
+
+    if llm_sidecar:
+        print(
+            "  AI sidecar:      "
+            f"{int(llm_sidecar.get('trusted', 0) or 0)}/"
+            f"{int(llm_sidecar.get('positions_checked', 0) or 0)} trusted cached event parse(s)"
+        )
 
     command_label = os.environ.get("BROKER_DISPLAY_COMMAND", "python Broker.py --status")
     print(f"  Command:         {command_label}")

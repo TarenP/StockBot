@@ -606,6 +606,8 @@ def run_replay(
         low_price_rank_policy=low_price_rank_policy,
         low_price_rank_penalty_mult=low_price_rank_penalty_mult,
         low_price_high_rank_floor=low_price_high_rank_floor,
+        llm_sidecar_features={},
+        llm_sidecar_broker_influence=False,
         avoid_earnings_days=avoid_earnings_days,
         execution_spread=execution_spread,
         rl_phase=rl_phase,
@@ -2673,6 +2675,7 @@ def run_full_replay(
 
     try:
         from pipeline.run_manifest import get_code_version as _get_code_version
+        from pipeline.run_manifest import sidecar_manifest_status
         manifest_path = Path(save_plot).with_name(f"{Path(save_plot).stem}_manifest.json")
         cfg = live_config or {}
         payload = {
@@ -2699,6 +2702,13 @@ def run_full_replay(
                 "aligned_observations": int(len(spy_rets)) if spy_rets is not None else 0,
             },
             "friction": friction,
+            "llm_sidecar": sidecar_manifest_status(
+                enabled=bool(cfg.get("llm_sidecar_enabled", False)),
+                loaded_tickers=0,
+                broker_influence=False,
+                mode="replay_disabled",
+                replay_safe=True,
+            ),
         }
         write_run_manifest("replay", payload, output_path=manifest_path)
         logger.info("Replay run manifest saved -> %s", manifest_path)

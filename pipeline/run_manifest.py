@@ -77,6 +77,24 @@ def hash_ticker_list(tickers) -> str:
     return stable_hash(cleaned)
 
 
+def sidecar_manifest_status(
+    *,
+    enabled: bool,
+    loaded_tickers: int = 0,
+    broker_influence: bool = False,
+    mode: str = "cached_features_only",
+    replay_safe: bool = True,
+) -> dict[str, Any]:
+    return {
+        "enabled": bool(enabled),
+        "mode": str(mode),
+        "loaded_tickers": int(loaded_tickers or 0),
+        "broker_influence": bool(broker_influence),
+        "replay_safe": bool(replay_safe),
+        "hot_path_raw_llm_calls": False,
+    }
+
+
 def get_code_version() -> str:
     """Return short git commit hash, or 'unknown' if not in a git repo."""
     try:

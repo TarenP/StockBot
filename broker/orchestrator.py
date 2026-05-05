@@ -39,6 +39,7 @@ ORCHESTRATOR_STATE_FIELDS = {
     "last_shadow_validation_at": None,
     "last_replay_validation_at": None,
     "last_universe_refresh_at": None,
+    "last_llm_sidecar_run_at": None,
     "last_daily_run_id": None,
     "last_daily_output_root": None,
     "last_force_run_at": None,
@@ -64,6 +65,14 @@ TASK_REGISTRY = (
         name="maintenance",
         cadence_days=1,
         last_run_field="last_maintenance_run_at",
+        phase="pre_cycle",
+        blocking=False,
+        heavy=False,
+    ),
+    PeriodicTask(
+        name="llm_sidecar",
+        cadence_days=1,
+        last_run_field="last_llm_sidecar_run_at",
         phase="pre_cycle",
         blocking=False,
         heavy=False,
@@ -182,6 +191,8 @@ def get_due_periodic_tasks(
         if task.heavy and not include_heavy and not force:
             continue
         if bool(cfg.get(f"disable_{task.name}", False)):
+            continue
+        if task.name == "llm_sidecar" and not bool(cfg.get("enable_llm_sidecar_precompute", False)):
             continue
         if force or _days_since(state.get(task.last_run_field), now) >= task.cadence_days:
             due.append(task)
@@ -443,6 +454,35 @@ def _run_shadow_task(config: dict, args: Any) -> None:
     print(get_shadow_summary())
 
 
+def _run_llm_sidecar_task(config: dict) -> dict[str, Any]:
+    from data_sources.document_store import DocumentStore
+    from llm.feature_adapter import persist_feature_record
+    from llm.transcript_parser import parse_transcript_event
+
+    store = DocumentStore(config.get("llm_document_store_dir", "broker/state/document_store"))
+    processed = 0
+    failed = 0
+    for doc in store.iter_documents() or []:
+        try:
+            parsed = parse_transcript_event(
+                doc.get("ticker", ""),
+                doc.get("text", ""),
+                source_type=doc.get("source_type", "event"),
+                as_of_date=doc.get("as_of_date"),
+                source_id=doc.get("doc_id"),
+                max_chars=int(config.get("llm_max_document_chars", 24000)),
+            )
+            persist_feature_record(
+                parsed,
+                min_confidence=float(config.get("llm_sidecar_min_confidence", 0.65)),
+            )
+            processed += 1
+        except Exception as exc:
+            failed += 1
+            logger.warning("LLM sidecar failed for document %s: %s", doc.get("doc_id"), exc)
+    return {"processed": processed, "failed": failed}
+
+
 def run_due_periodic_tasks(
     state: dict[str, Any],
     now: datetime,
@@ -476,6 +516,12 @@ def run_due_periodic_tasks(
         if task.name == "shadow_validation" and getattr(args, "no_shadows", False):
             skipped.append(task.name)
             continue
+        if task.name == "llm_sidecar" and not (
+            bool(config.get("enable_llm_sidecar_precompute", False))
+            or bool(getattr(args, "refresh_ai_sidecar", False))
+        ):
+            skipped.append(task.name)
+            continue
         if task.name in {"policy_review", "replay_validation"} and not bool(
             config.get(f"enable_{task.name}", False)
         ):
@@ -492,6 +538,8 @@ def run_due_periodic_tasks(
                     state["last_autotune_run_at"] = _iso_now(now)
             elif task.name == "shadow_validation":
                 _run_shadow_task(config, args)
+            elif task.name == "llm_sidecar":
+                _run_llm_sidecar_task(config)
             else:
                 logger.info("Periodic task %s is registered but disabled until configured.", task.name)
                 skipped.append(task.name)
@@ -684,6 +732,36 @@ def run_only_periodic(args: Any, config: dict, state: dict[str, Any] | None = No
         save_orchestrator_state(state)
 
 
+def run_llm_sidecar_once(args: Any, config: dict, state: dict[str, Any] | None = None) -> dict[str, Any]:
+    _ = args
+    state = load_orchestrator_state() if state is None else state
+    now = now_et()
+    run_id = _run_id(now, force=True, mode="llm_sidecar")
+    state_before = json.loads(json.dumps(state, default=str))
+    executed: list[str] = []
+    skipped: list[str] = []
+    try:
+        _run_llm_sidecar_task(config)
+        state["last_llm_sidecar_run_at"] = _iso_now(now)
+        _record_task(state, "llm_sidecar", "complete", now=now, run_id=run_id)
+        executed.append("llm_sidecar")
+        return state
+    except Exception as exc:
+        _record_task(state, "llm_sidecar", "failed", now=now, reason=str(exc), run_id=run_id)
+        raise
+    finally:
+        _write_run_metadata(
+            run_id=run_id,
+            mode="llm_sidecar_only",
+            force=True,
+            tasks_executed=executed,
+            tasks_skipped=skipped,
+            state_before=state_before,
+            state_after=state,
+        )
+        save_orchestrator_state(state)
+
+
 def run_smart_broker_command(args: Any, config: dict) -> dict[str, Any]:
     state = load_orchestrator_state()
     now = now_et()
@@ -743,6 +821,10 @@ def run_smart_broker_command(args: Any, config: dict) -> dict[str, Any]:
 
     if getattr(args, "only_periodic", False):
         return run_only_periodic(args, config, state)
+
+    if getattr(args, "refresh_ai_sidecar", False) and already_ran_full_cycle_today(state, now):
+        state = run_llm_sidecar_once(args, config, state)
+        return refresh_prices_and_status_only(args, config, state, invocation_mode="same_day_status")
 
     if getattr(args, "status", False) or getattr(args, "snapshot", False):
         return refresh_prices_and_status_only(args, config, state, invocation_mode="status")

@@ -179,6 +179,10 @@ rl_min_score          = 0.0    # Phase 1: min rl_score to enter (0 = top-k only)
 - `rl_checkpoint_path = auto` always picks the checkpoint with the highest validation Sharpe, not the most recently trained one.
 - Set `freeze_universe_snapshot = true` for reproducible replay — the universe is frozen to a dated snapshot file so re-running the same replay always uses the same ticker set.
 
+- The weak-sleeve and low-price policy matrices are promotion-gated. The 2026-05-05 review held both incumbents: `weak_theme_penalty_mult = 0.50` with no cooldown, and `low_price_rank_policy = late_cap`.
+- Earnings reaction, macro regime, and insider activity enter as soft rank/size adjustments. They are auditable in buy reasons and allocation diagnostics; when underlying data is unavailable, earnings and insider adjustments stay neutral.
+- The local AI sidecar complements FinBERT for long unstructured documents. It uses SEC/FRED public data clients, local Ollama JSON extraction, and cached compact features under `broker/state/llm_cache`; live broker decisions never call the LLM directly.
+
 ### Degraded-mode behavior
 
 | Condition | New entries | Exits | Status run |
@@ -189,8 +193,42 @@ rl_min_score          = 0.0    # Phase 1: min rl_score to enter (0 = top-k only)
 | Benchmark (SPY) unavailable | Allowed | Allowed | Allowed (no relative metrics) |
 | Universe below min_broad_universe_size | Error — run aborts | — | — |
 | Risk halt (daily loss / drawdown) | Blocked | Allowed | Allowed |
+| Ollama / sidecar cache unavailable | No LLM influence | Allowed | Allowed |
 
 Each blocked condition is named in the manifest and printed to the console.
+
+### Local AI sidecar
+
+The first AI sidecar target is earnings transcript / event parsing. It extracts
+structured fields only:
+
+- `guidance_direction`
+- `management_tone`
+- `demand_outlook`
+- `margin_outlook`
+- `thesis_impact`
+- `top_risks`
+- `confidence`
+
+The sidecar is deliberately not a trader. It cannot decide buys, sells, stops,
+weights, risk gates, or policy promotion. Raw document parsing and Ollama calls
+run only in precompute/orchestration workflows, then the broker consumes cached
+JSON features. By default `llm_sidecar_broker_influence = false`, so parsed
+events appear in diagnostics and memos only. Influence can be enabled later only
+after replay validation and promotion review.
+
+Useful paths:
+
+- `broker/state/document_store/` raw local documents for precompute
+- `broker/state/llm_cache/parses/` validated structured parses
+- `broker/state/llm_cache/features/` compact broker-readable features
+- `broker/state/llm_sidecar_summary.json` current diagnostic summary
+
+Manual precompute:
+
+```bash
+python Broker.py --refresh-ai-sidecar
+```
 
 ---
 

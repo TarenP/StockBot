@@ -1,0 +1,56 @@
+{
+  "confidence_note": "small_sample_present",
+  "decision_statuses": [
+    "promote",
+    "hold_for_more_evidence",
+    "reject_mechanism",
+    "reject_confidence",
+    "reject_drawdown",
+    "reject_turnover",
+    "reject_insufficient_edge"
+  ],
+  "decision_thresholds": {
+    "max_drawdown_degradation": 0.15,
+    "max_turnover_degradation": 0.25,
+    "min_leader_edge_vs_current": 0.05,
+    "min_mechanism_score_for_candidate": 0.55,
+    "small_sample_penalty": 0.15,
+    "stability_min_windows": 3,
+    "stability_min_winner_rate": 0.6,
+    "stability_min_winner_windows": 2
+  },
+  "families": {
+    "low_price": {
+      "leader": "low_price=pre_penalty",
+      "leader_confidence_penalty": 0.15,
+      "leader_decision_reason": "family leader is small-sample and cannot replace the default",
+      "leader_decision_status": "reject_confidence",
+      "leader_drawdown_degradation": 0.0,
+      "leader_incumbent_edge": 0.022916666666666696,
+      "leader_policy_rank_score": 0.49375,
+      "leader_raw_policy_rank_score": 0.64375,
+      "leader_stability_total_windows": 5,
+      "leader_stability_winner_rate": 0.8,
+      "leader_stability_winner_windows": 4,
+      "leader_turnover_degradation": 0.0,
+      "rows": 4,
+      "small_sample_rows": 4
+    }
+  },
+  "generated_at": "2026-05-04T20:38:57.266587",
+  "ranking_formula": {
+    "low_price_mechanism_score": "mean percentile rank favoring fewer tokenized high-rank low-price entries, lower tokenized rate, and lower max low-price exposure",
+    "outcome_score": "mean percentile rank of total_return, sharpe, and max_drawdown",
+    "policy_rank_score": "raw_policy_rank_score minus confidence_penalty; small-sample rows cannot rank above the best normal-sample row in the same family",
+    "raw_policy_rank_score": "0.65 * outcome_score + 0.35 * mechanism_score",
+    "weak_sleeve_mechanism_score": "mean percentile rank favoring fewer weak re-entries, fewer weak themes, fewer weak-sleeve selections, and lower max theme concentration"
+  },
+  "ranking_policy": "65% outcome score and 35% mechanism score within each family; small-sample rows receive a 0.15 policy-score penalty.",
+  "standard_review_packet": [
+    "*_sensitivity.csv",
+    "*_policy_review.csv",
+    "*_policy_review.json",
+    "paper diagnostics replacement_scoreboards"
+  ],
+  "window_guidance": "Treat one-window family_rank as provisional; compare leaders across repeated identical replay windows before changing live policy."
+}

@@ -42,10 +42,12 @@ from broker.brain     import BrokerBrain
 from broker.risk      import PortfolioRiskEngine, validate_startup
 from broker.paper_diagnostics import (
     CAP_IMPACT_SUMMARY_PATH,
+    LLM_SIDECAR_SUMMARY_PATH,
     PARITY_REPORT_PATH,
     PERFORMANCE_ATTRIBUTION_PATH,
     build_replay_live_parity_report,
     summarize_cap_impact_history,
+    summarize_llm_sidecar_features,
     summarize_performance_attribution,
     write_json,
 )
@@ -139,6 +141,35 @@ def _paper_execution_cost(
     tiered_spread = 0.02 if is_penny else (0.005 if price < 20.0 else 0.001)
     spread = max(float(base_spread or 0.0), tiered_spread)
     return shares * price * spread, spread, f"paper_spread:{spread:.4f}"
+
+
+def _load_llm_sidecar_features_for_cycle(
+    tickers: list[str],
+    config: dict | None,
+    as_of_date: str | None = None,
+) -> tuple[dict[str, dict], dict[str, object]]:
+    cfg = config or {}
+    if not bool(cfg.get("llm_sidecar_enabled", False)):
+        return {}, {"enabled": False, "loaded_tickers": 0, "mode": "disabled"}
+    try:
+        from llm.feature_adapter import load_cached_sidecar_features
+
+        features = load_cached_sidecar_features(
+            tickers,
+            cache_dir=cfg.get("llm_cache_dir", "broker/state/llm_cache"),
+            min_confidence=float(cfg.get("llm_sidecar_min_confidence", 0.65)),
+            as_of_date=as_of_date,
+        )
+        return features, {
+            "enabled": True,
+            "mode": "cached_features_only",
+            "loaded_tickers": len(features),
+            "broker_influence": bool(cfg.get("llm_sidecar_broker_influence", False)),
+            "min_confidence": float(cfg.get("llm_sidecar_min_confidence", 0.65)),
+        }
+    except Exception as exc:
+        logger.warning("LLM sidecar feature load failed; continuing without it: %s", exc)
+        return {}, {"enabled": True, "mode": "degraded", "loaded_tickers": 0, "error": str(exc)}
 
 
 # ── One-shot cycle ────────────────────────────────────────────────────────────
@@ -252,6 +283,26 @@ def run_cycle(
         return
     freshness = summarize_price_sentiment_freshness(df, positions=portfolio.positions)
     run_manifest["freshness"] = freshness
+    latest_data_date = freshness.get("latest_data_date")
+    latest_tickers = []
+    try:
+        latest_date = df.index.get_level_values("date").max()
+        latest_tickers = [
+            str(ticker).upper()
+            for ticker in df.xs(latest_date, level="date").index.get_level_values("ticker").unique()
+        ]
+    except Exception:
+        latest_tickers = []
+    sidecar_tickers = sorted(set(latest_tickers) | {str(t).upper() for t in portfolio.positions.keys()})
+    sidecar_features, sidecar_status = _load_llm_sidecar_features_for_cycle(
+        sidecar_tickers,
+        cfg,
+        as_of_date=latest_data_date,
+    )
+    brain.llm_sidecar_features = sidecar_features
+    brain.llm_sidecar_broker_influence = bool(cfg.get("llm_sidecar_broker_influence", False))
+    brain.llm_sidecar_min_confidence = float(cfg.get("llm_sidecar_min_confidence", 0.65))
+    run_manifest["llm_sidecar"] = sidecar_status
     cfg = config or {}
     min_price_coverage = float(cfg.get("min_fresh_price_coverage", 0.90))
     min_sentiment_coverage = float(cfg.get("min_fresh_sentiment_coverage", 0.50))
@@ -428,11 +479,14 @@ def run_cycle(
         write_json(CAP_IMPACT_SUMMARY_PATH, cap_summary)
         attribution = summarize_performance_attribution(portfolio)
         write_json(PERFORMANCE_ATTRIBUTION_PATH, attribution)
+        llm_summary = summarize_llm_sidecar_features(portfolio)
+        write_json(LLM_SIDECAR_SUMMARY_PATH, llm_summary)
         parity_report = build_replay_live_parity_report(cfg, brain=brain)
         write_json(PARITY_REPORT_PATH, parity_report)
         run_manifest["diagnostics"] = {
             "cap_impact_summary_path": str(CAP_IMPACT_SUMMARY_PATH),
             "performance_attribution_path": str(PERFORMANCE_ATTRIBUTION_PATH),
+            "llm_sidecar_summary_path": str(LLM_SIDECAR_SUMMARY_PATH),
             "replay_live_parity_path": str(PARITY_REPORT_PATH),
             "replay_live_parity_compatible": parity_report.get("compatible"),
         }
@@ -516,6 +570,17 @@ def parse_args(config: dict = None):
     p.add_argument("--low_price_rank_policy", type=str, default=cfg.get("low_price_rank_policy", "late_cap"))
     p.add_argument("--low_price_rank_penalty_mult", type=float, default=cfg.get("low_price_rank_penalty_mult", 0.70))
     p.add_argument("--low_price_high_rank_floor", type=float, default=cfg.get("low_price_high_rank_floor", 0.80))
+    p.add_argument("--earnings_reaction_enabled", action="store_true", default=cfg.get("earnings_reaction_enabled", True))
+    p.add_argument("--earnings_reaction_rank_strength", type=float, default=cfg.get("earnings_reaction_rank_strength", 0.10))
+    p.add_argument("--earnings_reaction_weight_strength", type=float, default=cfg.get("earnings_reaction_weight_strength", 0.10))
+    p.add_argument("--macro_regime_enabled", action="store_true", default=cfg.get("macro_regime_enabled", True))
+    p.add_argument("--macro_regime_weight_strength", type=float, default=cfg.get("macro_regime_weight_strength", 0.08))
+    p.add_argument("--insider_adjustment_enabled", action="store_true", default=cfg.get("insider_adjustment_enabled", True))
+    p.add_argument("--insider_adjustment_rank_strength", type=float, default=cfg.get("insider_adjustment_rank_strength", 0.08))
+    p.add_argument("--insider_adjustment_weight_strength", type=float, default=cfg.get("insider_adjustment_weight_strength", 0.08))
+    p.add_argument("--llm_sidecar_enabled", action="store_true", default=cfg.get("llm_sidecar_enabled", False))
+    p.add_argument("--llm_sidecar_broker_influence", action="store_true", default=cfg.get("llm_sidecar_broker_influence", False))
+    p.add_argument("--llm_sidecar_min_confidence", type=float, default=cfg.get("llm_sidecar_min_confidence", 0.65))
     p.add_argument("--avoid_earnings", type=int,   default=cfg.get("avoid_earnings", 5))
     p.add_argument("--top_n",          type=int,   default=cfg.get("top_n",          500))
     p.add_argument("--max_daily_loss", type=float, default=cfg.get("max_daily_loss", 0.025))
@@ -556,6 +621,8 @@ def main(config: dict = None, maintenance_context: dict | None = None):
             write_json(CAP_IMPACT_SUMMARY_PATH, cap_summary)
             attribution = summarize_performance_attribution(portfolio)
             write_json(PERFORMANCE_ATTRIBUTION_PATH, attribution)
+            llm_summary = summarize_llm_sidecar_features(portfolio)
+            write_json(LLM_SIDECAR_SUMMARY_PATH, llm_summary)
         except Exception as exc:
             logger.warning("Could not update status diagnostics: %s", exc)
         print_report(portfolio)
@@ -616,6 +683,16 @@ def main(config: dict = None, maintenance_context: dict | None = None):
         low_price_rank_policy = args.low_price_rank_policy,
         low_price_rank_penalty_mult = args.low_price_rank_penalty_mult,
         low_price_high_rank_floor = args.low_price_high_rank_floor,
+        earnings_reaction_enabled = args.earnings_reaction_enabled,
+        earnings_reaction_rank_strength = args.earnings_reaction_rank_strength,
+        earnings_reaction_weight_strength = args.earnings_reaction_weight_strength,
+        macro_regime_enabled = args.macro_regime_enabled,
+        macro_regime_weight_strength = args.macro_regime_weight_strength,
+        insider_adjustment_enabled = args.insider_adjustment_enabled,
+        insider_adjustment_rank_strength = args.insider_adjustment_rank_strength,
+        insider_adjustment_weight_strength = args.insider_adjustment_weight_strength,
+        llm_sidecar_broker_influence = args.llm_sidecar_broker_influence,
+        llm_sidecar_min_confidence = args.llm_sidecar_min_confidence,
         avoid_earnings_days = args.avoid_earnings,
         device              = DEVICE,
         rl_enabled          = args.rl_enabled,
