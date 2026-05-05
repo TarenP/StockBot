@@ -551,11 +551,6 @@ def main(config: dict = None, maintenance_context: dict | None = None):
         portfolio._last_mark_to_market = portfolio.refresh_latest_holding_prices()
         portfolio._last_dividend_accrual = portfolio.accrue_dividends(_today_et())
         portfolio.save()
-        spy_price = _fetch_current_spy_price()
-        portfolio.record_snapshot(
-            spy_price=spy_price,
-            extra={"status_refresh": True},
-        )
         try:
             cap_summary = summarize_cap_impact_history(trade_log=portfolio.trade_log)
             write_json(CAP_IMPACT_SUMMARY_PATH, cap_summary)
@@ -563,7 +558,6 @@ def main(config: dict = None, maintenance_context: dict | None = None):
             write_json(PERFORMANCE_ATTRIBUTION_PATH, attribution)
         except Exception as exc:
             logger.warning("Could not update status diagnostics: %s", exc)
-        log_cycle([], portfolio.equity, portfolio.cash, spy_price=spy_price)
         print_report(portfolio)
         return
 

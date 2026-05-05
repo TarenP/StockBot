@@ -5,6 +5,7 @@ and produces full benchmark performance reports.
 
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -336,7 +337,8 @@ def _print_status_snapshot(portfolio, eq: pd.DataFrame | None) -> None:
         status = "OK" if parity.get("compatible") else "CHECK"
         print(f"  Replay parity:   {status}")
 
-    print("  Command:         python Broker.py --status")
+    command_label = os.environ.get("BROKER_DISPLAY_COMMAND", "python Broker.py --status")
+    print(f"  Command:         {command_label}")
 
 
 def print_report(portfolio, show_benchmark: bool = True):

@@ -269,10 +269,31 @@ def _temporary_argv(args: list[str]):
         sys.argv = old
 
 
-def _invoke_broker_main(config: dict, argv: list[str], maintenance_context: dict | None = None) -> None:
+@contextmanager
+def _temporary_env(name: str, value: str | None):
+    old = os.environ.get(name)
+    if value is None:
+        yield
+        return
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = old
+
+
+def _invoke_broker_main(
+    config: dict,
+    argv: list[str],
+    maintenance_context: dict | None = None,
+    display_command: str | None = None,
+) -> None:
     from broker.broker import main as broker_main
 
-    with _temporary_argv(argv):
+    with _temporary_argv(argv), _temporary_env("BROKER_DISPLAY_COMMAND", display_command):
         broker_main(config, maintenance_context=maintenance_context)
 
 
@@ -507,7 +528,12 @@ def refresh_prices_and_status_only(
             logger.warning("Status price refresh failed; using cached prices: %s", exc)
             _record_task(state, "price_refresh", "failed", now=now, reason=str(exc), run_id=run_id)
 
-    _invoke_broker_main(config, ["--status"])
+    display_command = (
+        "python Broker.py"
+        if invocation_mode == "same_day_status"
+        else "python Broker.py --status"
+    )
+    _invoke_broker_main(config, ["--status"], display_command=display_command)
     _show_shadow_summary()
     state["last_price_refresh_at"] = _iso_now(now)
     state["last_status_refresh_at"] = _iso_now(now)

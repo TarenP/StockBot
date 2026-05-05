@@ -124,6 +124,7 @@ def test_run_cycle_skips_duplicate_refresh_after_maintenance(monkeypatch):
 def test_status_command_refreshes_marks_without_accruing_cash(monkeypatch):
     portfolio = _DummyPortfolio()
     printed = {}
+    history_writes = {"snapshots": 0, "cycles": 0}
 
     class _Args:
         cash = 10_000.0
@@ -133,12 +134,25 @@ def test_status_command_refreshes_marks_without_accruing_cash(monkeypatch):
     monkeypatch.setattr(broker_module, "parse_args", lambda config=None: _Args())
     monkeypatch.setattr(broker_module, "Portfolio", lambda initial_cash=10_000.0: portfolio)
     monkeypatch.setattr(
+        portfolio,
+        "record_snapshot",
+        lambda *args, **kwargs: history_writes.__setitem__(
+            "snapshots", history_writes["snapshots"] + 1
+        ) or {},
+    )
+    monkeypatch.setattr(
         broker_module,
         "print_report",
         lambda p: printed.__setitem__("portfolio", p),
     )
     monkeypatch.setattr(broker_module, "_fetch_current_spy_price", lambda: 123.0)
-    monkeypatch.setattr(broker_module, "log_cycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        broker_module,
+        "log_cycle",
+        lambda *args, **kwargs: history_writes.__setitem__(
+            "cycles", history_writes["cycles"] + 1
+        ),
+    )
     monkeypatch.setattr(
         broker_module,
         "summarize_performance_attribution",
@@ -153,7 +167,67 @@ def test_status_command_refreshes_marks_without_accruing_cash(monkeypatch):
     assert portfolio.dividends_accrued is True
     assert portfolio.marked is True
     assert portfolio.saved is True
-    assert portfolio.snapshot_recorded is True
+    assert history_writes == {"snapshots": 0, "cycles": 0}
+    assert portfolio.snapshot_recorded is False
+
+
+def test_status_command_preserves_history_derived_metrics(monkeypatch):
+    temp_dir = Path("tests/_tmp") / f"status_history_{uuid4().hex}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    equity_path = temp_dir / "equity_curve.csv"
+    history_path = temp_dir / "portfolio_history.jsonl"
+    pd.DataFrame(
+        [
+            {"time": "2026-05-01T16:00:00", "equity": 100.0, "cash": 0.0, "spy_price": 100.0},
+            {"time": "2026-05-02T16:00:00", "equity": 110.0, "cash": 0.0, "spy_price": 101.0},
+            {"time": "2026-05-03T16:00:00", "equity": 105.0, "cash": 0.0, "spy_price": 102.0},
+        ]
+    ).to_csv(equity_path, index=False)
+    history_rows = [
+        {"time": "2026-05-02T16:00:00", "allocation_summary": {"cap_impact": {"total_cap_impact": 0.1}}},
+        {"time": "2026-05-03T16:00:00", "allocation_summary": {"cap_impact": {"total_cap_impact": 0.2}}},
+    ]
+    history_path.write_text("\n".join(json.dumps(row) for row in history_rows) + "\n")
+
+    def _metrics():
+        eq = pd.read_csv(equity_path)
+        returns = eq["equity"].pct_change(fill_method=None).dropna()
+        hist_count = sum(1 for line in history_path.read_text().splitlines() if line.strip())
+        return {
+            "equity_points": len(eq),
+            "daily_observations": len(returns),
+            "win_rate": float((returns > 0).mean()),
+            "cap_cycles": hist_count,
+        }
+
+    before = _metrics()
+    portfolio = _DummyPortfolio()
+
+    class _Args:
+        cash = 10_000.0
+        status = True
+        trades = False
+
+    def _append_snapshot(*args, **kwargs):
+        with history_path.open("a") as fh:
+            fh.write(json.dumps({"time": "2026-05-04T12:00:00", "allocation_summary": {}}) + "\n")
+
+    def _append_cycle(*args, **kwargs):
+        pd.DataFrame(
+            [{"time": "2026-05-04T12:00:00", "equity": 105.0, "cash": 0.0, "spy_price": 102.0}]
+        ).to_csv(equity_path, mode="a", header=False, index=False)
+
+    monkeypatch.setattr(broker_module, "parse_args", lambda config=None: _Args())
+    monkeypatch.setattr(broker_module, "Portfolio", lambda initial_cash=10_000.0: portfolio)
+    monkeypatch.setattr(portfolio, "record_snapshot", _append_snapshot)
+    monkeypatch.setattr(broker_module, "log_cycle", _append_cycle)
+    monkeypatch.setattr(broker_module, "print_report", lambda *args, **kwargs: None)
+    monkeypatch.setattr(broker_module, "summarize_performance_attribution", lambda portfolio: {})
+    monkeypatch.setattr(broker_module, "write_json", lambda *args, **kwargs: None)
+
+    broker_module.main({})
+
+    assert _metrics() == before
 
 
 def test_run_cycle_prints_summary_only_via_report(monkeypatch):

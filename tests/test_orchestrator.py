@@ -128,7 +128,13 @@ def test_status_refresh_writes_current_outputs_and_state(monkeypatch):
     invoked = []
     now = datetime(2026, 5, 4, 12, 0, tzinfo=ET)
 
-    monkeypatch.setattr(orch, "_invoke_broker_main", lambda config, argv: invoked.append(argv))
+    monkeypatch.setattr(
+        orch,
+        "_invoke_broker_main",
+        lambda config, argv, maintenance_context=None, display_command=None: invoked.append(
+            (argv, display_command)
+        ),
+    )
     monkeypatch.setattr(orch, "_show_shadow_summary", lambda: None)
     monkeypatch.setattr(orch, "save_orchestrator_state", lambda payload: writes.setdefault("state", payload))
     monkeypatch.setattr(
@@ -147,11 +153,36 @@ def test_status_refresh_writes_current_outputs_and_state(monkeypatch):
         now=now,
     )
 
-    assert invoked == [["--status"]]
+    assert invoked == [(["--status"], "python Broker.py")]
     assert updated["last_status_refresh_at"].startswith("2026-05-04T12:00:00")
     assert updated["last_price_refresh_at"].startswith("2026-05-04T12:00:00")
     assert writes["outputs"]["mode"] == "same_day_status"
     assert writes["outputs"]["run_id"] == "run_status"
+
+
+def test_explicit_status_refresh_uses_status_command_label(monkeypatch):
+    invoked = []
+    monkeypatch.setattr(
+        orch,
+        "_invoke_broker_main",
+        lambda config, argv, maintenance_context=None, display_command=None: invoked.append(
+            display_command
+        ),
+    )
+    monkeypatch.setattr(orch, "_show_shadow_summary", lambda: None)
+    monkeypatch.setattr(orch, "save_orchestrator_state", lambda payload: None)
+    monkeypatch.setattr(orch, "write_current_outputs", lambda **kwargs: None)
+
+    orch.refresh_prices_and_status_only(
+        SimpleNamespace(refresh_prices=False),
+        {},
+        {},
+        invocation_mode="status",
+        run_id="run_status",
+        now=datetime(2026, 5, 4, 12, 0, tzinfo=ET),
+    )
+
+    assert invoked == ["python Broker.py --status"]
 
 
 def test_write_current_outputs_keeps_canonical_files(monkeypatch):
