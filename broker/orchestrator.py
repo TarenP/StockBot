@@ -495,7 +495,7 @@ def refresh_prices_and_status_only(
     run_id: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    state = state or load_orchestrator_state()
+    state = load_orchestrator_state() if state is None else state
     now = now or now_et()
     run_id = run_id or _run_id(now, mode="status")
 
@@ -525,7 +525,7 @@ def run_full_daily_cycle(
     run_id: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    state = state or load_orchestrator_state()
+    state = load_orchestrator_state() if state is None else state
     now = now or now_et()
     run_id = run_id or _run_id(now, force=force, mode="full")
     state_before = json.loads(json.dumps(state, default=str))
@@ -556,6 +556,7 @@ def run_full_daily_cycle(
             executed.append("full_broker_cycle")
         except FileNotFoundError as exc:
             if "stooq_panel.parquet" in str(exc) or "Price data not found" in str(exc):
+                error = str(exc)
                 print("\n" + "=" * 60)
                 print("  FIRST-TIME SETUP REQUIRED")
                 print("=" * 60)
@@ -565,6 +566,10 @@ def run_full_daily_cycle(
                 print("  Takes 2-6 hours on CPU, 30-60 min on GPU.")
                 print("  After that, just run: python Broker.py")
                 print("=" * 60 + "\n")
+                state["last_failed_task"] = "full_daily_cycle"
+                state["last_failed_reason"] = error
+                _write_legacy_run_state("failed", status="failed", now=now)
+                return state
             else:
                 raise
 
@@ -619,7 +624,7 @@ def run_full_daily_cycle(
 
 
 def run_only_periodic(args: Any, config: dict, state: dict[str, Any] | None = None) -> dict[str, Any]:
-    state = state or load_orchestrator_state()
+    state = load_orchestrator_state() if state is None else state
     now = now_et()
     run_id = _run_id(now, force=bool(getattr(args, "force_periodic", False)), mode="periodic")
     state_before = json.loads(json.dumps(state, default=str))

@@ -120,3 +120,157 @@ def test_smart_command_force_runs_full_cycle(monkeypatch):
     orch.run_smart_broker_command(args, {})
 
     assert calls == [(True, state)]
+
+
+def test_status_refresh_writes_current_outputs_and_state(monkeypatch):
+    state = {}
+    writes = {}
+    invoked = []
+    now = datetime(2026, 5, 4, 12, 0, tzinfo=ET)
+
+    monkeypatch.setattr(orch, "_invoke_broker_main", lambda config, argv: invoked.append(argv))
+    monkeypatch.setattr(orch, "_show_shadow_summary", lambda: None)
+    monkeypatch.setattr(orch, "save_orchestrator_state", lambda payload: writes.setdefault("state", payload))
+    monkeypatch.setattr(
+        orch,
+        "write_current_outputs",
+        lambda **kwargs: writes.setdefault("outputs", kwargs),
+    )
+
+    args = SimpleNamespace(refresh_prices=False)
+    updated = orch.refresh_prices_and_status_only(
+        args,
+        {},
+        state,
+        invocation_mode="same_day_status",
+        run_id="run_status",
+        now=now,
+    )
+
+    assert invoked == [["--status"]]
+    assert updated["last_status_refresh_at"].startswith("2026-05-04T12:00:00")
+    assert updated["last_price_refresh_at"].startswith("2026-05-04T12:00:00")
+    assert writes["outputs"]["mode"] == "same_day_status"
+    assert writes["outputs"]["run_id"] == "run_status"
+
+
+def test_write_current_outputs_keeps_canonical_files(monkeypatch):
+    temp_dir = Path("tests/_tmp") / f"orchestrator_{uuid4().hex}"
+    current_dir = temp_dir / "current"
+    monkeypatch.setattr(orch, "CURRENT_DIR", current_dir)
+    monkeypatch.setattr(
+        orch,
+        "_portfolio_state",
+        lambda: {
+            "cash": 123.0,
+            "positions": {"AAA": {"shares": 1}},
+            "last_saved": "2026-05-04T12:00:00",
+            "trade_log": [{"time": "2026-05-04T10:00:00", "ticker": "AAA"}],
+        },
+    )
+
+    orch.write_current_outputs(
+        state={"last_full_broker_run_date": "2026-05-04"},
+        run_id="run_1",
+        mode="full_cycle",
+        force=True,
+        now=datetime(2026, 5, 4, 12, 0, tzinfo=ET),
+    )
+
+    assert (current_dir / "latest_status.json").exists()
+    assert (current_dir / "today_summary.json").exists()
+    assert (current_dir / "today_trade_log.json").exists()
+    assert '"run_id": "run_1"' in (current_dir / "latest_status.json").read_text()
+
+
+def test_full_cycle_writes_metadata_and_marks_complete(monkeypatch):
+    now = datetime(2026, 5, 4, 12, 0, tzinfo=ET)
+    state = {}
+    metadata = {}
+    legacy = []
+    temp_dir = Path("tests/_tmp") / f"orchestrator_{uuid4().hex}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(orch, "_ensure_no_live_duplicate", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orch,
+        "_write_legacy_run_state",
+        lambda stage, status="running", now=None: legacy.append((stage, status)),
+    )
+    monkeypatch.setattr(
+        orch,
+        "run_due_periodic_tasks",
+        lambda state, now, config, args, phase, run_id, include_heavy=False, force=False: (
+            state,
+            [f"{phase}_task"],
+            [],
+            {"prices_updated": "2026-05-04"} if phase == "pre_cycle" else None,
+        ),
+    )
+    monkeypatch.setattr(orch, "_invoke_broker_main", lambda config, argv, maintenance_context=None: None)
+    monkeypatch.setattr(orch, "write_current_outputs", lambda **kwargs: None)
+    monkeypatch.setattr(orch, "save_orchestrator_state", lambda state: None)
+    monkeypatch.setattr(
+        orch,
+        "_write_run_metadata",
+        lambda **kwargs: metadata.update(kwargs) or temp_dir / "run_metadata.json",
+    )
+
+    args = SimpleNamespace(no_periodic=False, force_periodic=False)
+    updated = orch.run_full_daily_cycle(
+        args,
+        {},
+        state,
+        run_id="run_full",
+        now=now,
+    )
+
+    assert updated["last_full_broker_run_date"] == "2026-05-04"
+    assert updated["last_daily_run_id"] == "run_full"
+    assert ("complete", "complete") in legacy
+    assert "full_broker_cycle" in metadata["tasks_executed"]
+
+
+def test_full_cycle_setup_failure_does_not_mark_complete(monkeypatch):
+    now = datetime(2026, 5, 4, 12, 0, tzinfo=ET)
+    legacy = []
+    temp_dir = Path("tests/_tmp") / f"orchestrator_{uuid4().hex}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(orch, "_ensure_no_live_duplicate", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orch,
+        "_write_legacy_run_state",
+        lambda stage, status="running", now=None: legacy.append((stage, status)),
+    )
+    monkeypatch.setattr(
+        orch,
+        "run_due_periodic_tasks",
+        lambda state, now, config, args, phase, run_id, include_heavy=False, force=False: (
+            state,
+            [],
+            [],
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        orch,
+        "_invoke_broker_main",
+        lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError("Price data not found")),
+    )
+    monkeypatch.setattr(orch, "save_orchestrator_state", lambda state: None)
+    monkeypatch.setattr(orch, "_write_run_metadata", lambda **kwargs: temp_dir / "run_metadata.json")
+
+    args = SimpleNamespace(no_periodic=False, force_periodic=False)
+    updated = orch.run_full_daily_cycle(
+        args,
+        {},
+        {},
+        run_id="run_fail",
+        now=now,
+    )
+
+    assert updated.get("last_full_broker_run_date") is None
+    assert updated["last_failed_task"] == "full_daily_cycle"
+    assert ("failed", "failed") in legacy
+    assert ("complete", "complete") not in legacy
