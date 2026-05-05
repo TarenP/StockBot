@@ -22,6 +22,7 @@ CAP_IMPACT_SUMMARY_PATH = Path("broker/state/cap_impact_summary.json")
 PERFORMANCE_ATTRIBUTION_PATH = Path("broker/state/performance_attribution.json")
 PARITY_REPORT_PATH = Path("broker/state/replay_live_parity.json")
 LLM_SIDECAR_SUMMARY_PATH = Path("broker/state/llm_sidecar_summary.json")
+LLM_SIDECAR_QUALITY_PATH = Path("broker/state/llm_sidecar_quality_report.json")
 
 
 # ── Cycle logging ─────────────────────────────────────────────────────────────
@@ -226,6 +227,7 @@ def _print_status_snapshot(portfolio, eq: pd.DataFrame | None) -> None:
     attribution = _load_json_file(PERFORMANCE_ATTRIBUTION_PATH)
     parity = _load_json_file(PARITY_REPORT_PATH)
     llm_sidecar = _load_json_file(LLM_SIDECAR_SUMMARY_PATH)
+    llm_quality = _load_json_file(LLM_SIDECAR_QUALITY_PATH)
 
     print(f"\n  {'-'*55}")
     print("  Current Status")
@@ -344,6 +346,16 @@ def _print_status_snapshot(portfolio, eq: pd.DataFrame | None) -> None:
             "  AI sidecar:      "
             f"{int(llm_sidecar.get('trusted', 0) or 0)}/"
             f"{int(llm_sidecar.get('positions_checked', 0) or 0)} trusted cached event parse(s)"
+        )
+    if llm_quality:
+        coverage = llm_quality.get("document_parse_coverage")
+        coverage_text = "n/a" if coverage is None else _fmt_optional_pct(float(coverage))
+        print(
+            "  AI quality:      "
+            f"parsed={int(llm_quality.get('parsed_documents', 0) or 0)} "
+            f"trusted={int(llm_quality.get('trusted_parses', 0) or 0)} "
+            f"coverage={coverage_text} "
+            f"review={len(llm_quality.get('manual_review_queue') or [])}"
         )
 
     command_label = os.environ.get("BROKER_DISPLAY_COMMAND", "python Broker.py --status")

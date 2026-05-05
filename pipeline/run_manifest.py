@@ -95,6 +95,17 @@ def sidecar_manifest_status(
     }
 
 
+def sidecar_quality_manifest(report: dict | None) -> dict[str, Any]:
+    payload = report or {}
+    return {
+        "parsed_documents": int(payload.get("parsed_documents", 0) or 0),
+        "trusted_parses": int(payload.get("trusted_parses", 0) or 0),
+        "document_parse_coverage": payload.get("document_parse_coverage"),
+        "manual_review_queue_count": len(payload.get("manual_review_queue") or []),
+        "confidence": payload.get("confidence") or {},
+    }
+
+
 def get_code_version() -> str:
     """Return short git commit hash, or 'unknown' if not in a git repo."""
     try:

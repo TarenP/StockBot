@@ -480,6 +480,17 @@ def _run_llm_sidecar_task(config: dict) -> dict[str, Any]:
         except Exception as exc:
             failed += 1
             logger.warning("LLM sidecar failed for document %s: %s", doc.get("doc_id"), exc)
+    try:
+        from llm.quality_report import write_sidecar_quality_report
+
+        write_sidecar_quality_report(
+            "broker/state/llm_sidecar_quality_report.json",
+            cache_dir=config.get("llm_cache_dir", "broker/state/llm_cache"),
+            document_store_dir=config.get("llm_document_store_dir", "broker/state/document_store"),
+            min_confidence=float(config.get("llm_sidecar_min_confidence", 0.65)),
+        )
+    except Exception as exc:
+        logger.warning("Could not write LLM sidecar quality report: %s", exc)
     return {"processed": processed, "failed": failed}
 
 
@@ -539,7 +550,12 @@ def run_due_periodic_tasks(
             elif task.name == "shadow_validation":
                 _run_shadow_task(config, args)
             elif task.name == "llm_sidecar":
-                _run_llm_sidecar_task(config)
+                result = _run_llm_sidecar_task(config)
+                logger.info(
+                    "LLM sidecar precompute complete: processed=%d failed=%d",
+                    int(result.get("processed", 0)),
+                    int(result.get("failed", 0)),
+                )
             else:
                 logger.info("Periodic task %s is registered but disabled until configured.", task.name)
                 skipped.append(task.name)

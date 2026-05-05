@@ -223,12 +223,18 @@ Useful paths:
 - `broker/state/llm_cache/parses/` validated structured parses
 - `broker/state/llm_cache/features/` compact broker-readable features
 - `broker/state/llm_sidecar_summary.json` current diagnostic summary
+- `broker/state/llm_sidecar_quality_report.json` coverage, confidence, and manual-review queue
 
 Manual precompute:
 
 ```bash
 python Broker.py --refresh-ai-sidecar
 ```
+
+Before enabling any broker influence, review the quality report. The useful
+fields are `document_parse_coverage`, `trusted_parses`, `confidence`, and
+`manual_review_queue`. High-confidence parses that claim thesis-changing events
+are deliberately queued for human inspection first.
 
 ---
 

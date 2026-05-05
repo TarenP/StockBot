@@ -24,6 +24,7 @@ CAP_IMPACT_SUMMARY_PATH = STATE_DIR / "cap_impact_summary.json"
 PERFORMANCE_ATTRIBUTION_PATH = STATE_DIR / "performance_attribution.json"
 PARITY_REPORT_PATH = STATE_DIR / "replay_live_parity.json"
 LLM_SIDECAR_SUMMARY_PATH = STATE_DIR / "llm_sidecar_summary.json"
+LLM_SIDECAR_QUALITY_PATH = STATE_DIR / "llm_sidecar_quality_report.json"
 
 KNOWN_PRICE_EVENTS = {
     "BKNG": [
@@ -1036,6 +1037,16 @@ def summarize_llm_sidecar_features(portfolio, cache_dir: str | Path = "broker/st
         thesis = str(payload.get("thesis_impact", "unknown"))
         thesis_counts[thesis] = thesis_counts.get(thesis, 0) + 1
         risk_count += len(payload.get("top_risks") or [])
+    try:
+        from llm.quality_report import build_sidecar_quality_report
+
+        quality = build_sidecar_quality_report(
+            cache_dir=cache_dir,
+            tickers=tickers,
+        )
+    except Exception as exc:
+        quality = {"error": str(exc)}
+
     return {
         "enabled": True,
         "positions_checked": len(tickers),
@@ -1043,6 +1054,13 @@ def summarize_llm_sidecar_features(portfolio, cache_dir: str | Path = "broker/st
         "trusted": len(trusted),
         "thesis_impact_counts": thesis_counts,
         "top_risk_count": risk_count,
+        "quality": {
+            "parsed_documents": quality.get("parsed_documents"),
+            "trusted_parses": quality.get("trusted_parses"),
+            "document_parse_coverage": quality.get("document_parse_coverage"),
+            "manual_review_queue_count": len(quality.get("manual_review_queue") or []),
+            "error": quality.get("error"),
+        },
     }
 
 

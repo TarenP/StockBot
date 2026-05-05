@@ -43,6 +43,7 @@ from broker.risk      import PortfolioRiskEngine, validate_startup
 from broker.paper_diagnostics import (
     CAP_IMPACT_SUMMARY_PATH,
     LLM_SIDECAR_SUMMARY_PATH,
+    LLM_SIDECAR_QUALITY_PATH,
     PARITY_REPORT_PATH,
     PERFORMANCE_ATTRIBUTION_PATH,
     build_replay_live_parity_report,
@@ -481,12 +482,23 @@ def run_cycle(
         write_json(PERFORMANCE_ATTRIBUTION_PATH, attribution)
         llm_summary = summarize_llm_sidecar_features(portfolio)
         write_json(LLM_SIDECAR_SUMMARY_PATH, llm_summary)
+        try:
+            from llm.quality_report import write_sidecar_quality_report
+
+            write_sidecar_quality_report(
+                LLM_SIDECAR_QUALITY_PATH,
+                tickers=portfolio.positions.keys(),
+                min_confidence=float(cfg.get("llm_sidecar_min_confidence", 0.65)),
+            )
+        except Exception as exc:
+            logger.warning("Could not write LLM sidecar quality report: %s", exc)
         parity_report = build_replay_live_parity_report(cfg, brain=brain)
         write_json(PARITY_REPORT_PATH, parity_report)
         run_manifest["diagnostics"] = {
             "cap_impact_summary_path": str(CAP_IMPACT_SUMMARY_PATH),
             "performance_attribution_path": str(PERFORMANCE_ATTRIBUTION_PATH),
             "llm_sidecar_summary_path": str(LLM_SIDECAR_SUMMARY_PATH),
+            "llm_sidecar_quality_path": str(LLM_SIDECAR_QUALITY_PATH),
             "replay_live_parity_path": str(PARITY_REPORT_PATH),
             "replay_live_parity_compatible": parity_report.get("compatible"),
         }
@@ -623,6 +635,16 @@ def main(config: dict = None, maintenance_context: dict | None = None):
             write_json(PERFORMANCE_ATTRIBUTION_PATH, attribution)
             llm_summary = summarize_llm_sidecar_features(portfolio)
             write_json(LLM_SIDECAR_SUMMARY_PATH, llm_summary)
+            try:
+                from llm.quality_report import write_sidecar_quality_report
+
+                write_sidecar_quality_report(
+                    LLM_SIDECAR_QUALITY_PATH,
+                    tickers=portfolio.positions.keys(),
+                    min_confidence=float(cfg.get("llm_sidecar_min_confidence", 0.65)),
+                )
+            except Exception as exc:
+                logger.warning("Could not update LLM sidecar quality report: %s", exc)
         except Exception as exc:
             logger.warning("Could not update status diagnostics: %s", exc)
         print_report(portfolio)

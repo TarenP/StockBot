@@ -1,9 +1,11 @@
+import json
 from pathlib import Path
 from uuid import uuid4
 
 from broker.brain import BrokerBrain
 from llm.cache import LLMCache, stable_doc_id
 from llm.feature_adapter import build_feature_record, load_cached_sidecar_features
+from llm.quality_report import build_sidecar_quality_report
 from llm.schemas import TranscriptEventParse
 from llm.transcript_parser import parse_cached_or_degrade
 
@@ -122,3 +124,46 @@ def test_replay_safety_blocks_future_dated_cached_features():
     loaded = load_cached_sidecar_features(["AAA"], cache_dir=cache_dir, as_of_date="2026-05-01")
 
     assert loaded == {}
+
+
+def test_quality_report_tracks_coverage_and_manual_review_queue():
+    cache_dir = _test_cache_dir()
+    doc_store = cache_dir / "docs"
+    doc_store.mkdir(parents=True, exist_ok=True)
+    raw_doc = {
+        "doc_id": "doc-review",
+        "ticker": "AAA",
+        "source_type": "transcript",
+        "as_of_date": "2026-05-01",
+        "text": "Demand improved but management cited margin risk.",
+    }
+    (doc_store / "doc-review.json").write_text(json.dumps(raw_doc), encoding="utf-8")
+
+    parsed = TranscriptEventParse(
+        ticker="AAA",
+        source_type="transcript",
+        source_id="doc-review",
+        as_of_date="2026-05-01",
+        guidance_direction="positive",
+        management_tone="positive",
+        demand_outlook="positive",
+        margin_outlook="negative",
+        thesis_impact="strengthens",
+        top_risks=["margin", "inventory", "competition"],
+        confidence=0.91,
+    )
+    cache = LLMCache(cache_dir)
+    cache.put_parse("doc-review", parsed)
+    cache.put_feature_record(build_feature_record(parsed))
+
+    report = build_sidecar_quality_report(
+        cache_dir=cache_dir,
+        document_store_dir=doc_store,
+        tickers=["AAA"],
+    )
+
+    assert report["raw_documents"] == 1
+    assert report["parsed_documents"] == 1
+    assert report["trusted_parses"] == 1
+    assert report["document_parse_coverage"] == 1.0
+    assert len(report["manual_review_queue"]) == 1
