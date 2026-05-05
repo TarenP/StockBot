@@ -217,6 +217,11 @@ JSON features. By default `llm_sidecar_broker_influence = false`, so parsed
 events appear in diagnostics and memos only. Influence can be enabled later only
 after replay validation and promotion review.
 
+Precompute is enabled by default through `enable_llm_sidecar_precompute = true`.
+That only refreshes cached parses and quality reports; it does not give the
+sidecar trading authority. If Ollama or documents are unavailable, the broker
+continues normally and the quality report records the degraded coverage.
+
 Useful paths:
 
 - `broker/state/document_store/` raw local documents for precompute
@@ -232,9 +237,23 @@ python Broker.py --refresh-ai-sidecar
 ```
 
 Before enabling any broker influence, review the quality report. The useful
-fields are `document_parse_coverage`, `trusted_parses`, `confidence`, and
-`manual_review_queue`. High-confidence parses that claim thesis-changing events
-are deliberately queued for human inspection first.
+fields are `document_parse_coverage`, `cache_hit_rate`, `invalid_parse_rate`,
+`by_event_type`, `trusted_parse_count_by_ticker`, `staleness`, `confidence`,
+`confidence_buckets`, and `manual_review_queue`. High-confidence parses that
+claim thesis-changing events are deliberately queued for human inspection first.
+
+Quality gates are reported under `go_no_go`. The starting thresholds are:
+
+- `llm_quality_min_coverage = 0.50`
+- `llm_quality_max_invalid_rate = 0.10`
+- `llm_quality_max_review_backlog = 50`
+- `llm_quality_min_trusted_parses = 20`
+- `llm_quality_max_staleness_days = 14`
+
+Passing those thresholds means the sidecar is ready for manual review and,
+after review, a tiny paper-only soft-penalty experiment. It still does not
+enable live broker influence. Hard vetoes, exits, sizing authority, and policy
+promotion remain disconnected from the sidecar.
 
 ---
 

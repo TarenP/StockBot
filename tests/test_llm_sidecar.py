@@ -160,10 +160,34 @@ def test_quality_report_tracks_coverage_and_manual_review_queue():
         cache_dir=cache_dir,
         document_store_dir=doc_store,
         tickers=["AAA"],
+        min_trusted_parses=1,
     )
 
     assert report["raw_documents"] == 1
     assert report["parsed_documents"] == 1
     assert report["trusted_parses"] == 1
     assert report["document_parse_coverage"] == 1.0
+    assert report["cache_hit_rate"] == 1.0
+    assert report["by_event_type"]["transcript"]["raw_documents"] == 1
+    assert report["by_event_type"]["transcript"]["trusted_parses"] == 1
+    assert report["by_event_type"]["transcript"]["confidence_buckets"]["gte_0_85"] == 1
+    assert report["trusted_parse_count_by_ticker"]["AAA"] == 1
+    assert report["go_no_go"]["influence_allowed"] is False
+    assert report["go_no_go"]["decision"] == "manual_review_ready"
     assert len(report["manual_review_queue"]) == 1
+
+
+def test_quality_report_blocks_influence_when_coverage_is_missing():
+    cache_dir = _test_cache_dir()
+    doc_store = cache_dir / "docs"
+    doc_store.mkdir(parents=True, exist_ok=True)
+
+    report = build_sidecar_quality_report(
+        cache_dir=cache_dir,
+        document_store_dir=doc_store,
+    )
+
+    assert report["raw_documents"] == 0
+    assert report["go_no_go"]["influence_allowed"] is False
+    assert report["go_no_go"]["decision"] == "collect_more_data"
+    assert "coverage" in report["go_no_go"]["failed_criteria"]

@@ -101,8 +101,12 @@ def sidecar_quality_manifest(report: dict | None) -> dict[str, Any]:
         "parsed_documents": int(payload.get("parsed_documents", 0) or 0),
         "trusted_parses": int(payload.get("trusted_parses", 0) or 0),
         "document_parse_coverage": payload.get("document_parse_coverage"),
+        "cache_hit_rate": payload.get("cache_hit_rate"),
+        "invalid_parse_rate": payload.get("invalid_parse_rate"),
         "manual_review_queue_count": len(payload.get("manual_review_queue") or []),
         "confidence": payload.get("confidence") or {},
+        "staleness": payload.get("staleness") or {},
+        "go_no_go": payload.get("go_no_go") or {},
     }
 
 

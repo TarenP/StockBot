@@ -350,12 +350,15 @@ def _print_status_snapshot(portfolio, eq: pd.DataFrame | None) -> None:
     if llm_quality:
         coverage = llm_quality.get("document_parse_coverage")
         coverage_text = "n/a" if coverage is None else _fmt_optional_pct(float(coverage))
+        go_no_go = llm_quality.get("go_no_go") or {}
+        decision = go_no_go.get("decision") or "unknown"
         print(
             "  AI quality:      "
             f"parsed={int(llm_quality.get('parsed_documents', 0) or 0)} "
             f"trusted={int(llm_quality.get('trusted_parses', 0) or 0)} "
             f"coverage={coverage_text} "
-            f"review={len(llm_quality.get('manual_review_queue') or [])}"
+            f"review={len(llm_quality.get('manual_review_queue') or [])} "
+            f"gate={decision}"
         )
 
     command_label = os.environ.get("BROKER_DISPLAY_COMMAND", "python Broker.py --status")

@@ -173,6 +173,23 @@ def _load_llm_sidecar_features_for_cycle(
         return {}, {"enabled": True, "mode": "degraded", "loaded_tickers": 0, "error": str(exc)}
 
 
+def _sidecar_quality_report_kwargs(config: dict | None, tickers=None) -> dict:
+    cfg = config or {}
+    kwargs = {
+        "cache_dir": cfg.get("llm_cache_dir", "broker/state/llm_cache"),
+        "document_store_dir": cfg.get("llm_document_store_dir", "broker/state/document_store"),
+        "min_confidence": float(cfg.get("llm_sidecar_min_confidence", 0.65)),
+        "min_coverage": float(cfg.get("llm_quality_min_coverage", 0.50)),
+        "max_invalid_parse_rate": float(cfg.get("llm_quality_max_invalid_rate", 0.10)),
+        "max_manual_review_queue": int(cfg.get("llm_quality_max_review_backlog", 50)),
+        "min_trusted_parses": int(cfg.get("llm_quality_min_trusted_parses", 20)),
+        "max_staleness_days": int(cfg.get("llm_quality_max_staleness_days", 14)),
+    }
+    if tickers is not None:
+        kwargs["tickers"] = tickers
+    return kwargs
+
+
 # ── One-shot cycle ────────────────────────────────────────────────────────────
 
 def run_cycle(
@@ -487,8 +504,7 @@ def run_cycle(
 
             write_sidecar_quality_report(
                 LLM_SIDECAR_QUALITY_PATH,
-                tickers=portfolio.positions.keys(),
-                min_confidence=float(cfg.get("llm_sidecar_min_confidence", 0.65)),
+                **_sidecar_quality_report_kwargs(cfg, tickers=portfolio.positions.keys()),
             )
         except Exception as exc:
             logger.warning("Could not write LLM sidecar quality report: %s", exc)
@@ -621,6 +637,7 @@ def parse_args(config: dict = None):
 
 def main(config: dict = None, maintenance_context: dict | None = None):
     args = parse_args(config)
+    cfg = config or {}
 
     portfolio = Portfolio(initial_cash=args.cash)
     # Status / trades — no trading, just reporting
@@ -640,8 +657,7 @@ def main(config: dict = None, maintenance_context: dict | None = None):
 
                 write_sidecar_quality_report(
                     LLM_SIDECAR_QUALITY_PATH,
-                    tickers=portfolio.positions.keys(),
-                    min_confidence=float(cfg.get("llm_sidecar_min_confidence", 0.65)),
+                    **_sidecar_quality_report_kwargs(cfg, tickers=portfolio.positions.keys()),
                 )
             except Exception as exc:
                 logger.warning("Could not update LLM sidecar quality report: %s", exc)

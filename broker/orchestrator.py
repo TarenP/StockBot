@@ -116,6 +116,19 @@ def _today_iso(now: datetime | None = None) -> str:
     return (now or now_et()).date().isoformat()
 
 
+def _sidecar_quality_report_kwargs(config: dict) -> dict[str, Any]:
+    return {
+        "cache_dir": config.get("llm_cache_dir", "broker/state/llm_cache"),
+        "document_store_dir": config.get("llm_document_store_dir", "broker/state/document_store"),
+        "min_confidence": float(config.get("llm_sidecar_min_confidence", 0.65)),
+        "min_coverage": float(config.get("llm_quality_min_coverage", 0.50)),
+        "max_invalid_parse_rate": float(config.get("llm_quality_max_invalid_rate", 0.10)),
+        "max_manual_review_queue": int(config.get("llm_quality_max_review_backlog", 50)),
+        "min_trusted_parses": int(config.get("llm_quality_min_trusted_parses", 20)),
+        "max_staleness_days": int(config.get("llm_quality_max_staleness_days", 14)),
+    }
+
+
 def _read_json(path: Path, default: Any) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -485,9 +498,7 @@ def _run_llm_sidecar_task(config: dict) -> dict[str, Any]:
 
         write_sidecar_quality_report(
             "broker/state/llm_sidecar_quality_report.json",
-            cache_dir=config.get("llm_cache_dir", "broker/state/llm_cache"),
-            document_store_dir=config.get("llm_document_store_dir", "broker/state/document_store"),
-            min_confidence=float(config.get("llm_sidecar_min_confidence", 0.65)),
+            **_sidecar_quality_report_kwargs(config),
         )
     except Exception as exc:
         logger.warning("Could not write LLM sidecar quality report: %s", exc)
