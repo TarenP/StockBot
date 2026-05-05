@@ -1353,6 +1353,40 @@ def _slice_replay_window(df_features: pd.DataFrame, price_lookup: pd.DataFrame, 
     return df_window, price_window
 
 
+def _policy_matrix_run_id() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def _window_manifest(windows: list[dict]) -> pd.DataFrame:
+    rows = []
+    prev = None
+    for window in windows:
+        start = pd.Timestamp(window["start"])
+        end = pd.Timestamp(window["end"])
+        calendar_days = max((end - start).days + 1, 1)
+        overlap_days = 0
+        if prev is not None:
+            prev_start = pd.Timestamp(prev["start"])
+            prev_end = pd.Timestamp(prev["end"])
+            overlap_start = max(start, prev_start)
+            overlap_end = min(end, prev_end)
+            if overlap_end >= overlap_start:
+                overlap_days = (overlap_end - overlap_start).days + 1
+        rows.append(
+            {
+                "window": str(window["label"]),
+                "start": start.date().isoformat(),
+                "end": end.date().isoformat(),
+                "trading_days": int(window.get("trading_days", 0) or 0),
+                "calendar_days": int(calendar_days),
+                "overlap_with_previous_days": int(overlap_days),
+                "overlap_with_previous_pct": float(overlap_days / calendar_days),
+            }
+        )
+        prev = window
+    return pd.DataFrame(rows)
+
+
 def run_policy_family_sensitivity(
     df_features: pd.DataFrame,
     price_lookup: pd.DataFrame,
@@ -1462,6 +1496,13 @@ def summarize_policy_family_matrix(
         if isinstance(review, pd.DataFrame) and not review.empty:
             review_rows.append(review.assign(window=_window))
     review_all = pd.concat(review_rows, ignore_index=True) if review_rows else pd.DataFrame()
+    sensitivity_rows = []
+    for _window, sensitivity in sensitivity_by_window.items():
+        if isinstance(sensitivity, pd.DataFrame) and not sensitivity.empty:
+            sensitivity_rows.append(sensitivity.assign(window=_window))
+    sensitivity_all = (
+        pd.concat(sensitivity_rows, ignore_index=True) if sensitivity_rows else pd.DataFrame()
+    )
     stability_lookup = {
         str(row.get("winner")): row
         for row in (stability_df.to_dict(orient="records") if isinstance(stability_df, pd.DataFrame) else [])
@@ -1475,17 +1516,38 @@ def summarize_policy_family_matrix(
         )
         wins = int(stability_lookup.get(variant, {}).get("winner_windows", 0) or 0)
         total_windows = int(stability_lookup.get(variant, {}).get("total_windows", 0) or 0)
+        variant_sensitivity = (
+            sensitivity_all[sensitivity_all["params"].eq(variant)]
+            if not sensitivity_all.empty else pd.DataFrame()
+        )
         rows.append(
             {
                 "variant": variant,
                 "wins": wins,
                 "total_windows": total_windows,
+                "winner_rate": _safe_ratio(wins, total_windows),
                 "avg_policy_rank_score": (
                     float(variant_reviews["policy_rank_score"].mean())
                     if not variant_reviews.empty else _json_float(row.get("policy_rank_score"))
                 ),
                 "avg_return": _json_float(row.get("outcome_total_return")),
+                "best_window_return": (
+                    _json_float(variant_sensitivity["total_return"].max())
+                    if not variant_sensitivity.empty else None
+                ),
+                "worst_window_return": (
+                    _json_float(variant_sensitivity["total_return"].min())
+                    if not variant_sensitivity.empty else None
+                ),
                 "avg_mdd": _json_float(row.get("outcome_max_drawdown")),
+                "best_window_mdd": (
+                    _json_float(variant_sensitivity["max_drawdown"].max())
+                    if not variant_sensitivity.empty else None
+                ),
+                "worst_window_mdd": (
+                    _json_float(variant_sensitivity["max_drawdown"].min())
+                    if not variant_sensitivity.empty else None
+                ),
                 "avg_turnover": _json_float(row.get("outcome_turnover")),
                 "key_mechanism_change": _mechanism_change_label(row),
                 "decision": str(row.get("decision_status")),
@@ -1525,6 +1587,7 @@ def run_policy_family_matrix(
     strategy: str | None = None,
     checkpoint_path: str | None = None,
     output_root: str | Path | None = None,
+    run_id: str | None = None,
 ) -> dict:
     """
     Execute the policy-selection runbook for one family.
@@ -1545,7 +1608,34 @@ def run_policy_family_matrix(
     sensitivity_by_window: dict[str, pd.DataFrame] = {}
     reviews_by_window: dict[str, pd.DataFrame] = {}
     review_summaries_by_window: dict[str, dict] = {}
+    run_id = str(run_id or _policy_matrix_run_id())
     out_root = Path(output_root) if output_root is not None else None
+    family_dir = (out_root / family / run_id) if out_root is not None else None
+    manifest_df = _window_manifest(windows)
+
+    if family_dir is not None:
+        family_dir.mkdir(parents=True, exist_ok=False)
+        manifest_df.to_csv(family_dir / "window_manifest.csv", index=False)
+        (family_dir / "window_manifest.json").write_text(
+            json.dumps(manifest_df.to_dict(orient="records"), indent=2, sort_keys=True)
+        )
+        metadata = {
+            "run_id": run_id,
+            "family": family,
+            "created_at": datetime.now().isoformat(),
+            "n_windows_requested": int(n_windows),
+            "window_years": int(window_years),
+            "step_months": int(step_months),
+            "variants": [label for label, _overrides in POLICY_FAMILY_VARIANTS[family]],
+            "fixed_inputs": {
+                "strategy": strategy or _resolve_replay_strategy(live_config),
+                "initial_cash": float(initial_cash),
+                "checkpoint_path": checkpoint_path,
+            },
+        }
+        (family_dir / "run_metadata.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True)
+        )
 
     for window in windows:
         label = str(window["label"])
@@ -1569,8 +1659,8 @@ def run_policy_family_matrix(
         reviews_by_window[label] = review
         review_summaries_by_window[label] = summary
 
-        if out_root is not None:
-            window_dir = out_root / family / label
+        if family_dir is not None:
+            window_dir = family_dir / label
             window_dir.mkdir(parents=True, exist_ok=True)
             sensitivity.to_csv(window_dir / "sensitivity.csv", index=False)
             review.to_csv(window_dir / "policy_review.csv", index=False)
@@ -1590,9 +1680,7 @@ def run_policy_family_matrix(
         stability,
     )
 
-    if out_root is not None:
-        family_dir = out_root / family
-        family_dir.mkdir(parents=True, exist_ok=True)
+    if family_dir is not None:
         stability.to_csv(family_dir / "winner_stability.csv", index=False)
         aggregate_sensitivity.to_csv(family_dir / "aggregate_sensitivity.csv", index=False)
         aggregate_review.to_csv(family_dir / "aggregate_policy_review.csv", index=False)
@@ -1603,7 +1691,10 @@ def run_policy_family_matrix(
 
     return {
         "family": family,
+        "run_id": run_id,
+        "output_dir": str(family_dir) if family_dir is not None else None,
         "windows": windows,
+        "window_manifest": manifest_df,
         "sensitivity_by_window": sensitivity_by_window,
         "policy_reviews_by_window": reviews_by_window,
         "policy_review_summaries_by_window": review_summaries_by_window,
@@ -2133,6 +2224,8 @@ def summarize_policy_winner_stability(policy_reviews) -> pd.DataFrame:
                     "window": str(window_label),
                     "decision_status": str(leader.get("decision_status", "review")),
                     "confidence_note": str(leader.get("confidence_note", "normal_sample")),
+                    "window_return": _json_float(leader.get("outcome_total_return")),
+                    "window_max_drawdown": _json_float(leader.get("outcome_max_drawdown")),
                 }
             )
 
@@ -2146,6 +2239,10 @@ def summarize_policy_winner_stability(policy_reviews) -> pd.DataFrame:
                 "winner_rate",
                 "small_sample_windows",
                 "candidate_windows",
+                "best_window_return",
+                "worst_window_return",
+                "best_window_drawdown",
+                "worst_window_drawdown",
                 "stability_note",
             ]
         )
@@ -2158,6 +2255,8 @@ def summarize_policy_winner_stability(policy_reviews) -> pd.DataFrame:
         winner_rate = winner_windows / total_windows if total_windows else 0.0
         small_sample_windows = int(group["confidence_note"].eq("small_sample").sum())
         candidate_windows = int(group["decision_status"].isin({"promote", "hold_for_more_evidence"}).sum())
+        window_returns = pd.to_numeric(group["window_return"], errors="coerce")
+        window_drawdowns = pd.to_numeric(group["window_max_drawdown"], errors="coerce")
         if total_windows < 3:
             stability_note = "too_few_windows"
         elif winner_rate >= 0.60 and small_sample_windows == 0:
@@ -2175,6 +2274,18 @@ def summarize_policy_winner_stability(policy_reviews) -> pd.DataFrame:
                 "winner_rate": winner_rate,
                 "small_sample_windows": small_sample_windows,
                 "candidate_windows": candidate_windows,
+                "best_window_return": (
+                    float(window_returns.max()) if window_returns.notna().any() else None
+                ),
+                "worst_window_return": (
+                    float(window_returns.min()) if window_returns.notna().any() else None
+                ),
+                "best_window_drawdown": (
+                    float(window_drawdowns.max()) if window_drawdowns.notna().any() else None
+                ),
+                "worst_window_drawdown": (
+                    float(window_drawdowns.min()) if window_drawdowns.notna().any() else None
+                ),
                 "stability_note": stability_note,
             }
         )

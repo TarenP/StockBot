@@ -1068,6 +1068,8 @@ def test_policy_winner_stability_summarizes_repeated_windows():
     low_price = by_family_winner[("low_price", "low_price=pre_penalty")]
     assert weak_block["winner_windows"] == 2
     assert np.isclose(weak_block["winner_rate"], 2 / 3)
+    assert "best_window_return" in weak_block
+    assert "worst_window_drawdown" in weak_block
     assert weak_block["stability_note"] == "stable_candidate"
     assert low_price["stability_note"] == "stable_but_small_sample"
 
@@ -1205,16 +1207,25 @@ def test_policy_family_matrix_builds_summary_and_artifacts(monkeypatch):
         family="weak_sleeve",
         n_windows=3,
         output_root=out_root,
+        run_id="test_run",
         live_config={"rl_enabled": False},
         strategy="screener_heuristics",
     )
 
     assert result["family"] == "weak_sleeve"
+    assert result["run_id"] == "test_run"
     assert len(result["windows"]) == 3
+    assert not result["window_manifest"].empty
     assert not result["winner_stability"].empty
     assert not result["summary_table"].empty
-    assert (out_root / "weak_sleeve" / "aggregate_policy_review.csv").exists()
-    assert (out_root / "weak_sleeve" / "summary_table.csv").exists()
+    run_dir = out_root / "weak_sleeve" / "test_run"
+    assert (run_dir / "window_manifest.csv").exists()
+    assert (run_dir / "window_manifest.json").exists()
+    assert (run_dir / "run_metadata.json").exists()
+    assert (run_dir / "aggregate_policy_review.csv").exists()
+    assert (run_dir / "summary_table.csv").exists()
+    assert "winner_rate" in result["summary_table"].columns
+    assert "worst_window_return" in result["summary_table"].columns
     shutil.rmtree(out_root, ignore_errors=True)
 
 
