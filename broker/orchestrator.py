@@ -472,7 +472,38 @@ def _run_llm_sidecar_task(config: dict) -> dict[str, Any]:
     from llm.feature_adapter import persist_feature_record
     from llm.transcript_parser import parse_transcript_event
 
-    store = DocumentStore(config.get("llm_document_store_dir", "broker/state/document_store"))
+    store_dir = config.get("llm_document_store_dir", "broker/state/document_store")
+
+    # ── Step 1: Auto-fetch documents for current universe ─────────────────────
+    try:
+        from data_sources.document_fetcher import fetch_documents_for_universe
+        from pipeline.universe_resolver import load_typed_config, resolve_configured_universe
+        from pipeline.checkpoints import load_checkpoint_asset_list
+
+        # Use checkpoint asset list if available, else resolve configured universe
+        tickers = load_checkpoint_asset_list(save_dir="models") or []
+        if not tickers:
+            tickers = resolve_configured_universe(config=config)
+
+        if tickers:
+            fetch_result = fetch_documents_for_universe(
+                tickers=tickers[:500],  # cap at 500 to avoid very long runs
+                store_dir=store_dir,
+                lookback_days=int(config.get("llm_document_lookback_days", 90)),
+                fetch_sec=bool(config.get("llm_fetch_sec_filings", True)),
+                fetch_news=bool(config.get("llm_fetch_earnings_news", True)),
+                max_chars=int(config.get("llm_max_document_chars", 24000)),
+            )
+            logger.info(
+                "Document fetch: %d SEC filings, %d news articles",
+                fetch_result.get("sec_stored", 0),
+                fetch_result.get("news_stored", 0),
+            )
+    except Exception as exc:
+        logger.warning("Document auto-fetch failed (continuing with existing docs): %s", exc)
+
+    # ── Step 2: Parse stored documents ────────────────────────────────────────
+    store = DocumentStore(store_dir)
     processed = 0
     failed = 0
     for doc in store.iter_documents() or []:
