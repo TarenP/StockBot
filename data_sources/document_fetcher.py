@@ -76,8 +76,17 @@ def _is_useful_for_llm(text: str) -> bool:
     if numeric / min(len(words), 200) > 0.5:
         return False
     return True
-    """Remove HTML tags and normalize whitespace."""
+
+
+def _strip_html(text: str) -> str:
+    """Remove HTML tags, entities, and normalize whitespace."""
     import re
+    import html as _html
+    text = _html.unescape(text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&[a-zA-Z#0-9]+;", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"&[a-zA-Z]+;", " ", text)
     text = re.sub(r"\s+", " ", text)

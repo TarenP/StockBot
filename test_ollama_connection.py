@@ -10,7 +10,7 @@ import json
 import requests
 
 OLLAMA_URL = "http://localhost:11434"
-MODEL = "gpt-oss:20b"
+MODEL = "mistral:7b"
 
 
 def check_server():

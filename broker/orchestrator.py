@@ -502,19 +502,37 @@ def _run_llm_sidecar_task(config: dict) -> dict[str, Any]:
     except Exception as exc:
         logger.warning("Document auto-fetch failed (continuing with existing docs): %s", exc)
 
-    # ── Step 2: Parse stored documents ────────────────────────────────────────
+    # ── Step 2: Parse stored documents (batch-limited per run) ───────────────
+    # Only process a small batch per run to avoid Ollama OOM crashes.
+    # Unprocessed documents are picked up on the next run.
+    from llm.cache import LLMCache
+    cache = LLMCache(config.get("llm_cache_dir", "broker/state/llm_cache"))
     store = DocumentStore(store_dir)
+    max_per_run = int(config.get("llm_max_docs_per_run", 30))
     processed = 0
     failed = 0
+    skipped = 0
+
     for doc in store.iter_documents() or []:
+        doc_id = doc.get("doc_id", "")
+
+        # Skip already-parsed documents
+        if doc_id and cache.get_parse(doc_id) is not None:
+            skipped += 1
+            continue
+
+        if processed + failed >= max_per_run:
+            skipped += 1
+            continue
+
         try:
             parsed = parse_transcript_event(
                 doc.get("ticker", ""),
                 doc.get("text", ""),
                 source_type=doc.get("source_type", "event"),
                 as_of_date=doc.get("as_of_date"),
-                source_id=doc.get("doc_id"),
-                max_chars=int(config.get("llm_max_document_chars", 24000)),
+                source_id=doc_id,
+                max_chars=int(config.get("llm_max_document_chars", 8000)),
             )
             persist_feature_record(
                 parsed,
@@ -523,7 +541,10 @@ def _run_llm_sidecar_task(config: dict) -> dict[str, Any]:
             processed += 1
         except Exception as exc:
             failed += 1
-            logger.warning("LLM sidecar failed for document %s: %s", doc.get("doc_id"), exc)
+            logger.warning("LLM sidecar failed for document %s: %s", doc_id, exc)
+
+    if skipped:
+        logger.info("LLM sidecar: skipped %d already-parsed or deferred documents", skipped)
     try:
         from llm.quality_report import write_sidecar_quality_report
 
