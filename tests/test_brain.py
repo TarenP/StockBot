@@ -382,6 +382,19 @@ def test_soft_signal_adjustments_use_earnings_macro_and_insider_scores():
     assert notes["insider"]["source"] == "insider_signal_score"
 
 
+def test_macro_regime_modes_can_remove_bull_boost():
+    brain = BrokerBrain(
+        portfolio=_DummyPortfolio(),
+        macro_regime_enabled=True,
+        macro_regime_mode="no_bull_boost",
+    )
+
+    score, source = brain._macro_regime_score(0, {})
+
+    assert score == 0.0
+    assert source.endswith("no_bull_boost")
+
+
 def test_run_cycle_allows_sector_overflow_for_strong_risk_on_candidate():
     portfolio = _EmptyPortfolio()
     brain = BrokerBrain(

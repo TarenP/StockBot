@@ -8,6 +8,8 @@ import pandas as pd
 from broker.feature_ablation import (
     AGGREGATE_COLUMNS,
     FEATURE_ABLATION_VARIANTS,
+    MACRO_ABLATION_SWEEP_VARIANTS,
+    MECHANISM_SUMMARY_COLUMNS,
     TOUCH_COLUMNS,
     build_feature_decision,
     build_frozen_feature_config,
@@ -59,6 +61,7 @@ def test_feature_decision_uses_audit_gate_vocabulary():
             "replay_safe": True,
             "feature_touch_count": 0,
             "feature_touch_rate": 0.0,
+            "decision_changed_count": 0,
             "wins": 0,
             "winner_rate": 0.0,
             "incumbent_edge": 0.0,
@@ -94,19 +97,39 @@ def test_feature_ablation_dry_run_writes_required_artifacts():
         assert (run_dir / "aggregate_feature_review.json").exists()
         assert (run_dir / "feature_touch_audit.csv").exists()
         assert (run_dir / "feature_touch_audit.json").exists()
+        assert (run_dir / "window_feature_mechanism_summary.csv").exists()
+        assert (run_dir / "window_feature_mechanism_summary.json").exists()
         assert (run_dir / "promotion_decision.json").exists()
 
         aggregate = pd.read_csv(run_dir / "aggregate_feature_review.csv")
         touches = pd.read_csv(run_dir / "feature_touch_audit.csv")
+        mechanism = pd.read_csv(run_dir / "window_feature_mechanism_summary.csv")
         assert list(aggregate.columns) == AGGREGATE_COLUMNS
         assert list(touches.columns) == TOUCH_COLUMNS
+        assert list(mechanism.columns) == MECHANISM_SUMMARY_COLUMNS
         assert set(aggregate["label"]) == {variant.label for variant in FEATURE_ABLATION_VARIANTS}
 
         for variant in FEATURE_ABLATION_VARIANTS:
             assert (run_dir / variant.label / "window_A" / "metrics.json").exists()
+            assert (run_dir / variant.label / "window_A" / "window_feature_mechanism_summary.csv").exists()
 
         decision = json.loads((run_dir / "promotion_decision.json").read_text())
         assert decision["decision_status"] == "hold_for_more_evidence"
     finally:
         shutil.rmtree(out_root, ignore_errors=True)
 
+
+def test_macro_sweep_variants_are_available_for_runner():
+    labels = {variant.label for variant in MACRO_ABLATION_SWEEP_VARIANTS}
+
+    assert {
+        "baseline",
+        "macro_weight_0.02",
+        "macro_weight_0.04",
+        "macro_weight_0.06",
+        "macro_weight_0.08",
+        "macro_risk_off_only",
+        "macro_no_bull_boost",
+        "macro_drawdown_guard_only",
+        "macro_volatility_scaler_only",
+    }.issubset(labels)

@@ -137,6 +137,7 @@ class BrokerBrain:
         earnings_reaction_weight_strength: float = 0.10,
         macro_regime_enabled: bool = True,
         macro_regime_weight_strength: float = 0.08,
+        macro_regime_mode: str = "standard",
         insider_adjustment_enabled: bool = True,
         insider_adjustment_rank_strength: float = 0.08,
         insider_adjustment_weight_strength: float = 0.08,
@@ -196,6 +197,7 @@ class BrokerBrain:
         self.earnings_reaction_weight_strength = earnings_reaction_weight_strength
         self.macro_regime_enabled = bool(macro_regime_enabled)
         self.macro_regime_weight_strength = macro_regime_weight_strength
+        self.macro_regime_mode = str(macro_regime_mode or "standard").strip().lower()
         self.insider_adjustment_enabled = bool(insider_adjustment_enabled)
         self.insider_adjustment_rank_strength = insider_adjustment_rank_strength
         self.insider_adjustment_weight_strength = insider_adjustment_weight_strength
@@ -1618,7 +1620,7 @@ class BrokerBrain:
         for key in ("macro_risk_score", "market_risk_score", "regime_risk_score"):
             score = self._bounded_signal_score(report.get(key))
             if score is not None:
-                return score, key
+                return self._apply_macro_regime_mode(score, key, market_regime)
 
         if market_regime is None:
             return None, "no_data"
@@ -1628,7 +1630,34 @@ class BrokerBrain:
             2: -0.10,  # choppy
             3: -0.60,  # risk-off
         }
-        return float(regime_map.get(int(market_regime), 0.0)), f"regime_{market_regime}"
+        return self._apply_macro_regime_mode(
+            float(regime_map.get(int(market_regime), 0.0)),
+            f"regime_{market_regime}",
+            market_regime,
+        )
+
+    def _apply_macro_regime_mode(
+        self,
+        score: float | None,
+        source: str,
+        market_regime: int | None,
+    ) -> tuple[float | None, str]:
+        if score is None:
+            return None, source
+        mode = self.macro_regime_mode
+        score = float(score)
+        if mode in {"standard", "", "none"}:
+            return score, source
+        if mode in {"risk_off_only", "no_bull_boost", "volatility_scaler_only"}:
+            return min(score, 0.0), f"{source}:{mode}"
+        if mode == "drawdown_guard_only":
+            try:
+                regime = int(market_regime) if market_regime is not None else None
+            except (TypeError, ValueError):
+                regime = None
+            guarded = min(score, 0.0) if regime in {2, 3} else 0.0
+            return guarded, f"{source}:{mode}"
+        return score, source
 
     def _insider_signal_score(self, report: dict) -> tuple[float | None, str]:
         for key in (

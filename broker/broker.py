@@ -691,12 +691,13 @@ def parse_args(config: dict = None):
     p.add_argument("--low_price_rank_policy", type=str, default=cfg.get("low_price_rank_policy", "late_cap"))
     p.add_argument("--low_price_rank_penalty_mult", type=float, default=cfg.get("low_price_rank_penalty_mult", 0.70))
     p.add_argument("--low_price_high_rank_floor", type=float, default=cfg.get("low_price_high_rank_floor", 0.80))
-    p.add_argument("--earnings_reaction_enabled", action="store_true", default=cfg.get("earnings_reaction_enabled", True))
+    p.add_argument("--earnings_reaction_enabled", action="store_true", default=cfg.get("earnings_reaction_enabled", False))
     p.add_argument("--earnings_reaction_rank_strength", type=float, default=cfg.get("earnings_reaction_rank_strength", 0.10))
     p.add_argument("--earnings_reaction_weight_strength", type=float, default=cfg.get("earnings_reaction_weight_strength", 0.10))
-    p.add_argument("--macro_regime_enabled", action="store_true", default=cfg.get("macro_regime_enabled", True))
+    p.add_argument("--macro_regime_enabled", action="store_true", default=cfg.get("macro_regime_enabled", False))
     p.add_argument("--macro_regime_weight_strength", type=float, default=cfg.get("macro_regime_weight_strength", 0.08))
-    p.add_argument("--insider_adjustment_enabled", action="store_true", default=cfg.get("insider_adjustment_enabled", True))
+    p.add_argument("--macro_regime_mode", type=str, default=cfg.get("macro_regime_mode", "standard"))
+    p.add_argument("--insider_adjustment_enabled", action="store_true", default=cfg.get("insider_adjustment_enabled", False))
     p.add_argument("--insider_adjustment_rank_strength", type=float, default=cfg.get("insider_adjustment_rank_strength", 0.08))
     p.add_argument("--insider_adjustment_weight_strength", type=float, default=cfg.get("insider_adjustment_weight_strength", 0.08))
     p.add_argument("--llm_sidecar_enabled", action="store_true", default=cfg.get("llm_sidecar_enabled", False))
@@ -823,6 +824,7 @@ def main(config: dict = None, maintenance_context: dict | None = None):
         earnings_reaction_weight_strength = args.earnings_reaction_weight_strength,
         macro_regime_enabled = args.macro_regime_enabled,
         macro_regime_weight_strength = args.macro_regime_weight_strength,
+        macro_regime_mode = args.macro_regime_mode,
         insider_adjustment_enabled = args.insider_adjustment_enabled,
         insider_adjustment_rank_strength = args.insider_adjustment_rank_strength,
         insider_adjustment_weight_strength = args.insider_adjustment_weight_strength,
