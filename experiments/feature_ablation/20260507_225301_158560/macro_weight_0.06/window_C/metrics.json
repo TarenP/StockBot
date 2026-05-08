@@ -1,0 +1,19 @@
+{
+  "avg_holding_days": 116.30434782608695,
+  "end": "2023-11-06",
+  "evaluated_candidate_count": 1218,
+  "label": "macro_weight_0.06",
+  "max_drawdown": -0.15190413243267556,
+  "policy_score": -0.1984023430222931,
+  "raw_policy_score": -0.1984023430222931,
+  "replay_safe": true,
+  "run_id": "20260507_225301_158560",
+  "sharpe": 0.011918309769851766,
+  "start": "2022-11-07",
+  "total_return": -0.01701161587062805,
+  "trade_count": 66,
+  "turnover": 5.3315245956156225,
+  "variant_family": "macro_sweep",
+  "win_rate": 0.5059760956175299,
+  "window_id": "window_C"
+}

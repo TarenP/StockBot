@@ -1,0 +1,74 @@
+[
+  {
+    "calendar_days": 366,
+    "end": "2022-11-04",
+    "overlap_with_previous_days": 0,
+    "overlap_with_previous_pct": 0.0,
+    "start": "2021-11-04",
+    "trading_days": 253,
+    "window": "window_A"
+  },
+  {
+    "calendar_days": 366,
+    "end": "2023-05-05",
+    "overlap_with_previous_days": 184,
+    "overlap_with_previous_pct": 0.5027322404371585,
+    "start": "2022-05-05",
+    "trading_days": 252,
+    "window": "window_B"
+  },
+  {
+    "calendar_days": 365,
+    "end": "2023-11-06",
+    "overlap_with_previous_days": 180,
+    "overlap_with_previous_pct": 0.4931506849315068,
+    "start": "2022-11-07",
+    "trading_days": 251,
+    "window": "window_C"
+  },
+  {
+    "calendar_days": 365,
+    "end": "2024-05-06",
+    "overlap_with_previous_days": 183,
+    "overlap_with_previous_pct": 0.5013698630136987,
+    "start": "2023-05-08",
+    "trading_days": 251,
+    "window": "window_D"
+  },
+  {
+    "calendar_days": 367,
+    "end": "2024-11-06",
+    "overlap_with_previous_days": 183,
+    "overlap_with_previous_pct": 0.4986376021798365,
+    "start": "2023-11-06",
+    "trading_days": 253,
+    "window": "window_E"
+  },
+  {
+    "calendar_days": 366,
+    "end": "2025-05-06",
+    "overlap_with_previous_days": 185,
+    "overlap_with_previous_pct": 0.505464480874317,
+    "start": "2024-05-06",
+    "trading_days": 251,
+    "window": "window_F"
+  },
+  {
+    "calendar_days": 366,
+    "end": "2025-11-06",
+    "overlap_with_previous_days": 182,
+    "overlap_with_previous_pct": 0.4972677595628415,
+    "start": "2024-11-06",
+    "trading_days": 251,
+    "window": "window_G"
+  },
+  {
+    "calendar_days": 366,
+    "end": "2026-05-06",
+    "overlap_with_previous_days": 185,
+    "overlap_with_previous_pct": 0.505464480874317,
+    "start": "2025-05-06",
+    "trading_days": 252,
+    "window": "window_H"
+  }
+]
