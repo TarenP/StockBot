@@ -1,0 +1,18 @@
+{
+  "avg_holding_days": 113.86363636363636,
+  "end": "2025-11-06",
+  "label": "earnings_only",
+  "max_drawdown": -0.2480665045408681,
+  "policy_score": 0.19867469604593962,
+  "raw_policy_score": 0.19867469604593962,
+  "replay_safe": true,
+  "run_id": "20260507_184228_173417",
+  "sharpe": 0.632534126102781,
+  "start": "2024-11-06",
+  "total_return": 0.12367590038960175,
+  "trade_count": 63,
+  "turnover": 5.6143934612187145,
+  "variant_family": "active",
+  "win_rate": 0.5577689243027888,
+  "window_id": "window_C"
+}

@@ -1,0 +1,6 @@
+{
+  "decision_reason": "No feature cleared all promotion gates.",
+  "decision_status": "hold_for_more_evidence",
+  "promoted_feature": null,
+  "promotions": []
+}
