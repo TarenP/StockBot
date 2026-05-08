@@ -60,6 +60,44 @@ def test_get_due_periodic_tasks_respects_phase_and_heavy_gate():
     assert "shadow_validation" in [task.name for task in post_heavy]
 
 
+def test_llm_sidecar_fetch_plan_uses_incremental_between_full_sweeps():
+    now = datetime(2026, 5, 7, 12, 0, tzinfo=ET)
+    state = {"last_llm_sidecar_full_fetch_at": "2026-05-04T12:00:00-04:00"}
+    config = {
+        "llm_document_lookback_days": 90,
+        "llm_incremental_document_lookback_days": 7,
+        "llm_full_document_refresh_days": 7,
+    }
+
+    plan = orch._llm_sidecar_fetch_plan(config, state, now)
+
+    assert plan["mode"] == "incremental"
+    assert plan["lookback_days"] == 7
+
+
+def test_llm_sidecar_fetch_plan_runs_full_when_due_or_forced():
+    now = datetime(2026, 5, 11, 12, 0, tzinfo=ET)
+    state = {"last_llm_sidecar_full_fetch_at": "2026-05-04T12:00:00-04:00"}
+    config = {
+        "llm_document_lookback_days": 90,
+        "llm_incremental_document_lookback_days": 7,
+        "llm_full_document_refresh_days": 7,
+    }
+
+    due_plan = orch._llm_sidecar_fetch_plan(config, state, now)
+    forced_plan = orch._llm_sidecar_fetch_plan(
+        config,
+        state,
+        datetime(2026, 5, 5, 12, 0, tzinfo=ET),
+        force_full_fetch=True,
+    )
+
+    assert due_plan["mode"] == "full"
+    assert due_plan["lookback_days"] == 90
+    assert forced_plan["mode"] == "full"
+    assert forced_plan["lookback_days"] == 90
+
+
 def test_smart_command_defaults_to_status_after_same_day_run(monkeypatch):
     calls = []
     now = datetime(2026, 5, 4, 12, 0, tzinfo=ET)

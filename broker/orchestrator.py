@@ -40,6 +40,8 @@ ORCHESTRATOR_STATE_FIELDS = {
     "last_replay_validation_at": None,
     "last_universe_refresh_at": None,
     "last_llm_sidecar_run_at": None,
+    "last_llm_sidecar_full_fetch_at": None,
+    "last_event_sidecar_run_at": None,
     "last_daily_run_id": None,
     "last_daily_output_root": None,
     "last_force_run_at": None,
@@ -73,6 +75,14 @@ TASK_REGISTRY = (
         name="llm_sidecar",
         cadence_days=1,
         last_run_field="last_llm_sidecar_run_at",
+        phase="pre_cycle",
+        blocking=False,
+        heavy=False,
+    ),
+    PeriodicTask(
+        name="event_sidecar",
+        cadence_days=1,
+        last_run_field="last_event_sidecar_run_at",
         phase="pre_cycle",
         blocking=False,
         heavy=False,
@@ -126,6 +136,38 @@ def _sidecar_quality_report_kwargs(config: dict) -> dict[str, Any]:
         "max_manual_review_queue": int(config.get("llm_quality_max_review_backlog", 50)),
         "min_trusted_parses": int(config.get("llm_quality_min_trusted_parses", 20)),
         "max_staleness_days": int(config.get("llm_quality_max_staleness_days", 14)),
+    }
+
+
+def _llm_sidecar_fetch_plan(
+    config: dict,
+    state: dict[str, Any] | None = None,
+    now: datetime | None = None,
+    *,
+    force_full_fetch: bool = False,
+) -> dict[str, Any]:
+    full_lookback_days = max(1, int(config.get("llm_document_lookback_days", 90)))
+    incremental_lookback_days = max(
+        1,
+        int(config.get("llm_incremental_document_lookback_days", 7)),
+    )
+    full_refresh_days = max(1, int(config.get("llm_full_document_refresh_days", 7)))
+    days_since_full = _days_since(
+        (state or {}).get("last_llm_sidecar_full_fetch_at"),
+        now,
+    )
+    use_full = force_full_fetch or days_since_full >= full_refresh_days
+
+    if use_full:
+        return {
+            "mode": "full",
+            "lookback_days": full_lookback_days,
+            "full_refresh_due": days_since_full >= full_refresh_days,
+        }
+    return {
+        "mode": "incremental",
+        "lookback_days": min(full_lookback_days, incremental_lookback_days),
+        "full_refresh_due": False,
     }
 
 
@@ -206,6 +248,8 @@ def get_due_periodic_tasks(
         if bool(cfg.get(f"disable_{task.name}", False)):
             continue
         if task.name == "llm_sidecar" and not bool(cfg.get("enable_llm_sidecar_precompute", False)):
+            continue
+        if task.name == "event_sidecar" and not bool(cfg.get("enable_event_sidecar_precompute", False)):
             continue
         if force or _days_since(state.get(task.last_run_field), now) >= task.cadence_days:
             due.append(task)
@@ -467,12 +511,24 @@ def _run_shadow_task(config: dict, args: Any) -> None:
     print(get_shadow_summary())
 
 
-def _run_llm_sidecar_task(config: dict) -> dict[str, Any]:
+def _run_llm_sidecar_task(
+    config: dict,
+    state: dict[str, Any] | None = None,
+    now: datetime | None = None,
+    *,
+    force_full_fetch: bool = False,
+) -> dict[str, Any]:
     from data_sources.document_store import DocumentStore
     from llm.feature_adapter import persist_feature_record
     from llm.transcript_parser import parse_transcript_event
 
     store_dir = config.get("llm_document_store_dir", "broker/state/document_store")
+    fetch_plan = _llm_sidecar_fetch_plan(
+        config,
+        state,
+        now,
+        force_full_fetch=force_full_fetch,
+    )
 
     # ── Step 1: Auto-fetch documents for current universe ─────────────────────
     try:
@@ -489,13 +545,15 @@ def _run_llm_sidecar_task(config: dict) -> dict[str, Any]:
             fetch_result = fetch_documents_for_universe(
                 tickers=tickers[:500],  # cap at 500 to avoid very long runs
                 store_dir=store_dir,
-                lookback_days=int(config.get("llm_document_lookback_days", 90)),
+                lookback_days=int(fetch_plan["lookback_days"]),
                 fetch_sec=bool(config.get("llm_fetch_sec_filings", True)),
                 fetch_news=bool(config.get("llm_fetch_earnings_news", True)),
                 max_chars=int(config.get("llm_max_document_chars", 24000)),
             )
             logger.info(
-                "Document fetch: %d SEC filings, %d news articles",
+                "Document fetch (%s, lookback=%dd): %d SEC filings, %d news articles",
+                fetch_plan["mode"],
+                int(fetch_plan["lookback_days"]),
                 fetch_result.get("sec_stored", 0),
                 fetch_result.get("news_stored", 0),
             )
@@ -554,7 +612,87 @@ def _run_llm_sidecar_task(config: dict) -> dict[str, Any]:
         )
     except Exception as exc:
         logger.warning("Could not write LLM sidecar quality report: %s", exc)
-    return {"processed": processed, "failed": failed}
+    return {
+        "processed": processed,
+        "failed": failed,
+        "fetch_mode": fetch_plan["mode"],
+        "fetch_lookback_days": int(fetch_plan["lookback_days"]),
+    }
+
+
+def _cached_sector_map_for_tickers(tickers: list[str]) -> dict[str, str]:
+    try:
+        from broker.sectors import SECTOR_CACHE_PATH, _STATIC_SECTOR_MAP
+
+        cached = {}
+        if SECTOR_CACHE_PATH.exists():
+            cached = _read_json(SECTOR_CACHE_PATH, {})
+        result = {}
+        for ticker in tickers or []:
+            symbol = str(ticker).upper()
+            sector = _STATIC_SECTOR_MAP.get(symbol) or cached.get(symbol)
+            if sector:
+                result[symbol] = str(sector)
+        return result
+    except Exception:
+        return {}
+
+
+def _run_event_sidecar_task(config: dict, now: datetime | None = None) -> dict[str, Any]:
+    from event_sidecar.feature_adapter import precompute_event_features, summarize_event_features
+    from event_sidecar.fetcher import fetch_and_store_market_events
+    from pipeline.checkpoints import load_checkpoint_asset_list
+    from pipeline.universe_resolver import resolve_configured_universe
+
+    cache_dir = config.get("event_sidecar_cache_dir", "broker/state/event_sidecar")
+    tickers = load_checkpoint_asset_list(save_dir="models") or []
+    if not tickers:
+        tickers = resolve_configured_universe(config=config)
+    tickers = [str(t).upper() for t in (tickers or [])[: int(config.get("event_sidecar_max_tickers", 500))]]
+    if not tickers:
+        return {"stored_events": 0, "feature_records": 0, "tickers": 0}
+
+    fetch_result = fetch_and_store_market_events(
+        tickers,
+        cache_dir=cache_dir,
+        lookback_days=int(config.get("event_sidecar_fetch_lookback_days", 3)),
+        include_gdelt=bool(config.get("event_sidecar_fetch_gdelt", True)),
+        include_sentiment_csv=bool(config.get("event_sidecar_use_sentiment_csv", True)),
+        max_gdelt_records_per_query=int(config.get("event_sidecar_max_gdelt_records_per_query", 15)),
+        sentiment_csv_limit=int(config.get("event_sidecar_sentiment_csv_limit", 500)),
+    )
+    feature_result = precompute_event_features(
+        tickers,
+        cache_dir=cache_dir,
+        sector_map=_cached_sector_map_for_tickers(tickers),
+        lookback_days=int(config.get("event_sidecar_feature_lookback_days", 14)),
+        as_of_date=(now or now_et()).date().isoformat(),
+    )
+    summary = summarize_event_features(
+        tickers,
+        cache_dir=cache_dir,
+        output_path=config.get("event_sidecar_summary_path", "broker/state/event_sidecar_summary.json"),
+    )
+    try:
+        from event_sidecar.quality_report import write_event_sidecar_quality_report
+
+        write_event_sidecar_quality_report(
+            config.get("event_sidecar_quality_path", "broker/state/event_sidecar_quality_report.json"),
+            cache_dir=cache_dir,
+            price_path=config.get("event_sidecar_quality_price_path", "MasterDS/stooq_panel.parquet"),
+            min_samples_for_influence=int(config.get("event_sidecar_quality_min_samples", 30)),
+            min_directional_accuracy=float(
+                config.get("event_sidecar_quality_min_directional_accuracy", 0.52)
+            ),
+            max_abs_mean_error=float(config.get("event_sidecar_quality_max_abs_mean_error", 0.03)),
+        )
+    except Exception as exc:
+        logger.warning("Could not write event sidecar quality report: %s", exc)
+    return {
+        **fetch_result,
+        **feature_result,
+        "tickers_with_events": int(summary.get("tickers_with_events", 0) or 0),
+    }
 
 
 def run_due_periodic_tasks(
@@ -596,6 +734,9 @@ def run_due_periodic_tasks(
         ):
             skipped.append(task.name)
             continue
+        if task.name == "event_sidecar" and not bool(config.get("enable_event_sidecar_precompute", False)):
+            skipped.append(task.name)
+            continue
         if task.name in {"policy_review", "replay_validation"} and not bool(
             config.get(f"enable_{task.name}", False)
         ):
@@ -613,11 +754,28 @@ def run_due_periodic_tasks(
             elif task.name == "shadow_validation":
                 _run_shadow_task(config, args)
             elif task.name == "llm_sidecar":
-                result = _run_llm_sidecar_task(config)
+                result = _run_llm_sidecar_task(
+                    config,
+                    state,
+                    now,
+                    force_full_fetch=force,
+                )
                 logger.info(
-                    "LLM sidecar precompute complete: processed=%d failed=%d",
+                    "LLM sidecar precompute complete: fetch=%s/%dd processed=%d failed=%d",
+                    result.get("fetch_mode", "unknown"),
+                    int(result.get("fetch_lookback_days", 0)),
                     int(result.get("processed", 0)),
                     int(result.get("failed", 0)),
+                )
+                if result.get("fetch_mode") == "full":
+                    state["last_llm_sidecar_full_fetch_at"] = _iso_now(now)
+            elif task.name == "event_sidecar":
+                result = _run_event_sidecar_task(config, now)
+                logger.info(
+                    "Event sidecar precompute complete: stored_events=%d features=%d eventful=%d",
+                    int(result.get("stored_events", 0)),
+                    int(result.get("feature_records", 0)),
+                    int(result.get("tickers_with_events", 0)),
                 )
             else:
                 logger.info("Periodic task %s is registered but disabled until configured.", task.name)
@@ -820,8 +978,15 @@ def run_llm_sidecar_once(args: Any, config: dict, state: dict[str, Any] | None =
     executed: list[str] = []
     skipped: list[str] = []
     try:
-        _run_llm_sidecar_task(config)
+        result = _run_llm_sidecar_task(
+            config,
+            state,
+            now,
+            force_full_fetch=True,
+        )
         state["last_llm_sidecar_run_at"] = _iso_now(now)
+        if result.get("fetch_mode") == "full":
+            state["last_llm_sidecar_full_fetch_at"] = _iso_now(now)
         _record_task(state, "llm_sidecar", "complete", now=now, run_id=run_id)
         executed.append("llm_sidecar")
         return state

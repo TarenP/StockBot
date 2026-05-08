@@ -143,6 +143,10 @@ class BrokerBrain:
         llm_sidecar_features: dict | None = None,
         llm_sidecar_broker_influence: bool = False,
         llm_sidecar_min_confidence: float = 0.65,
+        event_sidecar_features: dict | None = None,
+        event_sidecar_broker_influence: bool = False,
+        pattern_features: dict | None = None,
+        pattern_sidecar_broker_influence: bool = False,
         avoid_earnings_days:  int   = 3,       # skip stocks within N days of earnings
         device=None,
         rl_enabled:           bool  = False,
@@ -200,6 +204,14 @@ class BrokerBrain:
         }
         self.llm_sidecar_broker_influence = bool(llm_sidecar_broker_influence)
         self.llm_sidecar_min_confidence = float(llm_sidecar_min_confidence)
+        self.event_sidecar_features = {
+            str(k).upper(): v for k, v in (event_sidecar_features or {}).items()
+        }
+        self.event_sidecar_broker_influence = bool(event_sidecar_broker_influence)
+        self.pattern_features = {
+            str(k).upper(): v for k, v in (pattern_features or {}).items()
+        }
+        self.pattern_sidecar_broker_influence = bool(pattern_sidecar_broker_influence)
         self.avoid_earnings_days  = avoid_earnings_days
         self.device               = device
         self.rl_enabled           = rl_enabled
@@ -859,6 +871,19 @@ class BrokerBrain:
                         "llm_event_confidence": float(report.get("llm_event_confidence", 0.0) or 0.0),
                         "llm_event_trusted": bool(report.get("llm_event_trusted", False)),
                         "llm_thesis_impact": report.get("llm_thesis_impact", "unknown"),
+                        "event_score": float(report.get("event_score", 0.0) or 0.0),
+                        "event_risk_score": float(report.get("event_risk_score", 0.0) or 0.0),
+                        "event_opportunity_score": float(
+                            report.get("event_opportunity_score", 0.0) or 0.0
+                        ),
+                        "event_mention_count": int(report.get("event_mention_count", 0) or 0),
+                        "event_top_types": ",".join(report.get("event_top_types", []) or []),
+                        "crowd_mention_velocity": float(
+                            report.get("crowd_mention_velocity", 0.0) or 0.0
+                        ),
+                        "pattern_score": float(report.get("pattern_score", 0.0) or 0.0),
+                        "pattern_confidence": float(report.get("pattern_confidence", 0.0) or 0.0),
+                        "primary_pattern": report.get("primary_pattern", "none"),
                         "rank_score": float(report["rank_score"]),
                     }
                 )
@@ -1354,6 +1379,19 @@ class BrokerBrain:
                         "llm_event_confidence": float(report.get("llm_event_confidence", 0.0) or 0.0),
                         "llm_event_trusted": bool(report.get("llm_event_trusted", False)),
                         "llm_thesis_impact": report.get("llm_thesis_impact", "unknown"),
+                        "event_score": float(report.get("event_score", 0.0) or 0.0),
+                        "event_risk_score": float(report.get("event_risk_score", 0.0) or 0.0),
+                        "event_opportunity_score": float(
+                            report.get("event_opportunity_score", 0.0) or 0.0
+                        ),
+                        "event_mention_count": int(report.get("event_mention_count", 0) or 0),
+                        "event_top_types": ",".join(report.get("event_top_types", []) or []),
+                        "crowd_mention_velocity": float(
+                            report.get("crowd_mention_velocity", 0.0) or 0.0
+                        ),
+                        "pattern_score": float(report.get("pattern_score", 0.0) or 0.0),
+                        "pattern_confidence": float(report.get("pattern_confidence", 0.0) or 0.0),
+                        "primary_pattern": report.get("primary_pattern", "none"),
                         "rank_score": float(report.get("rank_score", score)),
                         "sentiment_label": sentiment_label,
                         "sentiment_policy": self.sentiment_policy,
@@ -1431,11 +1469,15 @@ class BrokerBrain:
         report = research(ticker)
         if report is not None:
             self._attach_llm_sidecar_features(ticker, report)
+            self._attach_event_sidecar_features(ticker, report)
+            self._attach_pattern_features(ticker, report)
             return report, False
 
         fallback = research_from_features(df_features, ticker)
         if fallback is not None:
             self._attach_llm_sidecar_features(ticker, fallback)
+            self._attach_event_sidecar_features(ticker, fallback)
+            self._attach_pattern_features(ticker, fallback)
         return fallback, fallback is not None
 
     def _attach_llm_sidecar_features(self, ticker: str, report: dict) -> None:
@@ -1454,6 +1496,36 @@ class BrokerBrain:
         if self.llm_sidecar_broker_influence and bool(report["llm_event_trusted"]):
             score = self._llm_sidecar_soft_score(features)
             report["earnings_reaction_score"] = score
+
+    def _attach_event_sidecar_features(self, ticker: str, report: dict) -> None:
+        features = self.event_sidecar_features.get(str(ticker).upper())
+        if not isinstance(features, dict):
+            return
+        report["event_sidecar"] = dict(features)
+        report["event_score"] = float(features.get("event_score", 0.0) or 0.0)
+        report["event_risk_score"] = float(features.get("event_risk_score", 0.0) or 0.0)
+        report["event_opportunity_score"] = float(features.get("event_opportunity_score", 0.0) or 0.0)
+        report["crowd_sentiment_score"] = float(features.get("crowd_sentiment_score", 0.0) or 0.0)
+        report["crowd_mention_velocity"] = float(features.get("crowd_mention_velocity", 0.0) or 0.0)
+        report["event_mention_count"] = int(features.get("mention_count", 0) or 0)
+        report["event_source_count"] = int(features.get("source_count", 0) or 0)
+        report["event_top_types"] = list(features.get("top_event_types") or [])[:5]
+        report["event_top_events"] = list(features.get("top_events") or [])[:5]
+        report["event_confidence"] = float(features.get("confidence", 0.0) or 0.0)
+        if self.event_sidecar_broker_influence:
+            logger.warning("event_sidecar_broker_influence is diagnostics-only in this build.")
+
+    def _attach_pattern_features(self, ticker: str, report: dict) -> None:
+        features = self.pattern_features.get(str(ticker).upper())
+        if not isinstance(features, dict):
+            return
+        report["pattern_sidecar"] = dict(features)
+        report["pattern_score"] = float(features.get("pattern_score", 0.0) or 0.0)
+        report["pattern_confidence"] = float(features.get("pattern_confidence", 0.0) or 0.0)
+        report["primary_pattern"] = features.get("primary_pattern", "none")
+        report["active_patterns"] = list(features.get("active_patterns") or [])[:5]
+        if self.pattern_sidecar_broker_influence:
+            logger.warning("pattern_sidecar_broker_influence is diagnostics-only in this build.")
 
     @staticmethod
     def _llm_sidecar_soft_score(features: dict) -> float:

@@ -23,6 +23,9 @@ PERFORMANCE_ATTRIBUTION_PATH = Path("broker/state/performance_attribution.json")
 PARITY_REPORT_PATH = Path("broker/state/replay_live_parity.json")
 LLM_SIDECAR_SUMMARY_PATH = Path("broker/state/llm_sidecar_summary.json")
 LLM_SIDECAR_QUALITY_PATH = Path("broker/state/llm_sidecar_quality_report.json")
+EVENT_SIDECAR_SUMMARY_PATH = Path("broker/state/event_sidecar_summary.json")
+EVENT_SIDECAR_QUALITY_PATH = Path("broker/state/event_sidecar_quality_report.json")
+MACRO_SHOCK_SUMMARY_PATH = Path("broker/state/macro_shock_summary.json")
 
 
 # ── Cycle logging ─────────────────────────────────────────────────────────────
@@ -228,6 +231,9 @@ def _print_status_snapshot(portfolio, eq: pd.DataFrame | None) -> None:
     parity = _load_json_file(PARITY_REPORT_PATH)
     llm_sidecar = _load_json_file(LLM_SIDECAR_SUMMARY_PATH)
     llm_quality = _load_json_file(LLM_SIDECAR_QUALITY_PATH)
+    event_sidecar = _load_json_file(EVENT_SIDECAR_SUMMARY_PATH)
+    event_quality = _load_json_file(EVENT_SIDECAR_QUALITY_PATH)
+    macro_shock = _load_json_file(MACRO_SHOCK_SUMMARY_PATH)
 
     print(f"\n  {'-'*55}")
     print("  Current Status")
@@ -359,6 +365,34 @@ def _print_status_snapshot(portfolio, eq: pd.DataFrame | None) -> None:
             f"coverage={coverage_text} "
             f"review={len(llm_quality.get('manual_review_queue') or [])} "
             f"gate={decision}"
+        )
+    if event_sidecar:
+        top_risk = event_sidecar.get("top_risk_tickers") or []
+        top_opp = event_sidecar.get("top_opportunity_tickers") or []
+        risk_text = top_risk[0]["ticker"] if top_risk else "none"
+        opp_text = top_opp[0]["ticker"] if top_opp else "none"
+        print(
+            "  Event sidecar:   "
+            f"{int(event_sidecar.get('tickers_with_events', 0) or 0)}/"
+            f"{int(event_sidecar.get('tickers_checked', 0) or 0)} tickers with events; "
+            f"risk={risk_text} opp={opp_text}"
+        )
+    if event_quality:
+        go_no_go = event_quality.get("go_no_go") or {}
+        stats = (event_quality.get("horizon_stats") or {}).get("ret_fwd_5d") or {}
+        print(
+            "  Event quality:   "
+            f"records={int(event_quality.get('feature_records', 0) or 0)} "
+            f"5d_samples={int(stats.get('samples', 0) or 0)} "
+            f"hit={_fmt_optional_pct(stats.get('directional_accuracy'))} "
+            f"gate={go_no_go.get('decision', 'unknown')}"
+        )
+    if macro_shock and macro_shock.get("available"):
+        print(
+            "  Macro shock:     "
+            f"{macro_shock.get('risk_state', 'unknown')} "
+            f"stress={_fmt_optional_pct(macro_shock.get('stress_score'))} "
+            f"breadth={_fmt_optional_pct(macro_shock.get('market_breadth'))}"
         )
 
     command_label = os.environ.get("BROKER_DISPLAY_COMMAND", "python Broker.py --status")

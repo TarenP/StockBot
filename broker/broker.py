@@ -25,6 +25,7 @@ Schedule it however you like:
 """
 
 import argparse
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -171,6 +172,62 @@ def _load_llm_sidecar_features_for_cycle(
     except Exception as exc:
         logger.warning("LLM sidecar feature load failed; continuing without it: %s", exc)
         return {}, {"enabled": True, "mode": "degraded", "loaded_tickers": 0, "error": str(exc)}
+
+
+def _load_event_sidecar_features_for_cycle(
+    tickers: list[str],
+    config: dict | None,
+    as_of_date: str | None = None,
+) -> tuple[dict[str, dict], dict[str, object]]:
+    cfg = config or {}
+    if not bool(cfg.get("event_sidecar_enabled", False)):
+        return {}, {"enabled": False, "loaded_tickers": 0, "mode": "disabled"}
+    try:
+        from event_sidecar.feature_adapter import load_cached_event_features
+
+        features = load_cached_event_features(
+            tickers,
+            cache_dir=cfg.get("event_sidecar_cache_dir", "broker/state/event_sidecar"),
+            min_confidence=float(cfg.get("event_sidecar_min_confidence", 0.0)),
+            as_of_date=as_of_date,
+        )
+        return features, {
+            "enabled": True,
+            "mode": "cached_features_only",
+            "loaded_tickers": len(features),
+            "broker_influence": bool(cfg.get("event_sidecar_broker_influence", False)),
+            "min_confidence": float(cfg.get("event_sidecar_min_confidence", 0.0)),
+        }
+    except Exception as exc:
+        logger.warning("Event sidecar feature load failed; continuing without it: %s", exc)
+        return {}, {"enabled": True, "mode": "degraded", "loaded_tickers": 0, "error": str(exc)}
+
+
+def _event_sidecar_influence_allowed(config: dict | None) -> tuple[bool, dict[str, object]]:
+    cfg = config or {}
+    requested = bool(cfg.get("event_sidecar_broker_influence", False))
+    if not requested:
+        return False, {"requested": False, "allowed": False, "decision": "disabled"}
+    if not bool(cfg.get("event_sidecar_require_quality_gate", True)):
+        return True, {"requested": True, "allowed": True, "decision": "quality_gate_bypassed"}
+    try:
+        report_path = Path(cfg.get("event_sidecar_quality_path", "broker/state/event_sidecar_quality_report.json"))
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        go_no_go = payload.get("go_no_go") or {}
+        allowed = bool(go_no_go.get("influence_allowed", False))
+        return allowed, {
+            "requested": True,
+            "allowed": allowed,
+            "decision": go_no_go.get("decision", "unknown"),
+            "failed_criteria": go_no_go.get("failed_criteria") or [],
+        }
+    except Exception as exc:
+        return False, {
+            "requested": True,
+            "allowed": False,
+            "decision": "quality_report_unavailable",
+            "error": str(exc),
+        }
 
 
 def _sidecar_quality_report_kwargs(config: dict | None, tickers=None) -> dict:
@@ -321,6 +378,42 @@ def run_cycle(
     brain.llm_sidecar_broker_influence = bool(cfg.get("llm_sidecar_broker_influence", False))
     brain.llm_sidecar_min_confidence = float(cfg.get("llm_sidecar_min_confidence", 0.65))
     run_manifest["llm_sidecar"] = sidecar_status
+    event_features, event_status = _load_event_sidecar_features_for_cycle(
+        sidecar_tickers,
+        cfg,
+        as_of_date=latest_data_date,
+    )
+    brain.event_sidecar_features = event_features
+    event_influence_allowed, event_influence_gate = _event_sidecar_influence_allowed(cfg)
+    brain.event_sidecar_broker_influence = event_influence_allowed
+    event_status["influence_gate"] = event_influence_gate
+    run_manifest["event_sidecar"] = event_status
+    if bool(cfg.get("pattern_sidecar_enabled", False)):
+        try:
+            from pipeline.patterns import build_pattern_features
+
+            pattern_features = build_pattern_features(df, sidecar_tickers)
+        except Exception as exc:
+            logger.warning("Pattern diagnostics failed; continuing without them: %s", exc)
+            pattern_features = {}
+    else:
+        pattern_features = {}
+    brain.pattern_features = pattern_features
+    brain.pattern_sidecar_broker_influence = bool(cfg.get("pattern_sidecar_broker_influence", False))
+    run_manifest["pattern_sidecar"] = {
+        "enabled": bool(cfg.get("pattern_sidecar_enabled", False)),
+        "mode": "diagnostics_only",
+        "loaded_tickers": len(pattern_features),
+        "broker_influence": bool(cfg.get("pattern_sidecar_broker_influence", False)),
+    }
+    if bool(cfg.get("macro_shock_dashboard_enabled", False)):
+        try:
+            from pipeline.macro_dashboard import write_macro_shock_summary
+
+            run_manifest["macro_shock"] = write_macro_shock_summary(df)
+        except Exception as exc:
+            logger.warning("Macro shock dashboard failed; continuing without it: %s", exc)
+            run_manifest["macro_shock"] = {"available": False, "error": str(exc)}
     cfg = config or {}
     min_price_coverage = float(cfg.get("min_fresh_price_coverage", 0.90))
     min_sentiment_coverage = float(cfg.get("min_fresh_sentiment_coverage", 0.50))
@@ -609,6 +702,10 @@ def parse_args(config: dict = None):
     p.add_argument("--llm_sidecar_enabled", action="store_true", default=cfg.get("llm_sidecar_enabled", False))
     p.add_argument("--llm_sidecar_broker_influence", action="store_true", default=cfg.get("llm_sidecar_broker_influence", False))
     p.add_argument("--llm_sidecar_min_confidence", type=float, default=cfg.get("llm_sidecar_min_confidence", 0.65))
+    p.add_argument("--event_sidecar_enabled", action="store_true", default=cfg.get("event_sidecar_enabled", False))
+    p.add_argument("--event_sidecar_broker_influence", action="store_true", default=cfg.get("event_sidecar_broker_influence", False))
+    p.add_argument("--pattern_sidecar_enabled", action="store_true", default=cfg.get("pattern_sidecar_enabled", False))
+    p.add_argument("--pattern_sidecar_broker_influence", action="store_true", default=cfg.get("pattern_sidecar_broker_influence", False))
     p.add_argument("--avoid_earnings", type=int,   default=cfg.get("avoid_earnings", 5))
     p.add_argument("--top_n",          type=int,   default=cfg.get("top_n",          500))
     p.add_argument("--max_daily_loss", type=float, default=cfg.get("max_daily_loss", 0.025))
@@ -731,6 +828,8 @@ def main(config: dict = None, maintenance_context: dict | None = None):
         insider_adjustment_weight_strength = args.insider_adjustment_weight_strength,
         llm_sidecar_broker_influence = args.llm_sidecar_broker_influence,
         llm_sidecar_min_confidence = args.llm_sidecar_min_confidence,
+        event_sidecar_broker_influence = args.event_sidecar_broker_influence,
+        pattern_sidecar_broker_influence = args.pattern_sidecar_broker_influence,
         avoid_earnings_days = args.avoid_earnings,
         device              = DEVICE,
         rl_enabled          = args.rl_enabled,

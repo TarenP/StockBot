@@ -108,6 +108,32 @@ def test_brain_attaches_sidecar_features_without_broker_influence():
     assert "earnings_reaction_score" not in report
 
 
+def test_brain_attaches_event_sidecar_features_without_broker_influence():
+    brain = BrokerBrain(
+        portfolio=_Portfolio(),
+        event_sidecar_features={
+            "AAA": {
+                "event_score": -0.2,
+                "event_risk_score": 0.3,
+                "event_opportunity_score": 0.0,
+                "crowd_sentiment_score": -0.1,
+                "mention_count": 2,
+                "source_count": 1,
+                "top_event_types": ["conflict"],
+                "confidence": 0.7,
+            }
+        },
+        event_sidecar_broker_influence=False,
+    )
+    report = {"ticker": "AAA", "composite_score": 0.9}
+
+    brain._attach_event_sidecar_features("AAA", report)
+
+    assert report["event_risk_score"] == 0.3
+    assert report["event_top_types"] == ["conflict"]
+    assert "earnings_reaction_score" not in report
+
+
 def test_replay_safety_blocks_future_dated_cached_features():
     cache_dir = _test_cache_dir()
     parsed = TranscriptEventParse(

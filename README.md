@@ -219,8 +219,10 @@ after replay validation and promotion review.
 
 Precompute is enabled by default through `enable_llm_sidecar_precompute = true`.
 That only refreshes cached parses and quality reports; it does not give the
-sidecar trading authority. If Ollama or documents are unavailable, the broker
-continues normally and the quality report records the degraded coverage.
+sidecar trading authority. Daily precompute uses a short incremental document
+lookback, while a full `llm_document_lookback_days` sweep runs weekly or when
+`--refresh-ai-sidecar` is used. If Ollama or documents are unavailable, the
+broker continues normally and the quality report records the degraded coverage.
 
 Useful paths:
 
@@ -229,6 +231,26 @@ Useful paths:
 - `broker/state/llm_cache/features/` compact broker-readable features
 - `broker/state/llm_sidecar_summary.json` current diagnostic summary
 - `broker/state/llm_sidecar_quality_report.json` coverage, confidence, and manual-review queue
+- `broker/state/event_sidecar/` cached market-event and headline-sentiment diagnostics
+- `broker/state/event_sidecar_summary.json` current event-sidecar summary
+
+### Market event sidecar
+
+The event sidecar is also diagnostics-only by default. It collects lightweight
+global event context from public GDELT article search, reuses the existing
+FinBERT headline sentiment CSV, maps event types such as conflict, sanctions,
+oil shocks, rates, inflation, cyber, and supply-chain disruptions to sector and
+ticker exposures, then caches broker-readable event risk/opportunity features.
+The companion quality report compares cached event scores with forward returns
+and keeps influence blocked unless minimum sample, hit-rate, and calibration
+thresholds pass. `event_sidecar_broker_influence = false` keeps those features
+out of trading authority by default.
+
+The broker also writes diagnostics for named technical patterns and macro shock
+state. Pattern features identify setups such as breakouts, failed breakouts,
+volatility contraction, accumulation/distribution, gap-and-hold/fade, and
+post-earnings drift. Macro shock diagnostics summarize risk-on/risk-off context
+from index momentum, VIX, breadth, and return dispersion.
 
 Manual precompute:
 
