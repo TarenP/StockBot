@@ -132,15 +132,16 @@ class BrokerBrain:
         low_price_rank_policy: str = "late_cap",
         low_price_rank_penalty_mult: float = 0.70,
         low_price_high_rank_floor: float = 0.80,
-        earnings_reaction_enabled: bool = True,
+        earnings_reaction_enabled: bool = False,
         earnings_reaction_rank_strength: float = 0.10,
         earnings_reaction_weight_strength: float = 0.10,
-        macro_regime_enabled: bool = True,
+        macro_regime_enabled: bool = False,
         macro_regime_weight_strength: float = 0.08,
         macro_regime_mode: str = "standard",
-        insider_adjustment_enabled: bool = True,
+        insider_adjustment_enabled: bool = False,
         insider_adjustment_rank_strength: float = 0.08,
         insider_adjustment_weight_strength: float = 0.08,
+        allow_unpromoted_feature_influence: bool = False,
         llm_sidecar_features: dict | None = None,
         llm_sidecar_broker_influence: bool = False,
         llm_sidecar_min_confidence: float = 0.65,
@@ -201,6 +202,7 @@ class BrokerBrain:
         self.insider_adjustment_enabled = bool(insider_adjustment_enabled)
         self.insider_adjustment_rank_strength = insider_adjustment_rank_strength
         self.insider_adjustment_weight_strength = insider_adjustment_weight_strength
+        self.allow_unpromoted_feature_influence = bool(allow_unpromoted_feature_influence)
         self.llm_sidecar_features = {
             str(k).upper(): v for k, v in (llm_sidecar_features or {}).items()
         }
@@ -1495,9 +1497,18 @@ class BrokerBrain:
         report["llm_margin_outlook"] = features.get("margin_outlook", "unknown")
         report["llm_thesis_impact"] = features.get("thesis_impact", "unknown")
         report["llm_top_risks"] = list(features.get("top_risks") or [])[:5]
-        if self.llm_sidecar_broker_influence and bool(report["llm_event_trusted"]):
+        report["llm_diagnostic_only"] = True
+        report["llm_broker_influence"] = False
+        report["llm_promotion_status"] = "unpromoted"
+        if (
+            self.llm_sidecar_broker_influence
+            and self.allow_unpromoted_feature_influence
+            and bool(report["llm_event_trusted"])
+        ):
             score = self._llm_sidecar_soft_score(features)
             report["earnings_reaction_score"] = score
+            report["llm_diagnostic_only"] = False
+            report["llm_broker_influence"] = True
 
     def _attach_event_sidecar_features(self, ticker: str, report: dict) -> None:
         features = self.event_sidecar_features.get(str(ticker).upper())
@@ -1514,6 +1525,9 @@ class BrokerBrain:
         report["event_top_types"] = list(features.get("top_event_types") or [])[:5]
         report["event_top_events"] = list(features.get("top_events") or [])[:5]
         report["event_confidence"] = float(features.get("confidence", 0.0) or 0.0)
+        report["event_diagnostic_only"] = True
+        report["event_broker_influence"] = False
+        report["event_promotion_status"] = "unpromoted"
         if self.event_sidecar_broker_influence:
             logger.warning("event_sidecar_broker_influence is diagnostics-only in this build.")
 
@@ -1526,6 +1540,9 @@ class BrokerBrain:
         report["pattern_confidence"] = float(features.get("pattern_confidence", 0.0) or 0.0)
         report["primary_pattern"] = features.get("primary_pattern", "none")
         report["active_patterns"] = list(features.get("active_patterns") or [])[:5]
+        report["pattern_diagnostic_only"] = True
+        report["pattern_broker_influence"] = False
+        report["pattern_promotion_status"] = "unpromoted"
         if self.pattern_sidecar_broker_influence:
             logger.warning("pattern_sidecar_broker_influence is diagnostics-only in this build.")
 
@@ -1680,27 +1697,54 @@ class BrokerBrain:
         rank_scale = 1.0
         weight_scale = 1.0
 
-        if self.earnings_reaction_enabled:
-            score, source = self._earnings_reaction_score(report)
-            rank = self._scale_from_signal(score, self.earnings_reaction_rank_strength)
-            weight = self._scale_from_signal(score, self.earnings_reaction_weight_strength)
+        score, source = self._earnings_reaction_score(report)
+        if self.earnings_reaction_enabled or score is not None:
+            influence = bool(self.earnings_reaction_enabled and self.allow_unpromoted_feature_influence)
+            rank = self._scale_from_signal(score, self.earnings_reaction_rank_strength) if influence else 1.0
+            weight = self._scale_from_signal(score, self.earnings_reaction_weight_strength) if influence else 1.0
             rank_scale *= rank
             weight_scale *= weight
-            notes["earnings"] = {"score": score, "source": source, "rank": rank, "weight": weight}
+            notes["earnings"] = {
+                "score": score,
+                "source": source,
+                "rank": rank,
+                "weight": weight,
+                "diagnostic_only": not influence,
+                "broker_influence": influence,
+                "promotion_status": "unpromoted",
+            }
 
-        if self.macro_regime_enabled:
-            score, source = self._macro_regime_score(market_regime, report)
-            weight = self._scale_from_signal(score, self.macro_regime_weight_strength)
+        score, source = self._macro_regime_score(market_regime, report)
+        if self.macro_regime_enabled or score is not None:
+            influence = bool(self.macro_regime_enabled and self.allow_unpromoted_feature_influence)
+            weight = self._scale_from_signal(score, self.macro_regime_weight_strength) if influence else 1.0
             weight_scale *= weight
-            notes["macro"] = {"score": score, "source": source, "rank": 1.0, "weight": weight}
+            notes["macro"] = {
+                "score": score,
+                "source": source,
+                "rank": 1.0,
+                "weight": weight,
+                "diagnostic_only": not influence,
+                "broker_influence": influence,
+                "promotion_status": "unpromoted",
+            }
 
-        if self.insider_adjustment_enabled:
-            score, source = self._insider_signal_score(report)
-            rank = self._scale_from_signal(score, self.insider_adjustment_rank_strength)
-            weight = self._scale_from_signal(score, self.insider_adjustment_weight_strength)
+        score, source = self._insider_signal_score(report)
+        if self.insider_adjustment_enabled or score is not None:
+            influence = bool(self.insider_adjustment_enabled and self.allow_unpromoted_feature_influence)
+            rank = self._scale_from_signal(score, self.insider_adjustment_rank_strength) if influence else 1.0
+            weight = self._scale_from_signal(score, self.insider_adjustment_weight_strength) if influence else 1.0
             rank_scale *= rank
             weight_scale *= weight
-            notes["insider"] = {"score": score, "source": source, "rank": rank, "weight": weight}
+            notes["insider"] = {
+                "score": score,
+                "source": source,
+                "rank": rank,
+                "weight": weight,
+                "diagnostic_only": not influence,
+                "broker_influence": influence,
+                "promotion_status": "unpromoted",
+            }
 
         return (
             float(np.clip(rank_scale, 0.50, 1.50)),

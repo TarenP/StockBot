@@ -43,6 +43,7 @@ def test_frozen_feature_config_disables_unpromoted_influence_layers():
             "earnings_reaction_enabled": True,
             "macro_regime_enabled": True,
             "insider_adjustment_enabled": True,
+            "allow_unpromoted_feature_influence": True,
             "event_sidecar_broker_influence": True,
         },
         "baseline",
@@ -51,6 +52,7 @@ def test_frozen_feature_config_disables_unpromoted_influence_layers():
     assert cfg["earnings_reaction_enabled"] is False
     assert cfg["macro_regime_enabled"] is False
     assert cfg["insider_adjustment_enabled"] is False
+    assert cfg["allow_unpromoted_feature_influence"] is False
     assert cfg["event_sidecar_broker_influence"] is False
     assert cfg["event_sidecar_enabled"] is True
 

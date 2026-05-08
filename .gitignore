@@ -3,6 +3,8 @@
 *.pt
 *.csv
 *.npz
+*.sqlite
+*.db
 
 # Python cache
 __pycache__/
@@ -14,6 +16,10 @@ StockData/
 
 # Broker runtime state
 broker/state/
+
+# Local market/data caches
+MasterDS/
+Sentiment/
 
 # Logs
 logs/
@@ -31,10 +37,16 @@ Thumbs.db
 # Test / hypothesis cache
 .hypothesis/
 .pytest_cache/
+pytest-cache-files-*/
 tests/_tmp/
 
 # Fold completion markers
 models/*.done
+models/*.json
+models/universe_snapshots/
+
+# Generated experiment outputs
+experiments/
 
 # IDE
 .vscode/

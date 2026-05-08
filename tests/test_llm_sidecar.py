@@ -108,6 +108,33 @@ def test_brain_attaches_sidecar_features_without_broker_influence():
     assert "earnings_reaction_score" not in report
 
 
+def test_llm_sidecar_influence_requires_explicit_experiment_gate():
+    features = {
+        "AAA": {
+            "llm_event_confidence": 0.95,
+            "llm_event_trusted": True,
+            "guidance_direction": "negative",
+            "management_tone": "negative",
+            "demand_outlook": "negative",
+            "margin_outlook": "negative",
+            "thesis_impact": "weakens",
+        }
+    }
+    brain = BrokerBrain(
+        portfolio=_Portfolio(),
+        llm_sidecar_features=features,
+        llm_sidecar_broker_influence=True,
+        allow_unpromoted_feature_influence=False,
+    )
+    report = {"ticker": "AAA", "composite_score": 0.9}
+
+    brain._attach_llm_sidecar_features("AAA", report)
+
+    assert report["llm_diagnostic_only"] is True
+    assert report["llm_broker_influence"] is False
+    assert "earnings_reaction_score" not in report
+
+
 def test_brain_attaches_event_sidecar_features_without_broker_influence():
     brain = BrokerBrain(
         portfolio=_Portfolio(),

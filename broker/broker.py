@@ -166,7 +166,10 @@ def _load_llm_sidecar_features_for_cycle(
             "enabled": True,
             "mode": "cached_features_only",
             "loaded_tickers": len(features),
-            "broker_influence": bool(cfg.get("llm_sidecar_broker_influence", False)),
+            "broker_influence": bool(
+                cfg.get("llm_sidecar_broker_influence", False)
+                and cfg.get("allow_unpromoted_feature_influence", False)
+            ),
             "min_confidence": float(cfg.get("llm_sidecar_min_confidence", 0.65)),
         }
     except Exception as exc:
@@ -195,7 +198,10 @@ def _load_event_sidecar_features_for_cycle(
             "enabled": True,
             "mode": "cached_features_only",
             "loaded_tickers": len(features),
-            "broker_influence": bool(cfg.get("event_sidecar_broker_influence", False)),
+            "broker_influence": bool(
+                cfg.get("event_sidecar_broker_influence", False)
+                and cfg.get("allow_unpromoted_feature_influence", False)
+            ),
             "min_confidence": float(cfg.get("event_sidecar_min_confidence", 0.0)),
         }
     except Exception as exc:
@@ -208,6 +214,12 @@ def _event_sidecar_influence_allowed(config: dict | None) -> tuple[bool, dict[st
     requested = bool(cfg.get("event_sidecar_broker_influence", False))
     if not requested:
         return False, {"requested": False, "allowed": False, "decision": "disabled"}
+    if not bool(cfg.get("allow_unpromoted_feature_influence", False)):
+        return False, {
+            "requested": True,
+            "allowed": False,
+            "decision": "unpromoted_experiment_gate_disabled",
+        }
     if not bool(cfg.get("event_sidecar_require_quality_gate", True)):
         return True, {"requested": True, "allowed": True, "decision": "quality_gate_bypassed"}
     try:
@@ -375,7 +387,8 @@ def run_cycle(
         as_of_date=latest_data_date,
     )
     brain.llm_sidecar_features = sidecar_features
-    brain.llm_sidecar_broker_influence = bool(cfg.get("llm_sidecar_broker_influence", False))
+    allow_unpromoted = bool(cfg.get("allow_unpromoted_feature_influence", False))
+    brain.llm_sidecar_broker_influence = bool(cfg.get("llm_sidecar_broker_influence", False) and allow_unpromoted)
     brain.llm_sidecar_min_confidence = float(cfg.get("llm_sidecar_min_confidence", 0.65))
     run_manifest["llm_sidecar"] = sidecar_status
     event_features, event_status = _load_event_sidecar_features_for_cycle(
@@ -399,12 +412,12 @@ def run_cycle(
     else:
         pattern_features = {}
     brain.pattern_features = pattern_features
-    brain.pattern_sidecar_broker_influence = bool(cfg.get("pattern_sidecar_broker_influence", False))
+    brain.pattern_sidecar_broker_influence = bool(cfg.get("pattern_sidecar_broker_influence", False) and allow_unpromoted)
     run_manifest["pattern_sidecar"] = {
         "enabled": bool(cfg.get("pattern_sidecar_enabled", False)),
         "mode": "diagnostics_only",
         "loaded_tickers": len(pattern_features),
-        "broker_influence": bool(cfg.get("pattern_sidecar_broker_influence", False)),
+        "broker_influence": bool(cfg.get("pattern_sidecar_broker_influence", False) and allow_unpromoted),
     }
     if bool(cfg.get("macro_shock_dashboard_enabled", False)):
         try:
@@ -700,6 +713,7 @@ def parse_args(config: dict = None):
     p.add_argument("--insider_adjustment_enabled", action="store_true", default=cfg.get("insider_adjustment_enabled", False))
     p.add_argument("--insider_adjustment_rank_strength", type=float, default=cfg.get("insider_adjustment_rank_strength", 0.08))
     p.add_argument("--insider_adjustment_weight_strength", type=float, default=cfg.get("insider_adjustment_weight_strength", 0.08))
+    p.add_argument("--allow_unpromoted_feature_influence", action="store_true", default=cfg.get("allow_unpromoted_feature_influence", False))
     p.add_argument("--llm_sidecar_enabled", action="store_true", default=cfg.get("llm_sidecar_enabled", False))
     p.add_argument("--llm_sidecar_broker_influence", action="store_true", default=cfg.get("llm_sidecar_broker_influence", False))
     p.add_argument("--llm_sidecar_min_confidence", type=float, default=cfg.get("llm_sidecar_min_confidence", 0.65))
@@ -828,6 +842,7 @@ def main(config: dict = None, maintenance_context: dict | None = None):
         insider_adjustment_enabled = args.insider_adjustment_enabled,
         insider_adjustment_rank_strength = args.insider_adjustment_rank_strength,
         insider_adjustment_weight_strength = args.insider_adjustment_weight_strength,
+        allow_unpromoted_feature_influence = args.allow_unpromoted_feature_influence,
         llm_sidecar_broker_influence = args.llm_sidecar_broker_influence,
         llm_sidecar_min_confidence = args.llm_sidecar_min_confidence,
         event_sidecar_broker_influence = args.event_sidecar_broker_influence,

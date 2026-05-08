@@ -133,6 +133,7 @@ FROZEN_BASELINE = {
     "macro_regime_enabled": False,
     "macro_regime_mode": "standard",
     "insider_adjustment_enabled": False,
+    "allow_unpromoted_feature_influence": False,
 }
 
 DIAGNOSTIC_DEFAULTS = {
@@ -168,9 +169,24 @@ class FeatureAblationVariant:
 
 FEATURE_ABLATION_VARIANTS = [
     FeatureAblationVariant("baseline", "baseline", {}),
-    FeatureAblationVariant("earnings_only", "active", {"earnings_reaction_enabled": True}, "earnings_reaction_score"),
-    FeatureAblationVariant("macro_only", "active", {"macro_regime_enabled": True}, "macro"),
-    FeatureAblationVariant("insider_only", "active", {"insider_adjustment_enabled": True}, "insider"),
+    FeatureAblationVariant(
+        "earnings_only",
+        "active",
+        {"earnings_reaction_enabled": True, "allow_unpromoted_feature_influence": True},
+        "earnings_reaction_score",
+    ),
+    FeatureAblationVariant(
+        "macro_only",
+        "active",
+        {"macro_regime_enabled": True, "allow_unpromoted_feature_influence": True},
+        "macro",
+    ),
+    FeatureAblationVariant(
+        "insider_only",
+        "active",
+        {"insider_adjustment_enabled": True, "allow_unpromoted_feature_influence": True},
+        "insider",
+    ),
     FeatureAblationVariant("event_sidecar_shadow", "sidecar_shadow", {}, "event_score"),
     FeatureAblationVariant("llm_sidecar_shadow", "sidecar_shadow", {}, "llm_event_confidence"),
     FeatureAblationVariant("pattern_sidecar_shadow", "sidecar_shadow", {}, "pattern_score"),
@@ -181,49 +197,81 @@ MACRO_ABLATION_SWEEP_VARIANTS = [
     FeatureAblationVariant(
         "macro_weight_0.02",
         "macro_sweep",
-        {"macro_regime_enabled": True, "macro_regime_weight_strength": 0.02},
+        {
+            "macro_regime_enabled": True,
+            "macro_regime_weight_strength": 0.02,
+            "allow_unpromoted_feature_influence": True,
+        },
         "macro",
     ),
     FeatureAblationVariant(
         "macro_weight_0.04",
         "macro_sweep",
-        {"macro_regime_enabled": True, "macro_regime_weight_strength": 0.04},
+        {
+            "macro_regime_enabled": True,
+            "macro_regime_weight_strength": 0.04,
+            "allow_unpromoted_feature_influence": True,
+        },
         "macro",
     ),
     FeatureAblationVariant(
         "macro_weight_0.06",
         "macro_sweep",
-        {"macro_regime_enabled": True, "macro_regime_weight_strength": 0.06},
+        {
+            "macro_regime_enabled": True,
+            "macro_regime_weight_strength": 0.06,
+            "allow_unpromoted_feature_influence": True,
+        },
         "macro",
     ),
     FeatureAblationVariant(
         "macro_weight_0.08",
         "macro_sweep",
-        {"macro_regime_enabled": True, "macro_regime_weight_strength": 0.08},
+        {
+            "macro_regime_enabled": True,
+            "macro_regime_weight_strength": 0.08,
+            "allow_unpromoted_feature_influence": True,
+        },
         "macro",
     ),
     FeatureAblationVariant(
         "macro_risk_off_only",
         "macro_sweep",
-        {"macro_regime_enabled": True, "macro_regime_mode": "risk_off_only"},
+        {
+            "macro_regime_enabled": True,
+            "macro_regime_mode": "risk_off_only",
+            "allow_unpromoted_feature_influence": True,
+        },
         "macro",
     ),
     FeatureAblationVariant(
         "macro_no_bull_boost",
         "macro_sweep",
-        {"macro_regime_enabled": True, "macro_regime_mode": "no_bull_boost"},
+        {
+            "macro_regime_enabled": True,
+            "macro_regime_mode": "no_bull_boost",
+            "allow_unpromoted_feature_influence": True,
+        },
         "macro",
     ),
     FeatureAblationVariant(
         "macro_drawdown_guard_only",
         "macro_sweep",
-        {"macro_regime_enabled": True, "macro_regime_mode": "drawdown_guard_only"},
+        {
+            "macro_regime_enabled": True,
+            "macro_regime_mode": "drawdown_guard_only",
+            "allow_unpromoted_feature_influence": True,
+        },
         "macro",
     ),
     FeatureAblationVariant(
         "macro_volatility_scaler_only",
         "macro_sweep",
-        {"macro_regime_enabled": True, "macro_regime_mode": "volatility_scaler_only"},
+        {
+            "macro_regime_enabled": True,
+            "macro_regime_mode": "volatility_scaler_only",
+            "allow_unpromoted_feature_influence": True,
+        },
         "macro",
     ),
 ]

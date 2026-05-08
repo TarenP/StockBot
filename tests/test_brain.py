@@ -351,18 +351,21 @@ def test_soft_signal_adjustments_are_neutral_without_data_when_macro_disabled():
 
     assert rank_scale == 1.0
     assert weight_scale == 1.0
-    assert "earnings:no_data" in brain._format_soft_signal_notes(notes)
-    assert "insider:no_data" in brain._format_soft_signal_notes(notes)
+    assert brain._format_soft_signal_notes(notes) == ""
 
 
 def test_soft_signal_adjustments_use_earnings_macro_and_insider_scores():
     brain = BrokerBrain(
         portfolio=_EmptyPortfolio(),
+        earnings_reaction_enabled=True,
         earnings_reaction_rank_strength=0.10,
         earnings_reaction_weight_strength=0.10,
+        macro_regime_enabled=True,
         macro_regime_weight_strength=0.08,
+        insider_adjustment_enabled=True,
         insider_adjustment_rank_strength=0.08,
         insider_adjustment_weight_strength=0.08,
+        allow_unpromoted_feature_influence=True,
     )
 
     rank_scale, weight_scale, notes = brain._soft_signal_adjustments(
@@ -380,6 +383,32 @@ def test_soft_signal_adjustments_use_earnings_macro_and_insider_scores():
     assert notes["earnings"]["source"] == "earnings_reaction_score"
     assert notes["macro"]["source"] == "regime_3"
     assert notes["insider"]["source"] == "insider_signal_score"
+
+
+def test_unpromoted_diagnostics_do_not_change_rank_or_weight():
+    brain = BrokerBrain(
+        portfolio=_EmptyPortfolio(),
+        earnings_reaction_enabled=True,
+        macro_regime_enabled=True,
+        insider_adjustment_enabled=True,
+        allow_unpromoted_feature_influence=False,
+    )
+
+    rank_scale, weight_scale, notes = brain._soft_signal_adjustments(
+        {
+            "ticker": "BBB",
+            "composite_score": 0.80,
+            "earnings_reaction_score": 1.0,
+            "insider_signal_score": -1.0,
+        },
+        market_regime=3,
+    )
+
+    assert rank_scale == 1.0
+    assert weight_scale == 1.0
+    assert notes["earnings"]["diagnostic_only"] is True
+    assert notes["macro"]["broker_influence"] is False
+    assert notes["insider"]["promotion_status"] == "unpromoted"
 
 
 def test_macro_regime_modes_can_remove_bull_boost():
