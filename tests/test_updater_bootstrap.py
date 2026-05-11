@@ -182,6 +182,84 @@ def test_update_sentiment_expands_to_live_universe(monkeypatch):
         sentiment_path.unlink(missing_ok=True)
 
 
+def test_sentiment_requests_session_ignores_env_proxy(monkeypatch):
+    monkeypatch.setattr(sentiment, "_requests_session", None)
+
+    session = sentiment._get_requests_session()
+
+    assert session.trust_env is False
+
+
+def test_score_headlines_uses_fallback_when_finbert_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        sentiment,
+        "_get_finbert",
+        lambda: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+
+    scores = sentiment._score_headlines(["Company wins big contract"])
+
+    assert len(scores) == 1
+    assert scores[0]["pos_score"] > scores[0]["neg_score"]
+    assert scores[0]["sentiment"] == "positive"
+
+
+def test_update_sentiment_appends_to_legacy_csv_schema(monkeypatch):
+    sentiment_path = _workspace_csv_path("test_legacy_sentiment")
+
+    try:
+        pd.DataFrame(
+            [
+                {
+                    "date": "2024-01-01",
+                    "stock": "AAA",
+                    "neg_score": 0.2,
+                    "neutral_score": 0.3,
+                    "pos_score": 0.5,
+                }
+            ]
+        ).to_csv(sentiment_path, index=False)
+        monkeypatch.setattr(sentiment, "SENTIMENT_PATH", sentiment_path)
+
+        def fake_fetch_and_score(tickers: list[str], lookback_days: int = 7) -> pd.DataFrame:
+            return pd.DataFrame(
+                [
+                    {
+                        "title": "Fresh headline",
+                        "date": "2024-01-02",
+                        "stock": "AAA",
+                        "neg_score": 0.1,
+                        "neutral_score": 0.2,
+                        "pos_score": 0.7,
+                        "sentiment": "positive",
+                    }
+                ]
+            )
+
+        monkeypatch.setattr(sentiment, "fetch_and_score", fake_fetch_and_score)
+
+        n_new = sentiment.update_sentiment(
+            ["AAA"],
+            lookback_days=3,
+            expand_live_universe=False,
+        )
+
+        saved = pd.read_csv(sentiment_path)
+        assert n_new == 1
+        assert len(saved) == 2
+        assert saved.columns.tolist() == [
+            "date",
+            "stock",
+            "neg_score",
+            "neutral_score",
+            "pos_score",
+        ]
+        assert saved.iloc[-1]["date"] == "2024-01-02"
+        assert saved.iloc[-1]["stock"] == "AAA"
+    finally:
+        sentiment_path.unlink(missing_ok=True)
+
+
 def test_update_parquet_keeps_benchmark_symbol_in_price_universe(monkeypatch):
     parquet_path = _workspace_parquet_path()
     calls: dict[str, object] = {}

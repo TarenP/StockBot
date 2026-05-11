@@ -18,6 +18,8 @@ import os
 import time
 import logging
 import warnings
+from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -32,10 +34,55 @@ logger = logging.getLogger(__name__)
 
 SENTIMENT_PATH = Path("Sentiment/analyst_ratings_with_sentiment.csv")
 NEWSAPI_KEY    = os.getenv("NEWSAPI_KEY", "")
+SENTIMENT_CORE_COLUMNS = ["date", "stock", "neg_score", "neutral_score", "pos_score"]
+_SOURCE_FAILURES: Counter[str] = Counter()
+_requests_session: requests.Session | None = None
+_PROXY_ENV_VARS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
 
 # ── FinBERT loader (lazy — only loads when first needed) ─────────────────────
 
 _finbert_pipeline = None
+
+
+def _get_requests_session() -> requests.Session:
+    """
+    Use a direct requests session for public news endpoints.
+
+    Some local/sandbox environments set proxy variables that point at a proxy
+    listener which is not actually running. The price updater uses yfinance and
+    may still work in that situation, while direct news requests fail with
+    ProxyError. Disabling env proxy inheritance keeps sentiment refreshes from
+    silently starving.
+    """
+    global _requests_session
+    if _requests_session is None:
+        _requests_session = requests.Session()
+        _requests_session.trust_env = False
+    return _requests_session
+
+
+def _http_get(url: str, **kwargs) -> requests.Response:
+    return _get_requests_session().get(url, **kwargs)
+
+
+def _record_source_failure(source: str, reason: str) -> None:
+    _SOURCE_FAILURES[f"{source}:{reason}"] += 1
+
+
+@contextmanager
+def _without_proxy_env():
+    saved = {key: os.environ.pop(key) for key in _PROXY_ENV_VARS if key in os.environ}
+    try:
+        yield
+    finally:
+        os.environ.update(saved)
 
 def _get_finbert():
     global _finbert_pipeline
@@ -45,15 +92,17 @@ def _get_finbert():
             from transformers import pipeline as hf_pipeline
             logger.info("Loading FinBERT model (first run downloads ~500MB)...")
             device = 0 if torch.cuda.is_available() else -1
-            _finbert_pipeline = hf_pipeline(
-                "text-classification",
-                model="ProsusAI/finbert",
-                tokenizer="ProsusAI/finbert",
-                top_k=None,
-                device=device,
-                truncation=True,
-                max_length=512,
-            )
+            with _without_proxy_env():
+                _finbert_pipeline = hf_pipeline(
+                    "text-classification",
+                    model="ProsusAI/finbert",
+                    tokenizer="ProsusAI/finbert",
+                    top_k=None,
+                    device=device,
+                    framework="pt",
+                    truncation=True,
+                    max_length=512,
+                )
             logger.info("FinBERT loaded on %s.", "GPU" if device == 0 else "CPU")
         except ImportError:
             raise ImportError(
@@ -61,6 +110,38 @@ def _get_finbert():
                 "Run: pip install transformers torch"
             )
     return _finbert_pipeline
+
+
+_POSITIVE_WORDS = {
+    "beat", "beats", "bullish", "buy", "growth", "higher", "outperform",
+    "profit", "raise", "raised", "rally", "record", "strong", "surge",
+    "upgrade", "upside", "wins",
+}
+_NEGATIVE_WORDS = {
+    "bearish", "cut", "downgrade", "falls", "fraud", "lawsuit", "loss",
+    "miss", "probe", "recall", "risk", "slump", "weak", "warning",
+}
+
+
+def _fallback_score_headline(headline: str) -> dict:
+    text = str(headline or "").lower()
+    pos_hits = sum(1 for word in _POSITIVE_WORDS if word in text)
+    neg_hits = sum(1 for word in _NEGATIVE_WORDS if word in text)
+    raw = float(pos_hits - neg_hits)
+    pos = float(np.clip(0.45 + raw * 0.12, 0.05, 0.90))
+    neg = float(np.clip(0.45 - raw * 0.12, 0.05, 0.90))
+    neutral = float(max(0.05, 1.0 - pos - neg))
+    total = pos + neg + neutral
+    pos /= total
+    neg /= total
+    neutral /= total
+    label = "positive" if pos >= neg else "negative"
+    return {
+        "neg_score": neg,
+        "neutral_score": neutral,
+        "pos_score": pos,
+        "sentiment": label,
+    }
 
 
 def _score_headlines(headlines: list[str]) -> list[dict]:
@@ -71,7 +152,16 @@ def _score_headlines(headlines: list[str]) -> list[dict]:
     if not headlines:
         return []
 
-    pipe    = _get_finbert()
+    try:
+        pipe = _get_finbert()
+    except Exception as exc:
+        logger.warning(
+            "FinBERT unavailable (%s); using lexical sentiment fallback for %d headline(s).",
+            exc,
+            len(headlines),
+        )
+        return [_fallback_score_headline(headline) for headline in headlines]
+
     results = []
 
     batches = list(range(0, len(headlines), 64))
@@ -121,7 +211,7 @@ def _fetch_newsapi(ticker: str, from_date: str, to_date: str) -> list[dict]:
         "apiKey":   NEWSAPI_KEY,
     }
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = _http_get(url, params=params, timeout=10)
         if r.status_code == 200:
             articles = r.json().get("articles", [])
             return [
@@ -132,7 +222,9 @@ def _fetch_newsapi(ticker: str, from_date: str, to_date: str) -> list[dict]:
                 }
                 for a in articles if a.get("title")
             ]
+        _record_source_failure("newsapi", f"http_{r.status_code}")
     except Exception as e:
+        _record_source_failure("newsapi", type(e).__name__)
         logger.debug(f"NewsAPI error for {ticker}: {e}")
     return []
 
@@ -145,12 +237,14 @@ def _fetch_finviz_rss(ticker: str) -> list[dict]:
     headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
     rows = []
     try:
-        r = requests.get(url, headers=headers, timeout=10)
+        r = _http_get(url, headers=headers, timeout=10)
         if r.status_code != 200:
+            _record_source_failure("finviz", f"http_{r.status_code}")
             return []
         soup = BeautifulSoup(r.text, "html.parser")
         news_table = soup.find(id="news-table")
         if not news_table:
+            _record_source_failure("finviz", "missing_news_table")
             return []
         today = datetime.today().date()
         current_date = today
@@ -170,6 +264,7 @@ def _fetch_finviz_rss(ticker: str) -> list[dict]:
                     pass
             rows.append({"title": title, "date": str(current_date), "stock": ticker})
     except Exception as e:
+        _record_source_failure("finviz", type(e).__name__)
         logger.debug(f"Finviz scrape error for {ticker}: {e}")
     return rows
 
@@ -181,8 +276,9 @@ def _fetch_yahoo_rss(ticker: str) -> list[dict]:
     url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
     rows = []
     try:
-        r = requests.get(url, timeout=10)
+        r = _http_get(url, timeout=10)
         if r.status_code != 200:
+            _record_source_failure("yahoo_rss", f"http_{r.status_code}")
             return []
         soup = BeautifulSoup(r.content, "xml")
         for item in soup.find_all("item")[:20]:
@@ -198,6 +294,7 @@ def _fetch_yahoo_rss(ticker: str) -> list[dict]:
                     pass
             rows.append({"title": title.text.strip(), "date": date_str, "stock": ticker})
     except Exception as e:
+        _record_source_failure("yahoo_rss", type(e).__name__)
         logger.debug(f"Yahoo RSS error for {ticker}: {e}")
     return rows
 
@@ -251,30 +348,68 @@ def fetch_and_score(
 
     from_date = (datetime.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     to_date   = datetime.today().strftime("%Y-%m-%d")
+    start_date = pd.Timestamp(from_date).date()
+    end_date = pd.Timestamp(to_date).date()
+    failure_snapshot = Counter(_SOURCE_FAILURES)
+
+    def _is_recent(row: dict) -> bool:
+        try:
+            row_date = pd.Timestamp(row.get("date")).date()
+        except Exception:
+            return False
+        return start_date <= row_date <= end_date
 
     # ── Phase 1: fetch all headlines (fast — just HTTP) ───────────────────────
     raw_rows: list[dict] = []
+    source_hit_counts: Counter[str] = Counter()
     pbar = tqdm(tickers, desc="Fetching news", unit="ticker", colour="green")
     for ticker in pbar:
         pbar.set_postfix(ticker=ticker)
         raw = []
+        source = None
 
         if NEWSAPI_KEY:
             raw = _fetch_newsapi(ticker, from_date, to_date)
+            source = "newsapi" if raw else None
             time.sleep(0.05)
 
         if not raw:
             raw = _fetch_finviz_rss(ticker)
+            source = "finviz" if raw else None
             time.sleep(0.10)
 
         if not raw:
             raw = _fetch_yahoo_rss(ticker)
+            source = "yahoo_rss" if raw else None
             time.sleep(0.10)
 
+        if raw:
+            raw = [row for row in raw if _is_recent(row)]
+        if raw and source:
+            source_hit_counts[source] += 1
         raw_rows.extend(raw)
 
     if not raw_rows:
+        failures = _SOURCE_FAILURES - failure_snapshot
+        if failures:
+            top_failures = ", ".join(
+                f"{key}={count}" for key, count in failures.most_common(5)
+            )
+            logger.warning(
+                "No recent headlines found; source failures during fetch: %s",
+                top_failures,
+            )
+        else:
+            logger.info(
+                "No recent headlines found from configured sources for %d tickers.",
+                len(tickers),
+            )
         return pd.DataFrame()
+    if source_hit_counts:
+        logger.info(
+            "Headline source coverage: %s",
+            ", ".join(f"{key}={value}" for key, value in source_hit_counts.items()),
+        )
 
     # ── Phase 2: score all headlines in one batched FinBERT pass ─────────────
     all_headlines = [r["title"] for r in raw_rows]
@@ -294,6 +429,50 @@ def fetch_and_score(
         })
 
     return pd.DataFrame(all_rows)
+
+
+def _read_existing_keys_for_dates(
+    path: Path,
+    key_cols: list[str],
+    dates: set[str],
+) -> set[tuple]:
+    if not dates:
+        return set()
+
+    keys: set[tuple] = set()
+    try:
+        for chunk in pd.read_csv(path, usecols=key_cols, chunksize=1_000_000):
+            chunk["date"] = chunk["date"].astype(str).str[:10]
+            chunk = chunk[chunk["date"].isin(dates)]
+            if chunk.empty:
+                continue
+            for col in key_cols:
+                chunk[col] = chunk[col].astype(str)
+            keys.update(tuple(row) for row in chunk[key_cols].itertuples(index=False, name=None))
+    except ValueError:
+        return set()
+    return keys
+
+
+def _storage_frame_for_existing_schema(new_df: pd.DataFrame, existing_cols: list[str]) -> pd.DataFrame:
+    frame = new_df.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    frame = frame.dropna(subset=["date", "stock"])
+
+    if "title" not in existing_cols:
+        core = frame[SENTIMENT_CORE_COLUMNS].copy()
+        return (
+            core.groupby(["date", "stock"], as_index=False)[
+                ["neg_score", "neutral_score", "pos_score"]
+            ]
+            .mean()
+            .loc[:, SENTIMENT_CORE_COLUMNS]
+        )
+
+    for col in existing_cols:
+        if col not in frame.columns:
+            frame[col] = np.nan
+    return frame[existing_cols]
 
 
 def update_sentiment(
@@ -327,18 +506,40 @@ def update_sentiment(
         logger.info("No new headlines found.")
         return 0
 
-    # Load existing and deduplicate
     if SENTIMENT_PATH.exists():
-        existing = pd.read_csv(SENTIMENT_PATH)
-        combined = pd.concat([existing, new_df], ignore_index=True)
+        existing_cols = pd.read_csv(SENTIMENT_PATH, nrows=0).columns.tolist()
+        storage_df = _storage_frame_for_existing_schema(new_df, existing_cols)
+        if storage_df.empty:
+            logger.info("No new sentiment rows after schema normalization.")
+            return 0
+
+        key_cols = ["title", "date", "stock"] if "title" in existing_cols else ["date", "stock"]
+        candidate_dates = set(storage_df["date"].astype(str).str[:10])
+        existing_keys = _read_existing_keys_for_dates(
+            SENTIMENT_PATH,
+            key_cols=key_cols,
+            dates=candidate_dates,
+        )
+        if existing_keys:
+            key_tuples = storage_df[key_cols].astype(str).itertuples(index=False, name=None)
+            keep_mask = [tuple(row) not in existing_keys for row in key_tuples]
+            storage_df = storage_df.loc[keep_mask]
+
+        if storage_df.empty:
+            logger.info("Sentiment already up to date for fetched headline dates.")
+            return 0
+
+        storage_df.to_csv(
+            SENTIMENT_PATH,
+            mode="a",
+            header=False,
+            index=False,
+            columns=existing_cols,
+        )
+        n_new = len(storage_df)
     else:
-        combined = new_df
+        new_df.to_csv(SENTIMENT_PATH, index=False)
+        n_new = len(new_df)
 
-    before = len(combined)
-    combined = combined.drop_duplicates(subset=["title", "date", "stock"], keep="last")
-    combined = combined.reset_index(drop=True)
-    n_new = len(combined) - (before - len(new_df))
-
-    combined.to_csv(SENTIMENT_PATH, index=False)
-    logger.info(f"Sentiment updated. {n_new} new rows. Total: {len(combined):,}")
+    logger.info(f"Sentiment updated. {n_new} new rows appended.")
     return n_new
