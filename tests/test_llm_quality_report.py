@@ -67,3 +67,17 @@ def test_quality_report_sets_influence_allowed_false_by_default():
     assert report["influence_allowed"] is False
     assert report["go_no_go"]["influence_allowed"] is False
     assert "disabled" in report["reason"].lower()
+
+
+def test_quality_report_never_allows_influence_by_default():
+    base = _test_dir()
+    report = build_sidecar_quality_report(
+        cache_dir=base / "cache",
+        document_store_dir=base / "docs",
+        min_coverage=0.0,
+        min_trusted_parses=0,
+    )
+
+    assert report["influence_allowed"] is False
+    assert report["go_no_go"]["influence_allowed"] is False
+    assert "disabled" in report["reason"].lower()

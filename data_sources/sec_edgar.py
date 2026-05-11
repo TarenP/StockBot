@@ -7,6 +7,7 @@ production use.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -14,11 +15,17 @@ import requests
 
 SEC_BASE = "https://data.sec.gov"
 SEC_ARCHIVES = "https://www.sec.gov/Archives/edgar/data"
-DEFAULT_UA = "StockBot research sidecar contact@example.com"
+DEFAULT_UA = os.getenv(
+    "STOCKBOT_SEC_USER_AGENT",
+    "StockBot research sidecar; set STOCKBOT_SEC_USER_AGENT with contact email",
+)
 
 
 def _headers(user_agent: str | None = None) -> dict[str, str]:
-    return {"User-Agent": user_agent or DEFAULT_UA, "Accept-Encoding": "gzip, deflate"}
+    return {
+        "User-Agent": user_agent or os.getenv("STOCKBOT_SEC_USER_AGENT", DEFAULT_UA),
+        "Accept-Encoding": "gzip, deflate",
+    }
 
 
 def cik_str(cik: str | int) -> str:
@@ -99,4 +106,3 @@ def load_ticker_cik_map(path: str | Path = "broker/state/company_tickers.json") 
         if ticker and cik is not None:
             mapping[ticker] = cik_str(cik)
     return mapping
-

@@ -17,6 +17,7 @@ is never stored twice.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,6 +29,26 @@ logger = logging.getLogger(__name__)
 _SEC_DELAY = 0.15
 _DEFAULT_LOOKBACK_DAYS = 90
 _FORMS_TO_FETCH = {"8-K"}  # 10-Q/10-K are too long and mostly financial tables; 8-K is event-driven narrative
+DEFAULT_SEC_USER_AGENT = os.getenv(
+    "STOCKBOT_SEC_USER_AGENT",
+    "StockBot research sidecar; set STOCKBOT_SEC_USER_AGENT with contact email",
+)
+_SEC_USER_AGENT_WARNING_EMITTED = False
+
+
+def get_sec_user_agent() -> str:
+    """Return the configured SEC User-Agent and warn once if contact info is missing."""
+    global _SEC_USER_AGENT_WARNING_EMITTED
+    configured = os.getenv("STOCKBOT_SEC_USER_AGENT")
+    if configured:
+        return configured
+    if not _SEC_USER_AGENT_WARNING_EMITTED:
+        logger.warning(
+            "STOCKBOT_SEC_USER_AGENT is not set; SEC requests will use a generic project User-Agent. "
+            "Set STOCKBOT_SEC_USER_AGENT with contact information before live SEC fetches."
+        )
+        _SEC_USER_AGENT_WARNING_EMITTED = True
+    return DEFAULT_SEC_USER_AGENT
 
 
 def _load_ticker_cik_map(cache_path: str = "broker/state/company_tickers.json") -> dict[str, str]:
@@ -43,7 +64,7 @@ def _load_ticker_cik_map(cache_path: str = "broker/state/company_tickers.json") 
             logger.info("Refreshing SEC ticker→CIK map...")
             r = requests.get(
                 "https://www.sec.gov/files/company_tickers.json",
-                headers={"User-Agent": "StockBot research sidecar contact@example.com"},
+                headers={"User-Agent": get_sec_user_agent()},
                 timeout=30,
             )
             r.raise_for_status()
@@ -82,13 +103,10 @@ def _strip_html(text: str) -> str:
     """Remove HTML tags, entities, and normalize whitespace."""
     import re
     import html as _html
-    text = _html.unescape(text)
+
+    text = _html.unescape(text or "")
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"&[a-zA-Z#0-9]+;", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"&[a-zA-Z]+;", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -99,7 +117,7 @@ def fetch_sec_filings(
     lookback_days: int = _DEFAULT_LOOKBACK_DAYS,
     forms: set[str] | None = None,
     max_chars: int = 24000,
-    user_agent: str = "StockBot research sidecar contact@example.com",
+    user_agent: str | None = None,
 ) -> dict[str, int]:
     """
     Fetch recent SEC filings for a list of tickers and store them.
@@ -112,6 +130,7 @@ def fetch_sec_filings(
     )
 
     store = DocumentStore(store_dir)
+    user_agent = user_agent or get_sec_user_agent()
     ticker_cik = _load_ticker_cik_map()
     forms_to_fetch = forms or _FORMS_TO_FETCH
     cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
