@@ -73,9 +73,14 @@ def _utc_now_iso() -> str:
 
 class TranscriptEventParse(BaseModel):
     ticker: str = Field(..., description="Uppercase ticker symbol")
+    doc_id: str = Field("", description="Stable raw document id")
     source_type: str = Field("unknown", description="transcript, 8-k, press_release, or event_cluster")
     source_id: str = Field("", description="Stable document or cache source id")
+    source_date: str | None = Field(None, description="Original source date in ISO format")
     as_of_date: str | None = Field(None, description="Document date in ISO format")
+    parsed_at: str = Field(default_factory=_utc_now_iso)
+    event_type: str = "unknown"
+    sentiment_label: Tone = "unknown"
     guidance_direction: Direction = "unknown"
     management_tone: Tone = "unknown"
     demand_outlook: Direction = "unknown"
@@ -83,16 +88,34 @@ class TranscriptEventParse(BaseModel):
     thesis_impact: ThesisImpact = "unknown"
     top_risks: list[str] = Field(default_factory=list)
     confidence: float = Field(0.0, ge=0.0, le=1.0)
+    risk_score: float = Field(0.0, ge=0.0, le=1.0)
+    opportunity_score: float = Field(0.0, ge=0.0, le=1.0)
+    summary: str = ""
+    contradictions: list[str] = Field(default_factory=list)
+    manual_review_required: bool = False
+    valid: bool = True
+    error: str | None = None
     evidence: list[str] = Field(default_factory=list)
     model: str = "unknown"
     generated_at: str = Field(default_factory=_utc_now_iso)
     schema_version: int = 1
 
     def compact_features(self, min_confidence: float = 0.65) -> dict[str, Any]:
-        trusted = float(self.confidence or 0.0) >= float(min_confidence)
+        trusted = bool(self.valid) and float(self.confidence or 0.0) >= float(min_confidence)
+        doc_id = self.doc_id or self.source_id
+        feature_timestamp = self.parsed_at or self.generated_at
         return {
             "ticker": str(self.ticker).upper(),
             "as_of_date": self.as_of_date,
+            "source_date": self.source_date or self.as_of_date,
+            "feature_timestamp": feature_timestamp,
+            "event_type": self.event_type or self.source_type or "unknown",
+            "confidence": float(self.confidence or 0.0),
+            "risk_score": float(self.risk_score or 0.0) if trusted else 0.0,
+            "opportunity_score": float(self.opportunity_score or 0.0) if trusted else 0.0,
+            "manual_review_required": bool(self.manual_review_required),
+            "trusted": bool(trusted),
+            "broker_influence": False,
             "llm_event_confidence": float(self.confidence or 0.0),
             "llm_event_trusted": bool(trusted),
             "guidance_direction": self.guidance_direction if trusted else "unknown",
@@ -102,6 +125,7 @@ class TranscriptEventParse(BaseModel):
             "thesis_impact": self.thesis_impact if trusted else "unknown",
             "top_risks": list(self.top_risks or [])[:5] if trusted else [],
             "source_id": self.source_id,
+            "doc_id": doc_id,
             "source_type": self.source_type,
             "schema_version": self.schema_version,
         }
@@ -110,8 +134,11 @@ class TranscriptEventParse(BaseModel):
 class SidecarFeatureRecord(BaseModel):
     ticker: str
     as_of_date: str | None = None
+    source_date: str | None = None
+    feature_timestamp: str = Field(default_factory=_utc_now_iso)
     features: dict[str, Any] = Field(default_factory=dict)
     memo: str | None = None
     source_id: str = ""
+    broker_influence: bool = False
     generated_at: str = Field(default_factory=_utc_now_iso)
     schema_version: int = 1

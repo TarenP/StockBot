@@ -19,9 +19,12 @@ def build_feature_record(
     return SidecarFeatureRecord(
         ticker=str(parsed.ticker).upper(),
         as_of_date=parsed.as_of_date,
+        source_date=parsed.source_date or parsed.as_of_date,
+        feature_timestamp=features.get("feature_timestamp"),
         features=features,
         memo=write_event_memo(features),
         source_id=parsed.source_id,
+        broker_influence=False,
     )
 
 
@@ -55,9 +58,10 @@ def load_cached_sidecar_features(
         if as_of_date and record_date and str(record_date) > str(as_of_date):
             continue
         payload = dict(record.features or {})
+        payload["broker_influence"] = False
         confidence = float(payload.get("llm_event_confidence", 0.0) or 0.0)
         if confidence < float(min_confidence):
             payload["llm_event_trusted"] = False
+            payload["trusted"] = False
         features[symbol] = payload
     return features
-

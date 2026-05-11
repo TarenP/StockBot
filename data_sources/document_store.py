@@ -12,6 +12,7 @@ from llm.cache import stable_doc_id
 class DocumentStore:
     def __init__(self, root: str | Path = "broker/state/document_store"):
         self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
 
     def put(
         self,
@@ -20,9 +21,11 @@ class DocumentStore:
         *,
         source_type: str,
         as_of_date: str | None = None,
+        source_id: str | None = None,
+        source_date: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> str:
-        doc_id = stable_doc_id(ticker, source_type, as_of_date, text)
+        doc_id = str(source_id or stable_doc_id(ticker, source_type, as_of_date, text))
         path = self.root / f"{doc_id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -31,6 +34,8 @@ class DocumentStore:
                     "doc_id": doc_id,
                     "ticker": str(ticker).upper(),
                     "source_type": source_type,
+                    "source_id": source_id or doc_id,
+                    "source_date": source_date or as_of_date,
                     "as_of_date": as_of_date,
                     "text": text,
                     "metadata": metadata or {},
@@ -55,3 +60,6 @@ class DocumentStore:
             payload = self.get(path.stem)
             if payload is not None:
                 yield payload
+
+    def list_documents(self) -> list[dict[str, Any]]:
+        return list(self.iter_documents() or [])

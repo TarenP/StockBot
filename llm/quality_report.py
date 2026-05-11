@@ -184,7 +184,11 @@ def build_sidecar_quality_report(
 
     trusted = [
         p for p in parses
-        if float(p.confidence or 0.0) >= float(min_confidence)
+        if bool(getattr(p, "valid", True)) and float(p.confidence or 0.0) >= float(min_confidence)
+    ]
+    invalid_parse_records = [
+        p for p in parses
+        if not bool(getattr(p, "valid", True))
     ]
     low_confidence = [
         p for p in parses
@@ -195,8 +199,9 @@ def build_sidecar_quality_report(
     for parsed in sorted(parses, key=lambda p: float(p.confidence or 0.0), reverse=True):
         risks = [str(risk) for risk in (parsed.top_risks or [])]
         source_type = _safe_event_type(parsed.source_type)
-        needs_review = (
-            float(parsed.confidence or 0.0) >= 0.85
+        needs_review = bool(getattr(parsed, "manual_review_required", False)) or (
+            bool(getattr(parsed, "valid", True))
+            and float(parsed.confidence or 0.0) >= 0.85
             and (
                 parsed.thesis_impact in {"strengthens", "weakens"}
                 or len(risks) >= 3
@@ -237,7 +242,7 @@ def build_sidecar_quality_report(
         source_type = _safe_event_type(parsed.source_type)
         doc_id = parsed.source_id
         confidence = float(parsed.confidence or 0.0)
-        is_trusted = confidence >= float(min_confidence)
+        is_trusted = bool(getattr(parsed, "valid", True)) and confidence >= float(min_confidence)
         parse_count_by_ticker[ticker] = parse_count_by_ticker.get(ticker, 0) + 1
         if is_trusted:
             trusted_parse_count_by_ticker[ticker] = trusted_parse_count_by_ticker.get(ticker, 0) + 1
@@ -266,9 +271,10 @@ def build_sidecar_quality_report(
     for source_type, count in manual_review_counts_by_event_type.items():
         by_event_type.setdefault(source_type, _new_event_type_bucket())["manual_review_queue_count"] += count
 
+    invalid_parse_total = invalid_parses + len(invalid_parse_records)
     invalid_parse_denominator = len(parses) + invalid_parses
     invalid_parse_rate = (
-        invalid_parses / invalid_parse_denominator
+        invalid_parse_total / invalid_parse_denominator
         if invalid_parse_denominator else 0.0
     )
     stale_parse_count = sum(1 for age in parse_ages if age > int(max_staleness_days))
@@ -307,28 +313,43 @@ def build_sidecar_quality_report(
         decision = "collect_more_data"
     else:
         decision = "manual_review_ready"
+    confidence_values = [float(p.confidence or 0.0) for p in parses]
+    confidence_avg = (sum(confidence_values) / len(confidence_values)) if confidence_values else None
+    influence_reason = (
+        "Broker influence disabled by policy; sidecar output is diagnostic-only."
+        if not failed_criteria
+        else "Broker influence disabled by policy; failed criteria: " + ", ".join(failed_criteria)
+    )
 
     return {
         "generated_at": _utc_now(),
         "min_confidence": float(min_confidence),
+        "raw_docs": len(raw_docs),
         "raw_documents": len(raw_docs),
         "valid_raw_documents": sum(1 for row in raw_docs if row.get("valid_json")),
+        "parsed_docs": len(parses),
         "parsed_documents": len(parses),
+        "invalid_parses": invalid_parse_total,
         "invalid_parse_files": invalid_parses,
+        "invalid_parse_records": len(invalid_parse_records),
         "trusted_parses": len(trusted),
         "low_confidence_parses": len(low_confidence),
         "feature_records": len(features),
+        "coverage": coverage,
         "document_parse_coverage": coverage,
         "cache_hit_rate": cache_hit_rate,
         "invalid_parse_rate": invalid_parse_rate,
+        "confidence_min": min(confidence_values, default=None),
+        "confidence_max": max(confidence_values, default=None),
+        "confidence_avg": confidence_avg,
+        "stale_parse_count": stale_parse_count,
+        "influence_allowed": False,
+        "reason": influence_reason,
         "unparsed_document_ids": unparsed_doc_ids[:100],
         "confidence": {
-            "avg": (
-                sum(float(p.confidence or 0.0) for p in parses) / len(parses)
-                if parses else None
-            ),
-            "min": min((float(p.confidence or 0.0) for p in parses), default=None),
-            "max": max((float(p.confidence or 0.0) for p in parses), default=None),
+            "avg": confidence_avg,
+            "min": min(confidence_values, default=None),
+            "max": max(confidence_values, default=None),
         },
         "confidence_buckets": confidence_buckets,
         "by_event_type": {

@@ -25,34 +25,29 @@ class OllamaClient:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout = int(timeout)
+        self.session = requests.Session()
+        self.session.trust_env = False
 
     def _is_alive(self) -> bool:
         """Check if Ollama server is still responding."""
         try:
-            r = requests.get(f"{self.base_url}/api/tags", timeout=5)
+            r = self.session.get(f"{self.base_url}/api/tags", timeout=2)
             return r.status_code == 200
         except Exception:
             return False
 
     def generate_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
         import re as _re
-        import time as _time
 
-        # Wait for server if it just crashed
-        for attempt in range(3):
-            if self._is_alive():
-                break
-            logger.warning("Ollama not responding, waiting 10s (attempt %d/3)...", attempt + 1)
-            _time.sleep(10)
-        else:
-            raise ConnectionError("Ollama server is not responding after 3 attempts")
+        if not self._is_alive():
+            raise ConnectionError("Ollama server is not responding")
 
         payload = {
             "model": self.model,
             "prompt": f"{system_prompt}\n\nRespond with valid JSON only, no other text.\n\n{user_prompt}",
             "stream": False,
         }
-        response = requests.post(
+        response = self.session.post(
             f"{self.base_url}/api/generate",
             json=payload,
             timeout=self.timeout,
@@ -105,11 +100,10 @@ class OllamaClient:
         raise ValueError(f"No valid JSON found in model response: {raw[:200]}")
 
     def embed(self, text: str) -> list[float]:
-        response = requests.post(
+        response = self.session.post(
             f"{self.base_url}/api/embeddings",
             json={"model": self.model, "prompt": text},
             timeout=self.timeout,
         )
         response.raise_for_status()
         return list(response.json().get("embedding") or [])
-

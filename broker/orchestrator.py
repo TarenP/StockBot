@@ -594,6 +594,7 @@ def _run_llm_sidecar_task(
             )
             persist_feature_record(
                 parsed,
+                cache=cache,
                 min_confidence=float(config.get("llm_sidecar_min_confidence", 0.65)),
             )
             processed += 1
