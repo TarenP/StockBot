@@ -20,6 +20,7 @@ QUICK START
 """
 
 import argparse
+import gc
 import glob
 import logging
 import os
@@ -68,6 +69,8 @@ def parse_args():
     p.add_argument("--save_dir",     type=str,   default="models", help="Checkpoint directory")
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--force_retrain", action="store_true",         help="Retrain folds even if completion markers already exist")
+    p.add_argument("--memory_light_train", action="store_true",
+                   help="Train RL folds one at a time with lower RAM pressure")
     p.add_argument("--force_refresh", action="store_true",
                    help="Re-download last 30 days (--mode update)")
     p.add_argument("--expand_universe", action="store_true",
@@ -191,6 +194,9 @@ def _load_data_and_universe(
     top_n: int,
     include_raw_cols: bool = False,
     universe_as_of_date: pd.Timestamp | None = None,
+    universe: list[str] | None = None,
+    start_date: pd.Timestamp | None = None,
+    end_date: pd.Timestamp | None = None,
 ):
     from pipeline.data import load_master, get_asset_universe
     from pipeline.universe_resolver import (
@@ -209,10 +215,17 @@ def _load_data_and_universe(
         min_price=float(investable_filters["min_price"]),
         min_avg_volume=float(investable_filters["min_avg_volume"]),
         include_raw_cols=include_raw_cols,
+        universe=universe,
         universe_as_of_date=universe_as_of_date,
+        start_date=start_date,
+        end_date=end_date,
         config=cfg,
     )
-    if is_benchmark_constrained_mode(get_universe_mode(cfg)):
+    if universe is not None:
+        requested = normalize_tickers(universe)
+        available = set(df.index.get_level_values("ticker").unique())
+        asset_list = [ticker for ticker in requested if ticker in available]
+    elif is_benchmark_constrained_mode(get_universe_mode(cfg)):
         configured_universe = normalize_tickers(
             resolve_configured_universe(
                 as_of_date=universe_as_of_date,
@@ -233,6 +246,18 @@ def _load_data_and_universe(
         )
     df = df[df.index.get_level_values("ticker").isin(asset_list)]
     return df, asset_list
+
+
+def _release_memory_light_fold(fold_idx: int) -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    try:
+        from pipeline.train import log_memory
+
+        log_memory(f"[fold {fold_idx}] after fold cleanup")
+    except Exception:
+        pass
 
 
 def _bootstrap_universe_size(top_n: int) -> int:
@@ -354,6 +379,122 @@ def run_update(args):
 
 # ── Mode: train ───────────────────────────────────────────────────────────────
 
+def _run_memory_light_train(args, debug_settings: dict, top_n: int):
+    from pipeline.data import (
+        filter_date_range,
+        prepare_memory_light_training_frame,
+        walk_forward_date_ranges,
+    )
+    from pipeline.features import FEATURE_COLS
+    from pipeline.train import PPO_CFG, fold_is_complete, log_memory, train_fold
+
+    logger.info("Memory-light RL training enabled.")
+    cfg = {**PPO_CFG, "total_steps": debug_settings["total_steps"]}
+    best_ckpts = []
+
+    log_memory("before load")
+    df_seed, asset_list = _load_data_and_universe(top_n, include_raw_cols=True)
+    log_memory("after feature build")
+    logger.info("Universe: %d tickers", len(asset_list))
+
+    fold_ranges = walk_forward_date_ranges(df_seed, train_years=8, val_years=1, test_years=1)
+    logger.info("Walk-forward folds available: %d", len(fold_ranges))
+    selected_folds = fold_ranges[:debug_settings["folds"]]
+    del df_seed
+    _release_memory_light_fold(-1)
+
+    if not debug_settings["skip_screener_train"]:
+        logger.info("Memory-light training skips screener retraining; pass standard training for screener rebuilds.")
+    shortlist_universe = None
+
+    with tqdm(
+        total=len(selected_folds),
+        desc="Training folds",
+        unit="fold",
+        colour="magenta",
+        dynamic_ncols=True,
+    ) as folds_pbar:
+        for i, fold_range in enumerate(selected_folds):
+            if fold_is_complete(args.save_dir, i) and not args.force_retrain:
+                logger.info("Fold %d already complete - skipping.", i)
+                ckpt = f"{args.save_dir}/best_fold{i}.pt"
+                if os.path.exists(ckpt):
+                    meta = torch.load(ckpt, map_location="cpu", weights_only=False)
+                    best_ckpts.append((ckpt, meta.get("val_sharpe", 0.0)))
+                folds_pbar.update(1)
+                folds_pbar.set_postfix(done=f"{i + 1}/{len(selected_folds)}")
+                continue
+
+            df_fold = None
+            df_train = None
+            df_val = None
+            try:
+                logger.info("[fold %d] loading fold data", i)
+                log_memory(f"[fold {i}] before load")
+                df_fold, _ = _load_data_and_universe(
+                    top_n,
+                    include_raw_cols=True,
+                    universe=asset_list,
+                    start_date=fold_range["load_start"],
+                    end_date=fold_range["load_end"],
+                )
+                log_memory("after feature build")
+
+                feature_cols = [col for col in FEATURE_COLS if col in df_fold.columns]
+                df_train = filter_date_range(
+                    df_fold,
+                    fold_range["train_start"],
+                    fold_range["train_end"],
+                )
+                df_val = filter_date_range(
+                    df_fold,
+                    fold_range["val_start"],
+                    fold_range["val_end"],
+                )
+                df_train = prepare_memory_light_training_frame(df_train, feature_cols)
+                df_val = prepare_memory_light_training_frame(df_val, feature_cols)
+                logger.info("[fold %d] training rows = %d", i, len(df_train))
+                logger.info("[fold %d] validation rows = %d", i, len(df_val))
+                log_memory("after fold filter")
+
+                folds_pbar.set_postfix(current=f"{i + 1}/{len(selected_folds)}")
+                ckpt_path, val_sharpe = train_fold(
+                    df_train=df_train,
+                    df_val=df_val,
+                    asset_list=asset_list,
+                    fold_idx=i,
+                    cfg=cfg,
+                    save_dir=args.save_dir,
+                    device=DEVICE,
+                    seed=args.seed,
+                    top_n=top_n,
+                    force_restart=args.force_retrain,
+                    shortlist_universe=shortlist_universe,
+                    training_mode="memory_light",
+                )
+                logger.info("[fold %d] saved checkpoint = %s", i, ckpt_path)
+                best_ckpts.append((ckpt_path, val_sharpe))
+                folds_pbar.update(1)
+                folds_pbar.set_postfix(
+                    done=f"{i + 1}/{len(selected_folds)}",
+                    val_sharpe=f"{val_sharpe:.3f}",
+                )
+            except KeyboardInterrupt:
+                logger.info("Training interrupted. Run the same command to resume.")
+                break
+            finally:
+                del df_train
+                del df_val
+                del df_fold
+                _release_memory_light_fold(i)
+                logger.info("[fold %d] released fold data", i)
+
+    if best_ckpts:
+        best = max(best_ckpts, key=lambda x: x[1])
+        logger.info("\nBest checkpoint: %s  (val Sharpe=%.3f)", best[0], best[1])
+        logger.info("Memory-light training complete; broker shadow warm-up was not run in this mode.")
+
+
 def run_train(args):
     from pipeline.data import walk_forward_split
     from pipeline.train import PPO_CFG, fold_is_complete, train_fold
@@ -361,6 +502,9 @@ def run_train(args):
     debug_settings = _effective_debug_settings(args)
     top_n = _resolve_top_n(args)
     _ensure_price_data(top_n, save_dir=args.save_dir)
+    if getattr(args, "memory_light_train", False):
+        return _run_memory_light_train(args, debug_settings, top_n)
+
     df, asset_list = _load_data_and_universe(top_n, include_raw_cols=True)
     logger.info(f"Universe: {len(asset_list)} tickers")
 

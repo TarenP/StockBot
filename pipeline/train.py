@@ -8,7 +8,9 @@ PPO training loop with:
 """
 
 import os
+import logging
 import time
+from datetime import datetime, timezone
 import numpy as np
 import torch
 import torch.nn as nn
@@ -20,6 +22,8 @@ from tqdm import tqdm
 from pipeline.environment import PortfolioEnv
 from pipeline.features import FEATURE_COLS
 from pipeline.model import PortfolioTransformer
+
+logger = logging.getLogger(__name__)
 
 
 # ── PPO hyperparameters ──────────────────────────────────────────────────────
@@ -57,7 +61,11 @@ def fold_is_complete(save_dir: str, fold_idx: int) -> bool:
     return os.path.exists(_done_path(save_dir, fold_idx))
 
 def _save_resume(path, model, optimizer, scheduler, model_cfg,
-                 fold_idx, steps_done, best_val_sharpe, best_val_return):
+                 fold_idx, steps_done, best_val_sharpe, best_val_return,
+                 training_mode: str = "standard",
+                 total_steps_requested: int | None = None,
+                 feature_cols: list[str] | None = None,
+                 asset_list: list[str] | None = None):
     torch.save({
         "model_state":     model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
@@ -65,12 +73,39 @@ def _save_resume(path, model, optimizer, scheduler, model_cfg,
         "model_cfg":       model_cfg,
         "fold":            fold_idx,
         "steps_done":      steps_done,
+        "steps":           steps_done,
         "best_val_sharpe": best_val_sharpe,
         "best_val_return": best_val_return,
+        "training_mode":   training_mode,
+        "total_steps":     total_steps_requested,
+        "total_steps_requested": total_steps_requested,
+        "feature_cols":    list(feature_cols or []),
+        "n_features":      len(feature_cols or []),
+        "asset_list":      list(asset_list or []),
+        "created_at":      datetime.now(timezone.utc).isoformat(),
     }, path)
 
 def _load_resume(path, device):
     return torch.load(path, map_location=device, weights_only=False)
+
+
+def log_memory(label: str):
+    try:
+        import psutil
+        rss = psutil.Process(os.getpid()).memory_info().rss / 1024**3
+        logger.info("Memory %s: RAM RSS %.2f GB", label, rss)
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            logger.info(
+                "Memory %s: CUDA allocated %.2f GB reserved %.2f GB",
+                label,
+                torch.cuda.memory_allocated() / 1024**3,
+                torch.cuda.memory_reserved() / 1024**3,
+            )
+    except Exception:
+        pass
 
 
 # ── GAE advantage estimation ─────────────────────────────────────────────────
@@ -184,6 +219,7 @@ def train_fold(
     force_restart: bool = False,
     shortlist_universe: list[str] = None,
     curriculum: bool = False,
+    training_mode: str = "standard",
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -225,7 +261,7 @@ def train_fold(
     model     = PortfolioTransformer(**model_cfg).to(device)
     optimizer = AdamW(model.parameters(), lr=cfg["lr"], weight_decay=1e-4)
     scheduler = CosineAnnealingLR(
-        optimizer, T_max=cfg["total_steps"] // cfg["rollout_steps"]
+        optimizer, T_max=max(cfg["total_steps"] // cfg["rollout_steps"], 1)
     )
 
     # ── Resume from mid-fold checkpoint if it exists ─────────────────────────
@@ -256,6 +292,7 @@ def train_fold(
     elif force_restart:
         tqdm.write(f"  Force restart enabled for fold {fold_idx} - ignoring old resume state.")
 
+    log_memory(f"[fold {fold_idx}] before training env build")
     train_env = PortfolioEnv(
         df_train,
         asset_list,
@@ -268,6 +305,7 @@ def train_fold(
         lookback=lookback,
         feature_cols=feature_cols,
     )
+    log_memory(f"[fold {fold_idx}] before training")
 
     tqdm.write(f"\n{'='*60}")
     tqdm.write(f"Fold {fold_idx} | device={device} | "
@@ -369,10 +407,16 @@ def train_fold(
                     "model_cfg":   model_cfg,
                     "fold":        fold_idx,
                     "steps":       steps_done,
+                    "total_steps": cfg["total_steps"],
+                    "total_steps_requested": cfg["total_steps"],
                     "val_sharpe":  val_sharpe,
                     "val_return":  val_return,
                     "top_n":       top_n,
                     "asset_list":  asset_list,
+                    "feature_cols": feature_cols,
+                    "n_features":  n_features,
+                    "created_at":  datetime.now(timezone.utc).isoformat(),
+                    "training_mode": training_mode,
                 }, best_ckpt_path)
                 tqdm.write(
                     f"  ✓ Step {steps_done:,} — new best  "
@@ -384,6 +428,10 @@ def train_fold(
                 _save_resume(
                     resume_path, model, optimizer, scheduler, model_cfg,
                     fold_idx, steps_done, best_val_sharpe, best_val_return,
+                    training_mode=training_mode,
+                    total_steps_requested=cfg["total_steps"],
+                    feature_cols=feature_cols,
+                    asset_list=asset_list,
                 )
                 steps_since_save = 0
 
@@ -393,6 +441,10 @@ def train_fold(
         _save_resume(
             resume_path, model, optimizer, scheduler, model_cfg,
             fold_idx, steps_done, best_val_sharpe, best_val_return,
+            training_mode=training_mode,
+            total_steps_requested=cfg["total_steps"],
+            feature_cols=feature_cols,
+            asset_list=asset_list,
         )
         tqdm.write(f"  Saved to {resume_path}. Re-run the same command to continue.")
         pbar.close()
@@ -401,10 +453,20 @@ def train_fold(
     pbar.close()
 
     # ── Mark fold as complete and clean up resume checkpoint ─────────────────
+    if training_mode == "memory_light":
+        _save_resume(
+            resume_path, model, optimizer, scheduler, model_cfg,
+            fold_idx, steps_done, best_val_sharpe, best_val_return,
+            training_mode=training_mode,
+            total_steps_requested=cfg["total_steps"],
+            feature_cols=feature_cols,
+            asset_list=asset_list,
+        )
     open(_done_path(save_dir, fold_idx), "w").close()
-    if os.path.exists(resume_path):
+    if os.path.exists(resume_path) and training_mode != "memory_light":
         os.remove(resume_path)
 
+    log_memory(f"[fold {fold_idx}] after training fold")
     tqdm.write(f"\nFold {fold_idx} complete. Best val Sharpe: {best_val_sharpe:.3f}")
     return best_ckpt_path, best_val_sharpe
 

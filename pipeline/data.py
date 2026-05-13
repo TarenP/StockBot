@@ -139,6 +139,9 @@ def load_master(
     universe_as_of_date: pd.Timestamp | None = None,
     config: dict | None = None,
     save_dir: str = "models",
+    start_date: pd.Timestamp | None = None,
+    end_date: pd.Timestamp | None = None,
+    feature_warmup_days: int = 370,
 ) -> pd.DataFrame:
     """
     Load, merge, filter, and feature-engineer the master dataset.
@@ -156,7 +159,19 @@ def load_master(
             "A clean training run will now fetch the initial parquet automatically.\n"
             "After training completes, just run: python Broker.py"
         )
-    df_prices = pd.read_parquet(price_path)
+    parquet_filters = None
+    if start_date is not None or end_date is not None:
+        parquet_filters = []
+        if start_date is not None:
+            warmup_start = pd.Timestamp(start_date) - pd.Timedelta(days=feature_warmup_days)
+            parquet_filters.append(("date", ">=", warmup_start))
+        if end_date is not None:
+            parquet_filters.append(("date", "<=", pd.Timestamp(end_date)))
+
+    try:
+        df_prices = pd.read_parquet(price_path, filters=parquet_filters) if parquet_filters else pd.read_parquet(price_path)
+    except Exception:
+        df_prices = pd.read_parquet(price_path)
 
     with tqdm(total=5, desc="Preparing data", unit="step", colour="cyan",
               dynamic_ncols=True) as pbar:
@@ -170,6 +185,20 @@ def load_master(
         )
         df_prices["ticker"] = df_prices["ticker"].str.upper()
         df_prices = df_prices.set_index(["date", "ticker"]).sort_index()
+        if start_date is not None or end_date is not None:
+            lower = None
+            upper = None
+            if start_date is not None:
+                lower = pd.Timestamp(start_date) - pd.Timedelta(days=feature_warmup_days)
+            if end_date is not None:
+                upper = pd.Timestamp(end_date)
+            date_index = df_prices.index.get_level_values("date")
+            mask = pd.Series(True, index=df_prices.index)
+            if lower is not None:
+                mask &= date_index >= lower
+            if upper is not None:
+                mask &= date_index <= upper
+            df_prices = df_prices[mask.to_numpy()]
         pbar.update(1)
 
         # ── 2. Basic liquidity filter (history + price + volume) ─────────────
@@ -251,6 +280,14 @@ def load_master(
         if include_raw_cols:
             raw_cols = df_prices[["close", "volume"]].copy()
             df_features = df_features.join(raw_cols, how="left")
+        if start_date is not None or end_date is not None:
+            date_index = df_features.index.get_level_values("date")
+            mask = pd.Series(True, index=df_features.index)
+            if start_date is not None:
+                mask &= date_index >= pd.Timestamp(start_date)
+            if end_date is not None:
+                mask &= date_index <= pd.Timestamp(end_date)
+            df_features = df_features[mask.to_numpy()]
         pbar.update(1)
 
     tqdm.write(f"  Tickers : {df_features.index.get_level_values('ticker').nunique()}")
@@ -262,38 +299,107 @@ def load_master(
     return df_features
 
 
+def walk_forward_date_ranges(
+    dates_or_df,
+    train_years: int = 10,
+    val_years: int = 1,
+    test_years: int = 1,
+) -> list[dict]:
+    if isinstance(dates_or_df, pd.DataFrame):
+        dates = sorted(dates_or_df.index.get_level_values("date").unique())
+    else:
+        dates = sorted(dates_or_df)
+    dates = pd.DatetimeIndex(dates)
+    if len(dates) == 0:
+        return []
+
+    ranges = []
+    val_delta = pd.DateOffset(years=val_years)
+    test_delta = pd.DateOffset(years=test_years)
+
+    fold_start = dates[0] + pd.DateOffset(years=train_years)
+    while fold_start + val_delta + test_delta <= dates[-1]:
+        val_start = fold_start
+        test_start = val_start + val_delta
+        test_end = test_start + test_delta
+
+        train_dates = dates[dates < val_start]
+        val_dates = dates[(dates >= val_start) & (dates < test_start)]
+        test_dates = dates[(dates >= test_start) & (dates < test_end)]
+
+        if len(train_dates) and len(val_dates) and len(test_dates):
+            ranges.append({
+                "train_start": pd.Timestamp(train_dates[0]),
+                "train_end": pd.Timestamp(train_dates[-1]),
+                "val_start": pd.Timestamp(val_dates[0]),
+                "val_end": pd.Timestamp(val_dates[-1]),
+                "test_start": pd.Timestamp(test_dates[0]),
+                "test_end": pd.Timestamp(test_dates[-1]),
+                "load_start": pd.Timestamp(train_dates[0]),
+                "load_end": pd.Timestamp(val_dates[-1]),
+                "train_rows": len(train_dates),
+                "val_rows": len(val_dates),
+                "test_rows": len(test_dates),
+            })
+
+        fold_start = test_end
+
+    return ranges
+
+
+def filter_date_range(
+    df: pd.DataFrame,
+    start_date: pd.Timestamp | None,
+    end_date: pd.Timestamp | None,
+    include_end: bool = True,
+) -> pd.DataFrame:
+    dates = df.index.get_level_values("date")
+    mask = pd.Series(True, index=df.index)
+    if start_date is not None:
+        mask &= dates >= pd.Timestamp(start_date)
+    if end_date is not None:
+        if include_end:
+            mask &= dates <= pd.Timestamp(end_date)
+        else:
+            mask &= dates < pd.Timestamp(end_date)
+    return df[mask.to_numpy()]
+
+
+def prepare_memory_light_training_frame(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    extra_cols: tuple[str, ...] = ("close",),
+) -> pd.DataFrame:
+    keep_cols = [col for col in feature_cols if col in df.columns]
+    keep_cols.extend(col for col in extra_cols if col in df.columns and col not in keep_cols)
+    prepared = df.loc[:, keep_cols].copy()
+    numeric_feature_cols = [
+        col for col in feature_cols
+        if col in prepared.columns and pd.api.types.is_numeric_dtype(prepared[col])
+    ]
+    if numeric_feature_cols:
+        prepared[numeric_feature_cols] = prepared[numeric_feature_cols].astype("float32")
+    return prepared
+
+
 def walk_forward_split(
     df: pd.DataFrame,
     train_years: int = 10,
     val_years: int = 1,
     test_years: int = 1,
 ) -> list[dict]:
-    dates = sorted(df.index.get_level_values("date").unique())
-    dates = pd.DatetimeIndex(dates)
-
-    folds      = []
-    val_delta  = pd.DateOffset(years=val_years)
-    test_delta = pd.DateOffset(years=test_years)
-
-    fold_start = dates[0] + pd.DateOffset(years=train_years)
-    while fold_start + val_delta + test_delta <= dates[-1]:
-        val_start  = fold_start
-        test_start = val_start  + val_delta
-        test_end   = test_start + test_delta
-
-        train_idx = dates[dates < val_start]
-        val_idx   = dates[(dates >= val_start)  & (dates < test_start)]
-        test_idx  = dates[(dates >= test_start) & (dates < test_end)]
-
-        if len(train_idx) and len(val_idx) and len(test_idx):
-            folds.append({
-                "train": df[df.index.get_level_values("date").isin(train_idx)],
-                "val":   df[df.index.get_level_values("date").isin(val_idx)],
-                "test":  df[df.index.get_level_values("date").isin(test_idx)],
-            })
-
-        fold_start = test_end
-
+    folds = []
+    for fold_range in walk_forward_date_ranges(
+        df,
+        train_years=train_years,
+        val_years=val_years,
+        test_years=test_years,
+    ):
+        folds.append({
+            "train": filter_date_range(df, fold_range["train_start"], fold_range["train_end"]),
+            "val": filter_date_range(df, fold_range["val_start"], fold_range["val_end"]),
+            "test": filter_date_range(df, fold_range["test_start"], fold_range["test_end"]),
+        })
     return folds
 
 
