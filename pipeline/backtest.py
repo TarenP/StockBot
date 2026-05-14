@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 from pipeline.environment import PortfolioEnv
 from pipeline.features    import FEATURE_COLS
 from pipeline.model       import PortfolioTransformer
+from pipeline.action_projection import normalize_projection_settings, projection_kwargs
 from pipeline.policy_diagnostics import average_metric_dicts, weight_concentration_metrics
 from pipeline.benchmark   import (
     align_return_series, fetch_spy_returns, compute_metrics, benchmark_vs_spy,
@@ -35,6 +36,7 @@ def run_backtest(
     spy_rets: np.ndarray | None = None,   # auto-fetched if None
     save_plot: str = "plots/backtest.png",
     ckpt_n_features: int | None = None,   # from checkpoint model_cfg
+    projection_settings: dict | None = None,
 ) -> dict:
     """
     Run the policy on df_test and compute full metrics vs SPY and equal-weight.
@@ -44,6 +46,9 @@ def run_backtest(
     current FEATURE_COLS, pass the checkpoint's n_features here so the env and
     model see the same feature slice.
     """
+    projection_settings = normalize_projection_settings(**(projection_settings or {}))
+    projection_args = projection_kwargs(projection_settings)
+
     # ── Resolve feature columns to match checkpoint ───────────────────────────
     if ckpt_n_features is not None and ckpt_n_features != len(FEATURE_COLS):
         feature_cols = FEATURE_COLS[:ckpt_n_features]
@@ -69,7 +74,7 @@ def run_backtest(
     with torch.no_grad():
         while not done:
             obs_t   = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            weights = model.get_weights(obs_t).squeeze(0).cpu().numpy()
+            weights = model.get_weights(obs_t, **projection_args).squeeze(0).cpu().numpy()
             weight_metrics.append(
                 weight_concentration_metrics(
                     weights[:-1],
@@ -148,6 +153,9 @@ def run_backtest(
     avg_weight_metrics = average_metric_dicts(weight_metrics)
     n_concentration = min(len(policy_aligned), len(spy_aligned)) if spy_aligned is not None else 0
     concentration = {
+        "projection_mode": projection_settings["rl_action_projection"],
+        "temperature": projection_settings["rl_action_temperature"],
+        "top_k": projection_settings["rl_action_top_k"],
         "avg_top10_weight_sum": avg_weight_metrics.get("avg_top_10_weight_sum", 0.0),
         "avg_top20_weight_sum": avg_weight_metrics.get("avg_top_20_weight_sum", 0.0),
         "avg_effective_positions": avg_weight_metrics.get("avg_effective_number_of_positions", 0.0),
@@ -170,6 +178,9 @@ def run_backtest(
     )
     print("\nRL Backtest Concentration Diagnostics:")
     for key in (
+        "projection_mode",
+        "temperature",
+        "top_k",
         "avg_top10_weight_sum",
         "avg_top20_weight_sum",
         "avg_effective_positions",
@@ -178,7 +189,13 @@ def run_backtest(
         "avg_turnover",
         "return_vs_spy",
     ):
-        print(f"  {key}: {concentration.get(key, 0.0):.6f}")
+        value = concentration.get(key, 0.0)
+        if isinstance(value, str):
+            print(f"  {key}: {value}")
+        elif isinstance(value, int):
+            print(f"  {key}: {value}")
+        else:
+            print(f"  {key}: {value:.6f}")
 
     # ── Plot ──────────────────────────────────────────────────────────────────
     plot_benchmark(

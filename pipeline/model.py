@@ -12,7 +12,8 @@ Architecture:
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from pipeline.action_projection import project_actions
 
 
 class PositionalEncoding(nn.Module):
@@ -149,11 +150,19 @@ class PortfolioTransformer(nn.Module):
         return logits, value
 
     @torch.no_grad()
-    def get_weights(self, obs: torch.Tensor, temperature: float = 1.0, padding_mask=None) -> torch.Tensor:
+    def get_weights(
+        self,
+        obs: torch.Tensor,
+        temperature: float = 1.0,
+        padding_mask=None,
+        projection: str = "softplus",
+        top_k: int = 50,
+    ) -> torch.Tensor:
         """Inference: returns the mean portfolio weights of the Dirichlet policy."""
         logits, _ = self.forward(obs, padding_mask=padding_mask)
-        concentration = F.softplus(logits / temperature) + 1e-6
-        # Floor the cash concentration to prevent the model from learning
-        # negative/zero cash weights (implicit leverage).
-        concentration[:, -1] = torch.clamp(concentration[:, -1], min=1e-6)
-        return concentration / concentration.sum(dim=-1, keepdim=True)
+        return project_actions(
+            logits,
+            projection=projection,
+            temperature=temperature,
+            top_k=top_k,
+        )

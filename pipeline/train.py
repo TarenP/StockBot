@@ -22,6 +22,7 @@ from tqdm import tqdm
 from pipeline.environment import PortfolioEnv
 from pipeline.features import FEATURE_COLS
 from pipeline.model import PortfolioTransformer
+from pipeline.action_projection import normalize_projection_settings, projection_kwargs
 from pipeline.policy_diagnostics import average_metric_dicts, weight_concentration_metrics
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,9 @@ def _save_resume(path, model, optimizer, scheduler, model_cfg,
                  training_mode: str = "standard",
                  total_steps_requested: int | None = None,
                  feature_cols: list[str] | None = None,
-                 asset_list: list[str] | None = None):
+                 asset_list: list[str] | None = None,
+                 projection_settings: dict | None = None):
+    projection_settings = normalize_projection_settings(**(projection_settings or {}))
     torch.save({
         "model_state":     model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
@@ -84,6 +87,7 @@ def _save_resume(path, model, optimizer, scheduler, model_cfg,
         "n_features":      len(feature_cols or []),
         "asset_list":      list(asset_list or []),
         "created_at":      datetime.now(timezone.utc).isoformat(),
+        **projection_settings,
     }, path)
 
 def _load_resume(path, device):
@@ -283,6 +287,7 @@ def train_fold(
     shortlist_universe: list[str] = None,
     curriculum: bool = False,
     training_mode: str = "standard",
+    projection_settings: dict | None = None,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -291,6 +296,7 @@ def train_fold(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     os.makedirs(save_dir, exist_ok=True)
+    projection_settings = normalize_projection_settings(**(projection_settings or {}))
 
     # Use shortlist universe when provided (overrides asset_list)
     if shortlist_universe is not None and len(shortlist_universe) > 0:
@@ -383,6 +389,12 @@ def train_fold(
     tqdm.write(f"Fold {fold_idx} | device={device} | "
                f"assets={len(asset_list)} | features={n_features} | "
                f"start_step={steps_done:,}/{cfg['total_steps']:,}")
+    tqdm.write(
+        "Projection | "
+        f"mode={projection_settings['rl_action_projection']} | "
+        f"temperature={projection_settings['rl_action_temperature']} | "
+        f"top_k={projection_settings['rl_action_top_k']}"
+    )
     tqdm.write(f"{'='*60}")
 
     save_every = cfg.get("save_every", 5_000)
@@ -461,7 +473,12 @@ def train_fold(
                     f"at step {steps_done:,}"
                 )
 
-            val_metrics = evaluate_diagnostics(model, val_env, device)
+            val_metrics = evaluate_diagnostics(
+                model,
+                val_env,
+                device,
+                projection_settings=projection_settings,
+            )
             val_sharpe = val_metrics["sharpe"]
             val_return = val_metrics["total_return"]
 
@@ -527,6 +544,7 @@ def train_fold(
                     "created_at":  datetime.now(timezone.utc).isoformat(),
                     "training_mode": training_mode,
                     "validation_metrics": val_metrics,
+                    **projection_settings,
                 }, best_ckpt_path)
                 tqdm.write(
                     f"  ✓ Step {steps_done:,} — new best  "
@@ -542,6 +560,7 @@ def train_fold(
                     total_steps_requested=cfg["total_steps"],
                     feature_cols=feature_cols,
                     asset_list=asset_list,
+                    projection_settings=projection_settings,
                 )
                 steps_since_save = 0
 
@@ -555,6 +574,7 @@ def train_fold(
             total_steps_requested=cfg["total_steps"],
             feature_cols=feature_cols,
             asset_list=asset_list,
+            projection_settings=projection_settings,
         )
         tqdm.write(f"  Saved to {resume_path}. Re-run the same command to continue.")
         pbar.close()
@@ -571,6 +591,7 @@ def train_fold(
             total_steps_requested=cfg["total_steps"],
             feature_cols=feature_cols,
             asset_list=asset_list,
+            projection_settings=projection_settings,
         )
     open(_done_path(save_dir, fold_idx), "w").close()
     if os.path.exists(resume_path) and training_mode != "memory_light":
@@ -583,8 +604,9 @@ def train_fold(
 
 # ── Evaluation helper ─────────────────────────────────────────────────────────
 
-def evaluate_diagnostics(model, env, device) -> dict:
+def evaluate_diagnostics(model, env, device, projection_settings: dict | None = None) -> dict:
     model.eval()
+    projection_args = projection_kwargs(projection_settings)
     obs, _ = env.reset()
     done   = False
     rets   = []
@@ -606,7 +628,7 @@ def evaluate_diagnostics(model, env, device) -> dict:
     while not done:
         obs_t   = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
-            weights = model.get_weights(obs_t)
+            weights = model.get_weights(obs_t, **projection_args)
         action  = weights.squeeze(0).cpu().numpy()
         target_returns = env._get_returns(env.ptr)
         benchmark_ret = float(np.nanmean(target_returns)) if len(target_returns) else 0.0

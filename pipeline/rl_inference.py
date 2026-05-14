@@ -18,8 +18,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 
+from pipeline.action_projection import normalize_projection_settings, projection_kwargs
 from pipeline.features import FEATURE_COLS
 from pipeline.model import PortfolioTransformer
 
@@ -87,6 +87,50 @@ def _normalize_asset_weights(asset_weights: np.ndarray) -> np.ndarray:
         return normalized
     normalized[positive_mask] = weights[positive_mask] / total_positive
     return normalized
+
+
+def _load_projection_config(path: str = "broker.config") -> dict:
+    cfg = {}
+    if not os.path.exists(path):
+        return cfg
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if key not in {"rl_action_projection", "rl_action_temperature", "rl_action_top_k"}:
+                    continue
+                cfg[key] = value.split("#")[0].strip()
+    except Exception:
+        return {}
+    return cfg
+
+
+def _resolve_projection_settings(
+    checkpoint_meta: dict | None = None,
+    rl_action_projection: str | None = None,
+    rl_action_temperature: float | None = None,
+    rl_action_top_k: int | None = None,
+) -> dict:
+    config = _load_projection_config()
+
+    def choose(explicit, key):
+        if explicit is not None:
+            return explicit
+        if config.get(key) is not None:
+            return config[key]
+        if checkpoint_meta is not None and checkpoint_meta.get(key) is not None:
+            return checkpoint_meta[key]
+        return None
+
+    return normalize_projection_settings(
+        projection=choose(rl_action_projection, "rl_action_projection"),
+        temperature=choose(rl_action_temperature, "rl_action_temperature"),
+        top_k=choose(rl_action_top_k, "rl_action_top_k"),
+    )
 
 
 def _load_model(
@@ -266,6 +310,9 @@ def get_rl_targets(
     mode: str = "rank",
     device: Optional[torch.device] = None,
     lookback: int = 20,
+    rl_action_projection: str | None = None,
+    rl_action_temperature: float | None = None,
+    rl_action_top_k: int | None = None,
 ) -> pd.Series | pd.DataFrame:
     """
     Load the PortfolioTransformer checkpoint and run a forward pass.
@@ -317,9 +364,28 @@ def get_rl_targets(
         ensemble = _load_ensemble(models_dir, device)
         # Use the first checkpoint's n_features as the canonical value
         ckpt_n_features = ensemble[0][1].get("model_cfg", {}).get("n_features", len(FEATURE_COLS))
+        projection_settings = _resolve_projection_settings(
+            ensemble[0][1],
+            rl_action_projection=rl_action_projection,
+            rl_action_temperature=rl_action_temperature,
+            rl_action_top_k=rl_action_top_k,
+        )
     else:
         model, ckpt = _load_model(checkpoint_path, device)
         ckpt_n_features = ckpt.get("model_cfg", {}).get("n_features", len(FEATURE_COLS))
+        projection_settings = _resolve_projection_settings(
+            ckpt,
+            rl_action_projection=rl_action_projection,
+            rl_action_temperature=rl_action_temperature,
+            rl_action_top_k=rl_action_top_k,
+        )
+    projection_args = projection_kwargs(projection_settings)
+    logger.info(
+        "RL inference projection: mode=%s temperature=%.4f top_k=%d",
+        projection_settings["rl_action_projection"],
+        projection_settings["rl_action_temperature"],
+        projection_settings["rl_action_top_k"],
+    )
 
     # Select only the features the model was trained on.
     # New features added after training are silently dropped for inference.
@@ -350,13 +416,13 @@ def get_rl_targets(
 
         all_weights = []
         for model, _ckpt in ensemble:
-            w = model.get_weights(obs_t, padding_mask=padding_mask)
+            w = model.get_weights(obs_t, padding_mask=padding_mask, **projection_args)
             all_weights.append(w.squeeze(0).cpu().numpy())
 
         weights_np = np.stack(all_weights, axis=0).mean(axis=0)  # (n_assets + 1,)
     else:
         # ── Single checkpoint inference ───────────────────────────────────────
-        weights = model.get_weights(obs_t, padding_mask=padding_mask)
+        weights = model.get_weights(obs_t, padding_mask=padding_mask, **projection_args)
         weights_np = weights.squeeze(0).cpu().numpy()
 
     asset_weights = weights_np[:-1]   # (n_assets,)

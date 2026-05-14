@@ -72,7 +72,7 @@ class _FixedWeightModel:
     def train(self):
         return self
 
-    def get_weights(self, obs):
+    def get_weights(self, obs, **_kwargs):
         return self.weights.to(obs.device)
 
 
@@ -123,10 +123,11 @@ def test_action_transform_trace_preserves_sum_to_one():
     trace = action_transform_trace(logits, final_weights)
 
     assert [stage["stage"] for stage in trace] == [
-        "raw_policy_shifted",
-        "softplus_projection",
+        "raw_policy",
+        "shifted_or_centered_policy",
+        "projection_selected_universe",
+        "projected_weights",
         "final_weights",
     ]
     for stage in trace:
-        asset_sum = stage["top_50_weight_sum"]
-        assert asset_sum + stage["cash_weight"] == pytest.approx(1.0)
+        assert stage["sum_weights"] == pytest.approx(1.0)

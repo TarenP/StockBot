@@ -94,6 +94,13 @@ def parse_args():
     p.add_argument("--rl_checkpoint", type=str, default=None,      help="Path to RL checkpoint for ablation/RL modes")
     p.add_argument("--debug_policy_output", action="store_true",
                    help="Print raw RL policy output diagnostics without changing weights")
+    p.add_argument("--rl_action_projection", type=str, default=None,
+                   choices=["softplus", "softmax", "top_k_softmax", "rank_top_k"],
+                   help="RL action-to-weight projection mode")
+    p.add_argument("--rl_action_temperature", type=float, default=None,
+                   help="RL action projection temperature")
+    p.add_argument("--rl_action_top_k", type=int, default=None,
+                   help="RL action projection top-k for sparse modes")
     return p.parse_args()
 
 
@@ -171,6 +178,28 @@ def _load_typed_config(path: str = "broker.config") -> dict:
                  (float(value) if value.replace(".", "", 1).lstrip("-").isdigit() else value))
             )
     return cfg
+
+
+def _resolve_rl_action_projection(args=None, checkpoint_meta: dict | None = None) -> dict:
+    from pipeline.action_projection import normalize_projection_settings
+
+    cfg = _load_typed_config()
+
+    def choose(attr: str, key: str, default=None):
+        value = getattr(args, attr, None) if args is not None else None
+        if value is not None:
+            return value
+        if checkpoint_meta is not None and checkpoint_meta.get(key) is not None:
+            return checkpoint_meta.get(key)
+        if cfg.get(key) is not None:
+            return cfg.get(key)
+        return default
+
+    return normalize_projection_settings(
+        projection=choose("rl_action_projection", "rl_action_projection"),
+        temperature=choose("rl_action_temperature", "rl_action_temperature"),
+        top_k=choose("rl_action_top_k", "rl_action_top_k"),
+    )
 
 
 def _latest_price_panel_date(price_path: str = "MasterDS/stooq_panel.parquet") -> pd.Timestamp | None:
@@ -396,6 +425,13 @@ def _run_memory_light_train(args, debug_settings: dict, top_n: int):
 
     logger.info("Memory-light RL training enabled.")
     cfg = {**PPO_CFG, "total_steps": debug_settings["total_steps"]}
+    projection_settings = _resolve_rl_action_projection(args)
+    logger.info(
+        "RL action projection: mode=%s temperature=%.4f top_k=%d",
+        projection_settings["rl_action_projection"],
+        projection_settings["rl_action_temperature"],
+        projection_settings["rl_action_top_k"],
+    )
     best_ckpts = []
 
     log_memory("before load")
@@ -478,6 +514,7 @@ def _run_memory_light_train(args, debug_settings: dict, top_n: int):
                     force_restart=args.force_retrain,
                     shortlist_universe=shortlist_universe,
                     training_mode="memory_light",
+                    projection_settings=projection_settings,
                 )
                 logger.info("[fold %d] saved checkpoint = %s", i, ckpt_path)
                 best_ckpts.append((ckpt_path, val_sharpe))
@@ -519,6 +556,13 @@ def run_train(args):
     logger.info(f"Walk-forward folds available: {len(folds)}")
 
     cfg = {**PPO_CFG, "total_steps": debug_settings["total_steps"]}
+    projection_settings = _resolve_rl_action_projection(args)
+    logger.info(
+        "RL action projection: mode=%s temperature=%.4f top_k=%d",
+        projection_settings["rl_action_projection"],
+        projection_settings["rl_action_temperature"],
+        projection_settings["rl_action_top_k"],
+    )
     best_ckpts = []
     start_fold = max(0, int(debug_settings.get("start_fold", 0)))
     selected_folds = list(enumerate(folds))[start_fold:start_fold + debug_settings["folds"]]
@@ -596,6 +640,7 @@ def run_train(args):
                     top_n=top_n,
                     force_restart=args.force_retrain,
                     shortlist_universe=shortlist_universe,
+                    projection_settings=projection_settings,
                 )
                 best_ckpts.append((ckpt_path, val_sharpe))
                 folds_pbar.update(1)
@@ -674,6 +719,7 @@ def run_finetune(args):
         logger.info("No checkpoint found — training from scratch.")
 
     cfg = {**PPO_CFG, "total_steps": args.finetune_steps}
+    projection_settings = _resolve_rl_action_projection(args, ckpt if ckpt_path else None)
 
     # Version the fine-tuned checkpoint
     fold_idx = len(glob.glob(f"{args.save_dir}/best_fold*.pt"))
@@ -689,6 +735,7 @@ def run_finetune(args):
         device           = DEVICE,
         seed             = args.seed,
         pretrained_state = pretrained_state,
+        projection_settings = projection_settings,
     )
     logger.info(f"Fine-tune done. Val Sharpe={val_sharpe:.3f} | Saved: {new_ckpt}")
 
@@ -706,6 +753,13 @@ def run_backtest_mode(args):
 
     import torch
     meta  = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    projection_settings = _resolve_rl_action_projection(args, meta)
+    logger.info(
+        "Backtest RL action projection: mode=%s temperature=%.4f top_k=%d",
+        projection_settings["rl_action_projection"],
+        projection_settings["rl_action_temperature"],
+        projection_settings["rl_action_top_k"],
+    )
     top_n = meta.get("top_n", _resolve_top_n(args))
 
     df, asset_list = _load_data_and_universe(top_n, include_raw_cols=True)
@@ -747,6 +801,7 @@ def run_backtest_mode(args):
         device=DEVICE,
         save_plot="plots/backtest.png",
         ckpt_n_features=ckpt_n_features,
+        projection_settings=projection_settings,
     )
 
 
@@ -769,6 +824,18 @@ def run_predict(args):
 
     import torch
     meta   = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    projection_settings = _resolve_rl_action_projection(args, meta)
+    projection_args = {
+        "projection": projection_settings["rl_action_projection"],
+        "temperature": projection_settings["rl_action_temperature"],
+        "top_k": projection_settings["rl_action_top_k"],
+    }
+    logger.info(
+        "Predict RL action projection: mode=%s temperature=%.4f top_k=%d",
+        projection_settings["rl_action_projection"],
+        projection_settings["rl_action_temperature"],
+        projection_settings["rl_action_top_k"],
+    )
     configured_top_n = _resolve_top_n(args)
     top_n  = meta.get("top_n", configured_top_n)
     if args.top_n is None and top_n != configured_top_n:
@@ -833,7 +900,7 @@ def run_predict(args):
     obs_t   = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
     with torch.no_grad():
         logits, _ = model(obs_t)
-        weights = model.get_weights(obs_t).squeeze(0).cpu().numpy()
+        weights = model.get_weights(obs_t, **projection_args).squeeze(0).cpu().numpy()
 
     asset_weights = weights[:-1]
     cash_weight   = weights[-1]
@@ -842,6 +909,11 @@ def run_predict(args):
         universe_size=len(asset_list),
         cash_weight=float(cash_weight),
     )
+    concentration.update({
+        "projection_mode": projection_settings["rl_action_projection"],
+        "temperature": projection_settings["rl_action_temperature"],
+        "top_k": projection_settings["rl_action_top_k"],
+    })
 
     # ── Build ranked output table ────────────────────────────────────────────
     # Grab the most recent feature snapshot per ticker for signal context
@@ -899,19 +971,19 @@ def run_predict(args):
     if getattr(args, "debug_policy_output", False):
         print()
         print("Raw Policy Output Diagnostics:")
-        raw_metrics = raw_policy_diagnostics(logits)
+        raw_metrics = raw_policy_diagnostics(logits, **projection_args)
         for key in (
             "raw_action_min",
             "raw_action_max",
             "raw_action_mean",
             "raw_action_std",
             "raw_action_entropy",
-            "raw_action_top10_sum_after_softplus_projection",
+            "raw_action_top10_sum_after_projection",
         ):
             print(f"  {key}: {raw_metrics.get(key, 0.0):.6f}")
         print()
         print("Action Transformation Trace:")
-        for stage_metrics in action_transform_trace(logits, weights):
+        for stage_metrics in action_transform_trace(logits, weights, **projection_args):
             print(f"  stage = {stage_metrics['stage']}")
             for key in (
                 "nonzero_positions",
@@ -920,6 +992,8 @@ def run_predict(args):
                 "top_20_weight_sum",
                 "weight_std",
                 "effective_number_of_positions",
+                "weight_entropy",
+                "sum_weights",
                 "cash_weight",
             ):
                 value = stage_metrics.get(key, 0.0)
