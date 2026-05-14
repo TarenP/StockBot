@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 from pipeline.environment import PortfolioEnv
 from pipeline.features    import FEATURE_COLS
 from pipeline.model       import PortfolioTransformer
+from pipeline.policy_diagnostics import average_metric_dicts, weight_concentration_metrics
 from pipeline.benchmark   import (
     align_return_series, fetch_spy_returns, compute_metrics, benchmark_vs_spy,
     print_benchmark_report, plot_benchmark,
@@ -59,14 +60,27 @@ def run_backtest(
     obs, _ = env.reset()
     done   = False
     policy_rets = []
+    weight_metrics = []
+    turnovers = []
+    prev_weights = np.zeros(len(asset_list) + 1, dtype=np.float32)
+    prev_weights[-1] = 1.0
 
     model.eval()
     with torch.no_grad():
         while not done:
             obs_t   = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
             weights = model.get_weights(obs_t).squeeze(0).cpu().numpy()
+            weight_metrics.append(
+                weight_concentration_metrics(
+                    weights[:-1],
+                    universe_size=len(asset_list),
+                    cash_weight=float(weights[-1]),
+                )
+            )
+            turnovers.append(float(np.abs(weights - prev_weights).sum()))
             obs, _, terminated, truncated, info = env.step(weights)
             policy_rets.append(info["port_ret"])
+            prev_weights = weights.astype(np.float32)
             done = terminated or truncated
     policy_rets = np.array(policy_rets)
     return_dates = pd.DatetimeIndex(env.dates[env.lookback:env.lookback + len(policy_rets)])
@@ -131,6 +145,22 @@ def run_backtest(
             results["spy"]    = compute_metrics(spy_aligned[:n], "SPY")
             results["vs_spy"] = benchmark_vs_spy(policy_aligned[:n], spy_aligned[:n])
 
+    avg_weight_metrics = average_metric_dicts(weight_metrics)
+    n_concentration = min(len(policy_aligned), len(spy_aligned)) if spy_aligned is not None else 0
+    concentration = {
+        "avg_top10_weight_sum": avg_weight_metrics.get("avg_top_10_weight_sum", 0.0),
+        "avg_top20_weight_sum": avg_weight_metrics.get("avg_top_20_weight_sum", 0.0),
+        "avg_effective_positions": avg_weight_metrics.get("avg_effective_number_of_positions", 0.0),
+        "avg_max_weight": avg_weight_metrics.get("avg_max_weight", 0.0),
+        "avg_cash_weight": avg_weight_metrics.get("avg_cash_weight", 0.0),
+        "avg_turnover": float(np.mean(turnovers)) if turnovers else 0.0,
+        "return_vs_spy": (
+            float(np.prod(1 + policy_aligned[:n_concentration]) - 1)
+            - float(np.prod(1 + spy_aligned[:n_concentration]) - 1)
+        ) if n_concentration else 0.0,
+    }
+    results["concentration"] = concentration
+
     # ── Print report ──────────────────────────────────────────────────────────
     print_benchmark_report(
         policy_aligned,
@@ -138,6 +168,17 @@ def run_backtest(
         ew_rets=ew_aligned,
         label="RL Policy",
     )
+    print("\nRL Backtest Concentration Diagnostics:")
+    for key in (
+        "avg_top10_weight_sum",
+        "avg_top20_weight_sum",
+        "avg_effective_positions",
+        "avg_max_weight",
+        "avg_cash_weight",
+        "avg_turnover",
+        "return_vs_spy",
+    ):
+        print(f"  {key}: {concentration.get(key, 0.0):.6f}")
 
     # ── Plot ──────────────────────────────────────────────────────────────────
     plot_benchmark(

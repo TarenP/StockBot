@@ -22,6 +22,7 @@ from tqdm import tqdm
 from pipeline.environment import PortfolioEnv
 from pipeline.features import FEATURE_COLS
 from pipeline.model import PortfolioTransformer
+from pipeline.policy_diagnostics import average_metric_dicts, weight_concentration_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,68 @@ def log_memory(label: str):
             )
     except Exception:
         pass
+
+
+def _frame_date_range(df):
+    dates = sorted(df.index.get_level_values("date").unique())
+    if not dates:
+        return "empty", "empty"
+    return pd_timestamp_date(dates[0]), pd_timestamp_date(dates[-1])
+
+
+def pd_timestamp_date(value):
+    try:
+        return value.date()
+    except AttributeError:
+        return value
+
+
+def _log_fold_frame_diagnostics(fold_idx, df_train, df_val, asset_list, train_env, val_env, feature_cols):
+    train_start, train_end = _frame_date_range(df_train)
+    val_start, val_end = _frame_date_range(df_val)
+    train_tickers = df_train.index.get_level_values("ticker").nunique()
+    val_tickers = df_val.index.get_level_values("ticker").nunique()
+    logger.info(
+        "[fold %d] train dates = %s to %s | validation dates = %s to %s",
+        fold_idx,
+        train_start,
+        train_end,
+        val_start,
+        val_end,
+    )
+    logger.info(
+        "[fold %d] train rows = %d tickers = %d | validation rows = %d tickers = %d | asset_list = %d | features = %d",
+        fold_idx,
+        len(df_train),
+        train_tickers,
+        len(df_val),
+        val_tickers,
+        len(asset_list),
+        len(feature_cols),
+    )
+    logger.info(
+        "[fold %d] train price tensor shape = %s | validation price tensor shape = %s",
+        fold_idx,
+        tuple(train_env.price_arr.shape),
+        tuple(val_env.price_arr.shape),
+    )
+    if train_tickers != len(asset_list) or val_tickers != len(asset_list):
+        logger.warning(
+            "[fold %d] ticker/asset alignment mismatch: train_tickers=%d val_tickers=%d asset_list=%d",
+            fold_idx,
+            train_tickers,
+            val_tickers,
+            len(asset_list),
+        )
+
+
+def _max_drawdown(returns: np.ndarray) -> float:
+    if len(returns) == 0:
+        return 0.0
+    equity = np.cumprod(1.0 + returns)
+    peaks = np.maximum.accumulate(equity)
+    drawdowns = (equity / np.maximum(peaks, 1e-12)) - 1.0
+    return float(drawdowns.min())
 
 
 # ── GAE advantage estimation ─────────────────────────────────────────────────
@@ -305,6 +368,15 @@ def train_fold(
         lookback=lookback,
         feature_cols=feature_cols,
     )
+    _log_fold_frame_diagnostics(
+        fold_idx,
+        df_train,
+        df_val,
+        asset_list,
+        train_env,
+        val_env,
+        feature_cols,
+    )
     log_memory(f"[fold {fold_idx}] before training")
 
     tqdm.write(f"\n{'='*60}")
@@ -389,13 +461,50 @@ def train_fold(
                     f"at step {steps_done:,}"
                 )
 
-            val_sharpe, val_return = evaluate(model, val_env, device)
+            val_metrics = evaluate_diagnostics(model, val_env, device)
+            val_sharpe = val_metrics["sharpe"]
+            val_return = val_metrics["total_return"]
 
             pbar.set_postfix(
                 loss       = f"{metrics.get('loss', 0):.3f}",
                 entropy    = f"{metrics.get('entropy', 0):.3f}",
                 val_sharpe = f"{val_sharpe:.3f}",
                 val_ret    = f"{val_return:.1%}",
+            )
+            logger.info(
+                "[fold %d] validation step=%d fresh=true return=%.6f benchmark_return=%.6f "
+                "max_drawdown=%.6f turnover=%.6f sharpe=%.6f mean=%.8f std=%.8f n=%d",
+                fold_idx,
+                steps_done,
+                val_metrics["total_return"],
+                val_metrics["benchmark_return"],
+                val_metrics["max_drawdown"],
+                val_metrics["turnover"],
+                val_metrics["sharpe"],
+                val_metrics["mean_return"],
+                val_metrics["std_return"],
+                val_metrics["n_returns"],
+            )
+            logger.info(
+                "[fold %d] validation concentration step=%d avg_max_weight=%.6f "
+                "avg_top10=%.6f avg_top20=%.6f avg_entropy=%.6f "
+                "avg_effective_positions=%.2f avg_cash=%.6f avg_nonzero=%.2f "
+                "avg_reward=%.8f avg_excess=%.8f avg_turnover_penalty=%.8f "
+                "avg_drawdown_penalty=%.8f avg_entropy_term=%.8f",
+                fold_idx,
+                steps_done,
+                val_metrics.get("avg_max_weight", 0.0),
+                val_metrics.get("avg_top_10_weight_sum", 0.0),
+                val_metrics.get("avg_top_20_weight_sum", 0.0),
+                val_metrics.get("avg_weight_entropy", 0.0),
+                val_metrics.get("avg_effective_number_of_positions", 0.0),
+                val_metrics.get("avg_cash_weight", 0.0),
+                val_metrics.get("avg_nonzero_positions", 0.0),
+                val_metrics.get("avg_reward", 0.0),
+                val_metrics.get("avg_excess_return_component", 0.0),
+                val_metrics.get("avg_turnover_penalty", 0.0),
+                val_metrics.get("avg_drawdown_penalty", 0.0),
+                val_metrics.get("avg_entropy_term", 0.0),
             )
 
             # ── Save best checkpoint ─────────────────────────────────────────
@@ -417,6 +526,7 @@ def train_fold(
                     "n_features":  n_features,
                     "created_at":  datetime.now(timezone.utc).isoformat(),
                     "training_mode": training_mode,
+                    "validation_metrics": val_metrics,
                 }, best_ckpt_path)
                 tqdm.write(
                     f"  ✓ Step {steps_done:,} — new best  "
@@ -473,35 +583,93 @@ def train_fold(
 
 # ── Evaluation helper ─────────────────────────────────────────────────────────
 
-def evaluate(model, env, device) -> tuple[float, float]:
+def evaluate_diagnostics(model, env, device) -> dict:
     model.eval()
     obs, _ = env.reset()
     done   = False
     rets   = []
+    benchmark_rets = []
+    turnovers = []
+    rewards = []
+    weight_metrics = []
+    excess_returns = []
+    turnover_penalties = []
+    drawdown_penalties = []
+    entropy_terms = []
+    prev_action = np.zeros(env.n_assets + 1, dtype=np.float32)
+    prev_action[-1] = 1.0
 
-    n_dates = len(env.dates) - env.lookback
+    n_dates = max(len(env.dates) - env.lookback - 1, 0)
     pbar = tqdm(total=n_dates, desc="  Evaluating", unit="day",
                 leave=False, colour="yellow")
 
     while not done:
         obs_t   = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        weights = model.get_weights(obs_t)
+        with torch.no_grad():
+            weights = model.get_weights(obs_t)
         action  = weights.squeeze(0).cpu().numpy()
-        obs, _, terminated, truncated, info = env.step(action)
+        target_returns = env._get_returns(env.ptr)
+        benchmark_ret = float(np.nanmean(target_returns)) if len(target_returns) else 0.0
+        turnover = float(np.abs(action - prev_action).sum())
+        benchmark_rets.append(benchmark_ret)
+        turnovers.append(turnover)
+        weight_metrics.append(weight_concentration_metrics(action[:-1], cash_weight=float(action[-1])))
+        entropy_terms.append(weight_metrics[-1]["weight_entropy"])
+        obs, reward, terminated, truncated, info = env.step(action)
         rets.append(info["port_ret"])
+        rewards.append(float(reward))
+        excess_returns.append(float(info["port_ret"] - benchmark_ret))
+        turnover_penalties.append(float(env.tc * turnover))
+        drawdown_penalties.append(0.0)
+        prev_action = action.astype(np.float32)
         pbar.update(env.step_size)
         done = terminated or truncated
 
     pbar.close()
     model.train()
 
-    rets = np.array(rets)
+    rets = np.array(rets, dtype=np.float32)
+    benchmark_rets = np.array(benchmark_rets, dtype=np.float32)
+    avg_weight_metrics = average_metric_dicts(weight_metrics)
+    reward_metrics = {
+        "avg_reward": float(np.mean(rewards)) if rewards else 0.0,
+        "avg_excess_return_component": float(np.mean(excess_returns)) if excess_returns else 0.0,
+        "avg_turnover_penalty": float(np.mean(turnover_penalties)) if turnover_penalties else 0.0,
+        "avg_drawdown_penalty": float(np.mean(drawdown_penalties)) if drawdown_penalties else 0.0,
+        "avg_entropy_term": float(np.mean(entropy_terms)) if entropy_terms else 0.0,
+    }
     if len(rets) < 2:
-        return 0.0, 0.0
+        return {
+            "sharpe": 0.0,
+            "total_return": 0.0,
+            "benchmark_return": float(np.prod(1 + benchmark_rets) - 1) if len(benchmark_rets) else 0.0,
+            "max_drawdown": 0.0,
+            "turnover": float(np.mean(turnovers)) if turnovers else 0.0,
+            "mean_return": float(rets.mean()) if len(rets) else 0.0,
+            "std_return": float(rets.std()) if len(rets) else 0.0,
+            "n_returns": int(len(rets)),
+        } | avg_weight_metrics | reward_metrics
 
-    sharpe  = (rets.mean() / (rets.std() + 1e-9)) * np.sqrt(252)
+    mean_r = float(rets.mean())
+    std_r = float(rets.std())
+    sharpe  = (mean_r / (std_r + 1e-9)) * np.sqrt(252)
     total_r = float(np.prod(1 + rets) - 1)
-    return sharpe, total_r
+    benchmark_r = float(np.prod(1 + benchmark_rets) - 1) if len(benchmark_rets) else 0.0
+    return {
+        "sharpe": float(sharpe),
+        "total_return": total_r,
+        "benchmark_return": benchmark_r,
+        "max_drawdown": _max_drawdown(rets),
+        "turnover": float(np.mean(turnovers)) if turnovers else 0.0,
+        "mean_return": mean_r,
+        "std_return": std_r,
+        "n_returns": int(len(rets)),
+    } | avg_weight_metrics | reward_metrics
+
+
+def evaluate(model, env, device) -> tuple[float, float]:
+    metrics = evaluate_diagnostics(model, env, device)
+    return metrics["sharpe"], metrics["total_return"]
 
 
 # ── Shortlist universe builder ────────────────────────────────────────────────

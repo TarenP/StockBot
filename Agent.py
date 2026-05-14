@@ -63,6 +63,7 @@ def parse_args():
     p.add_argument("--top_n",        type=int,   default=None,      help="Universe size for portfolio agent (defaults to broker.config)")
     p.add_argument("--top_k",        type=int,   default=10,       help="Stocks to hold / show")
     p.add_argument("--folds",        type=int,   default=3,        help="Walk-forward folds")
+    p.add_argument("--start_fold",   type=int,   default=0,        help="First walk-forward fold index to train")
     p.add_argument("--total_steps",  type=int,   default=100_000,  help="PPO steps per fold")
     p.add_argument("--finetune_steps", type=int, default=20_000,   help="PPO steps for fine-tune")
     p.add_argument("--checkpoint",   type=str,   default=None,     help="Path to .pt checkpoint")
@@ -91,6 +92,8 @@ def parse_args():
     p.add_argument("--replay_years",  type=int, default=3,         help="Years of history to replay (--mode replay)")
     p.add_argument("--sensitivity",   action="store_true",         help="Run sensitivity sweep during replay")
     p.add_argument("--rl_checkpoint", type=str, default=None,      help="Path to RL checkpoint for ablation/RL modes")
+    p.add_argument("--debug_policy_output", action="store_true",
+                   help="Print raw RL policy output diagnostics without changing weights")
     return p.parse_args()
 
 
@@ -291,6 +294,7 @@ def _ensure_price_data(top_n: int, save_dir: str = "models") -> None:
 def _effective_debug_settings(args) -> dict:
     settings = {
         "folds": args.folds,
+        "start_fold": args.start_fold,
         "total_steps": args.total_steps,
         "screener_epochs": args.screener_epochs,
         "skip_screener_train": args.skip_screener_train,
@@ -301,6 +305,7 @@ def _effective_debug_settings(args) -> dict:
     if args.debug_fast:
         settings.update({
             "folds": 1,
+            "start_fold": args.start_fold,
             "total_steps": min(args.total_steps, 2_048),
             "screener_epochs": 1,
             "skip_screener_train": True,
@@ -309,9 +314,10 @@ def _effective_debug_settings(args) -> dict:
             "shadow_validation_top_n": 5,
         })
         logger.info(
-            "Debug-fast enabled: folds=%d total_steps=%d screener_epochs=%d "
+            "Debug-fast enabled: start_fold=%d folds=%d total_steps=%d screener_epochs=%d "
             "skip_screener=%s shadow_generations=%d shadow_replay_years=%d "
             "shadow_validation_top_n=%d",
+            settings["start_fold"],
             settings["folds"],
             settings["total_steps"],
             settings["screener_epochs"],
@@ -399,7 +405,8 @@ def _run_memory_light_train(args, debug_settings: dict, top_n: int):
 
     fold_ranges = walk_forward_date_ranges(df_seed, train_years=8, val_years=1, test_years=1)
     logger.info("Walk-forward folds available: %d", len(fold_ranges))
-    selected_folds = fold_ranges[:debug_settings["folds"]]
+    start_fold = max(0, int(debug_settings.get("start_fold", 0)))
+    selected_folds = list(enumerate(fold_ranges))[start_fold:start_fold + debug_settings["folds"]]
     del df_seed
     _release_memory_light_fold(-1)
 
@@ -414,7 +421,7 @@ def _run_memory_light_train(args, debug_settings: dict, top_n: int):
         colour="magenta",
         dynamic_ncols=True,
     ) as folds_pbar:
-        for i, fold_range in enumerate(selected_folds):
+        for i, fold_range in selected_folds:
             if fold_is_complete(args.save_dir, i) and not args.force_retrain:
                 logger.info("Fold %d already complete - skipping.", i)
                 ckpt = f"{args.save_dir}/best_fold{i}.pt"
@@ -513,7 +520,8 @@ def run_train(args):
 
     cfg = {**PPO_CFG, "total_steps": debug_settings["total_steps"]}
     best_ckpts = []
-    selected_folds = folds[:debug_settings["folds"]]
+    start_fold = max(0, int(debug_settings.get("start_fold", 0)))
+    selected_folds = list(enumerate(folds))[start_fold:start_fold + debug_settings["folds"]]
 
     # ── Train screener first (needed to build shortlist universe) ─────────────
     if not debug_settings["skip_screener_train"]:
@@ -561,7 +569,7 @@ def run_train(args):
         colour="magenta",
         dynamic_ncols=True,
     ) as folds_pbar:
-        for i, fold in enumerate(selected_folds):
+        for i, fold in selected_folds:
             if fold_is_complete(args.save_dir, i) and not args.force_retrain:
                 logger.info(f"Fold {i} already complete - skipping.")
                 ckpt = f"{args.save_dir}/best_fold{i}.pt"
@@ -747,6 +755,12 @@ def run_backtest_mode(args):
 def run_predict(args):
     from pipeline.backtest import load_model
     from pipeline.features import FEATURE_COLS
+    from pipeline.policy_diagnostics import (
+        action_transform_trace,
+        format_weight_diagnostics,
+        raw_policy_diagnostics,
+        weight_concentration_metrics,
+    )
 
     ckpt_path = args.checkpoint or _best_checkpoint(args.save_dir)
     if not ckpt_path:
@@ -817,10 +831,17 @@ def run_predict(args):
             pass
 
     obs_t   = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-    weights = model.get_weights(obs_t).squeeze(0).cpu().numpy()
+    with torch.no_grad():
+        logits, _ = model(obs_t)
+        weights = model.get_weights(obs_t).squeeze(0).cpu().numpy()
 
     asset_weights = weights[:-1]
     cash_weight   = weights[-1]
+    concentration = weight_concentration_metrics(
+        asset_weights,
+        universe_size=len(asset_list),
+        cash_weight=float(cash_weight),
+    )
 
     # ── Build ranked output table ────────────────────────────────────────────
     # Grab the most recent feature snapshot per ticker for signal context
@@ -872,6 +893,40 @@ def run_predict(args):
     print(f"  {'-'*66}")
     print(f"  {'CASH':<12} {cash_weight:>6.2%}")
     print(f"{'='*72}")
+    print()
+    for line in format_weight_diagnostics(concentration):
+        print(line)
+    if getattr(args, "debug_policy_output", False):
+        print()
+        print("Raw Policy Output Diagnostics:")
+        raw_metrics = raw_policy_diagnostics(logits)
+        for key in (
+            "raw_action_min",
+            "raw_action_max",
+            "raw_action_mean",
+            "raw_action_std",
+            "raw_action_entropy",
+            "raw_action_top10_sum_after_softplus_projection",
+        ):
+            print(f"  {key}: {raw_metrics.get(key, 0.0):.6f}")
+        print()
+        print("Action Transformation Trace:")
+        for stage_metrics in action_transform_trace(logits, weights):
+            print(f"  stage = {stage_metrics['stage']}")
+            for key in (
+                "nonzero_positions",
+                "max_weight",
+                "top_10_weight_sum",
+                "top_20_weight_sum",
+                "weight_std",
+                "effective_number_of_positions",
+                "cash_weight",
+            ):
+                value = stage_metrics.get(key, 0.0)
+                if isinstance(value, int):
+                    print(f"    {key}: {value}")
+                else:
+                    print(f"    {key}: {value:.6f}")
     print(f"  Signals are cross-sectionally z-scored (0 = universe avg).")
     print(f"  Rebalance weekly. Not financial advice.\n")
 
